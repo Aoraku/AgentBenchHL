@@ -1,5 +1,7 @@
 # AgentBench-HL
 
+![Goal-led HL experiment loop](assets/goal-led-hl-loop.png)
+
 AgentBench-HL 是一个可复现的 Human-Level（HL）博弈策略研究框架。它把长程代码
 研究交给同一个持久 Codex Goal，把可审计的实验事实交给确定性内核：候选版本、官方
 对局、回放、指标、经验与实验账本均由框架保存和复算。
