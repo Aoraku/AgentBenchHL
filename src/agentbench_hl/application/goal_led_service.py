@@ -122,12 +122,29 @@ class GoalLedService:
             lambda event: getattr(event, "event_type", "") == "AgentTurnCompleted",
         )
 
-    def _request_path(self) -> Path:
+    def _request_path(self) -> Path | None:
         action = self.workspace / ".agentbench" / "action.json"
-        return action if action.is_file() else self.workspace / ".agentbench" / "match_request.json"
+        if action.is_file():
+            return action
+        legacy = self.workspace / ".agentbench" / "match_request.json"
+        if not legacy.is_file():
+            return None
+        try:
+            request = MatchRequest.from_path(legacy)
+        except ValueError:
+            return legacy
+        archived = (
+            self.workspace
+            / ".agentbench"
+            / "processed-requests"
+            / f"{request.request_id}.json"
+        )
+        return None if archived.is_file() else legacy
 
     def _consume_request(self) -> MatchRequest:
         path = self._request_path()
+        if path is None:
+            raise ValueError("Goal did not submit a new action.json")
         request = MatchRequest.from_path(path)
         if request.opponent_id not in self.runnable_opponent_ids:
             raise ValueError(f"request names unknown or unrunnable opponent: {request.opponent_id}")
@@ -231,17 +248,46 @@ class GoalLedService:
         )
         return feedback, len(rows)
 
-    def _run_request(self, session: AgentSession, request_count: int) -> GoalLedOutcome:
-        request = self._consume_request()
-        if request_count == 0 and request.opponent_id != "rank01":
-            raise ValueError("the first Goal-led official request must target rank01")
-        feedback, match_count = self._execute(request)
+    def _pending_feedback(self) -> tuple[MatchRequest, Path, int] | None:
+        delivered = {
+            str(event.payload["request_id"])
+            for event in self.events.read_all()
+            if event.event_type == "GoalFeedbackDelivered"
+            and isinstance(event.payload.get("request_id"), str)
+        }
+        for event in reversed(self.events.read_all()):
+            if event.event_type != "GoalMatchRequested":
+                continue
+            request_id = event.payload.get("request_id")
+            if not isinstance(request_id, str) or request_id in delivered:
+                continue
+            archived = self.workspace / ".agentbench" / "processed-requests" / f"{request_id}.json"
+            feedback = self.workspace / "feedback" / request_id / "feedback.json"
+            if not archived.is_file() or not feedback.is_file():
+                continue
+            request = MatchRequest.from_path(archived)
+            match_count = sum(
+                event.event_type == "GoalMatchCompleted"
+                and event.payload.get("request_id") == request_id
+                for event in self.events.read_all()
+            )
+            return request, feedback, match_count
+        return None
+
+    def _deliver_feedback(
+        self,
+        session: AgentSession,
+        request: MatchRequest,
+        feedback: Path,
+        match_count: int,
+        request_count: int,
+    ) -> GoalLedOutcome:
         session = self._turn(
             session,
             (
                 f"官方比赛反馈已写入 {feedback.relative_to(self.workspace)}。"
                 "阅读 replay.json、public-trace.jsonl 和 feedback.json；更新 research/ 中的"
-                "成功经验与失败假设，修改策略，并在准备好下一步时写新的 match_request.json。"
+                "成功经验与失败假设，修改策略，并在准备好下一步时写新的 action.json。"
             ),
         )
         self._append(
@@ -251,6 +297,15 @@ class GoalLedService:
         )
         self._write_state(session.thread_id, request_count + 1)
         return GoalLedOutcome(session.thread_id, self.workspace, request.request_id, match_count)
+
+    def _run_request(self, session: AgentSession, request_count: int) -> GoalLedOutcome:
+        request = self._consume_request()
+        if request_count == 0 and request.opponent_id != "rank01":
+            raise ValueError("the first Goal-led official request must target rank01")
+        feedback, match_count = self._execute(request)
+        return self._deliver_feedback(
+            session, request, feedback, match_count, request_count
+        )
 
     def start(self) -> GoalLedOutcome:
         if self._state_path.exists():
@@ -293,7 +348,13 @@ class GoalLedService:
     def advance(self) -> GoalLedOutcome:
         thread_id, request_count = self._load_state()
         session = self.runtime.resume(thread_id, self._context(""))
-        if not self._request_path().is_file():
+        pending = self._pending_feedback()
+        if pending is not None:
+            request, feedback, match_count = pending
+            return self._deliver_feedback(
+                session, request, feedback, match_count, request_count
+            )
+        if self._request_path() is None:
             session = self._turn(
                 session,
                 "继续研究：基于已有 Experience 与公开反馈改进策略，然后写下一份 action.json。",

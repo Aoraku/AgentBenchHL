@@ -85,6 +85,34 @@ class TimingOutRuntime(RequestingRuntime):
         raise TimeoutError("deliberate long-goal interruption")
 
 
+class FeedbackTimeoutRuntime(RequestingRuntime):
+    def run_until_checkpoint(
+        self,
+        session: AgentSession,
+        run_context: RunContext,
+        _checkpoint_predicate: object,
+    ) -> AgentSession:
+        self.prompts.append(run_context.initial_prompt)
+        request = run_context.cwd / ".agentbench" / "action.json"
+        request.parent.mkdir(exist_ok=True)
+        if len(self.prompts) == 1:
+            request.write_text(
+                json.dumps(
+                    {
+                        "request_id": "first-rank01",
+                        "candidate_ids": ["v000"],
+                        "opponent_id": "rank01",
+                        "roles": ["P0"],
+                        "seeds": [1],
+                        "rationale": "Use the strongest player's public opening replay.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return session
+        raise TimeoutError("feedback turn interrupted")
+
+
 def test_goal_led_bridge_keeps_one_thread_and_returns_public_rank01_feedback(
     tmp_path: Path,
 ) -> None:
@@ -146,3 +174,54 @@ def test_goal_led_persists_thread_before_the_first_long_turn(tmp_path: Path) -> 
         "schema_version": "1.0",
         "thread_id": "thread-I",
     }
+
+
+def test_goal_led_recovers_unacknowledged_feedback_without_replaying_matches(
+    tmp_path: Path,
+) -> None:
+    bootstrap = tmp_path / "bootstrap"
+    bootstrap.mkdir()
+    (bootstrap / "main.py").write_text("print('candidate')\n", encoding="utf-8")
+    gamepack = tmp_path / "gamepack"
+    gamepack.mkdir()
+    interrupted = FeedbackTimeoutRuntime()
+    service = GoalLedService(
+        run_root=tmp_path / "run",
+        bootstrap_root=bootstrap,
+        gamepack_root=gamepack,
+        runtime=interrupted,
+        arena=PublicReplayArena(),
+        model="gpt-5.6",
+        model_provider="OpenAI",
+        runnable_opponent_ids=("rank01",),
+        public_leaderboard=({"opponent_id": "rank01", "rank": 1, "score": 2000.0},),
+    )
+
+    with pytest.raises(TimeoutError, match="feedback turn"):
+        service.start()
+
+    legacy = service.workspace / ".agentbench" / "match_request.json"
+    archived = service.workspace / ".agentbench" / "processed-requests" / "first-rank01.json"
+    legacy.write_text(archived.read_text(encoding="utf-8"), encoding="utf-8")
+
+    resumed = RequestingRuntime()
+    recovery = GoalLedService(
+        run_root=tmp_path / "run",
+        bootstrap_root=bootstrap,
+        gamepack_root=gamepack,
+        runtime=resumed,
+        arena=PublicReplayArena(),
+        model="gpt-5.6",
+        model_provider="OpenAI",
+        runnable_opponent_ids=("rank01",),
+        public_leaderboard=({"opponent_id": "rank01", "rank": 1, "score": 2000.0},),
+    )
+
+    outcome = recovery.advance()
+
+    assert outcome.request_id == "first-rank01"
+    assert outcome.match_count == 1
+    assert len(resumed.prompts) == 1
+    events = (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8")
+    assert events.count('"event_type":"GoalMatchCompleted"') == 1
+    assert '"event_type":"GoalFeedbackDelivered"' in events
