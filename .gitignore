@@ -1,0 +1,44 @@
+# Secrets and local provider configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local experiment state and generated scientific artifacts
+runs/
+run-*/
+official-matches/
+snapshots/
+feedback/
+workspace/.agentbench/
+codex-home/
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+!tests/**/*.jsonl
+reports/curves/*.csv
+reports/curves/*.png
+
+# Local, one-off recovery helpers retained outside the public framework
+tools/
+
+# Python and tooling output
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Platform/editor files
+.DS_Store
+.idea/
+.vscode/

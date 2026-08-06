@@ -1,0 +1,7 @@
+schema_version: "1.0"
+opponents: runnable_official_pool
+roles: [P0, P1]
+seeds: [1, 2]
+curriculum: lowest_rank_first
+solve_condition: all_valid_cases_win
+locked_regression: true

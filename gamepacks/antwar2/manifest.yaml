@@ -1,0 +1,23 @@
+schema_version: "1.0"
+game: antwar2
+candidate_interface: AI.choose_operations
+rules: rules.md
+sdk_interface: sdk_interface.md
+decision_space: decision_space.yaml
+replay_skill: replay_skill.md
+development_matrix: development_matrix.yaml
+candidate_support: candidate_support
+public_sdk_tree_sha256: f54280bb6b4407609ee7cc0b4df405b37c8009d5049dbaa642f12b5648a9efe0
+learning_isolation:
+  allowed:
+    - frozen_gamepack
+    - public_sdk
+    - active_candidate
+    - run_local_public_replays
+    - run_local_experience
+  forbidden:
+    - human_source
+    - certification_matrix
+    - reference_policy_versions
+    - reference_policy_replays
+    - cross_run_codex_memory

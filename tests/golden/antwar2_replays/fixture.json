@@ -1,0 +1,67 @@
+[
+  {
+    "seed": 7,
+    "op0": [],
+    "op1": [],
+    "round_state": {
+      "round": 0,
+      "camps": [50, 50],
+      "speedLv": [0, 0],
+      "anthpLv": [0, 0],
+      "coins": [50, 50],
+      "towers": [],
+      "ants": [],
+      "weaponCooldowns": [[0, 0, 0, 0], [0, 0, 0, 0]],
+      "activeEffects": [],
+      "winner": -1
+    }
+  },
+  {
+    "op0": [{"type": 11, "id": -1, "args": -1, "pos": {"x": 8, "y": 11}}],
+    "op1": [],
+    "round_state": {
+      "round": 1,
+      "camps": [50, 50],
+      "speedLv": [0, 0],
+      "anthpLv": [0, 0],
+      "coins": [35, 50],
+      "towers": [{"id": 5, "player": 0, "type": 0, "hp": 10, "cd": 1, "pos": {"x": 8, "y": 11}}],
+      "ants": [],
+      "weaponCooldowns": [[0, 0, 0, 0], [0, 0, 0, 0]],
+      "activeEffects": [],
+      "winner": -1
+    }
+  },
+  {
+    "op0": [{"type": 21, "id": -1, "args": -1, "pos": {"x": 16, "y": 9}}],
+    "op1": [{"type": 31, "id": -1, "args": -1, "pos": {"x": -1, "y": -1}}],
+    "round_state": {
+      "round": 28,
+      "camps": [50, 42],
+      "speedLv": [0, 1],
+      "anthpLv": [0, 0],
+      "coins": [10, 5],
+      "towers": [],
+      "ants": [],
+      "weaponCooldowns": [[19, 0, 0, 0], [0, 0, 0, 0]],
+      "activeEffects": [{"player": 0, "type": 1, "pos": {"x": 16, "y": 9}}],
+      "winner": -1
+    }
+  },
+  {
+    "op0": [],
+    "op1": [],
+    "round_state": {
+      "round": 29,
+      "camps": [50, 0],
+      "speedLv": [0, 1],
+      "anthpLv": [0, 0],
+      "coins": [13, 8],
+      "towers": [],
+      "ants": [],
+      "weaponCooldowns": [[18, 0, 0, 0], [0, 0, 0, 0]],
+      "activeEffects": [],
+      "winner": 0
+    }
+  }
+]

@@ -1,0 +1,54 @@
+schema_version: "1.0"
+policy_interface:
+  input_type: SDK.backend.state.BackendState
+  output_type: ordered list[Operation]
+  entry_symbol: AI.choose_operations
+  legality: state.can_apply_operation(player, operation, accepted_prefix)
+  state_mapping:
+    base_hp: state.bases[player].hp
+    generation_level: state.bases[player].generation_level
+    ant_level: state.bases[player].ant_level
+    coins: state.coins[player]
+  replay_mapping:
+    round_state.camps[player]: state.bases[player].hp
+    round_state.speedLv[player]: state.bases[player].generation_level
+    round_state.anthpLv[player]: state.bases[player].ant_level
+atomic_actions:
+  - {name: HOLD, code: null, arguments: []}
+  - {name: BUILD_TOWER, code: 11, arguments: [x, y]}
+  - {name: UPGRADE_TOWER, code: 12, arguments: [tower_id, target_type]}
+  - {name: DOWNGRADE_TOWER, code: 13, arguments: [tower_id]}
+  - {name: USE_LIGHTNING_STORM, code: 21, arguments: [x, y]}
+  - {name: USE_EMP_BLASTER, code: 22, arguments: [x, y]}
+  - {name: USE_DEFLECTOR, code: 23, arguments: [x, y]}
+  - {name: USE_EMERGENCY_EVASION, code: 24, arguments: [x, y]}
+  - {name: UPGRADE_GENERATION_SPEED, code: 31, arguments: []}
+  - {name: UPGRADE_GENERATED_ANT, code: 32, arguments: []}
+atomization:
+  roles: [P0, P1]
+  preserve_accepted_order: true
+  empty_bundle: HOLD
+  rejected_operations: record_but_exclude_from_policy_sequence
+measurement:
+  deterministic_policy_channel: epsilon_regularized
+  epsilon_source: experiment_config
+  support: exact_legal_atomic_actions
+  reference_states: candidate_version_fixed_panel_replay_decision_states
+  local_context:
+    - frozen_public_backend_state
+    - policy_internal_memory
+    - shared_accepted_atomic_prefix
+  comparison:
+    include_terminal_hold: true
+    stop_after_first_prefix_divergence: true
+    rationale: later atoms no longer share the same decision context after a divergent prefix
+  raw_output:
+    - local_policy_kl_trace
+    - action_disagreement_trace
+    - state_id
+    - legal_atomic_support
+occupancy:
+  state_id: sha256_of_exact_normalized_public_backend_state
+  source: each_version_own_fixed_panel_rollouts
+  metric: total_variation
+  relation_to_policy_kl: reported_separately_never_added

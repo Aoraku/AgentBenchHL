@@ -1,0 +1,1 @@
+"""Pure scientific domain types."""
