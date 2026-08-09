@@ -17,6 +17,6 @@ paths:
   runs_root: ../../../runs
 curriculum:
   order: lowest_rank_first
-  development_seeds: [1, 2]
+  development_seeds: [1, 2, 3, 4]
 measurement:
   epsilon: 0.01

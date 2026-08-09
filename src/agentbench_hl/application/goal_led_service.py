@@ -77,6 +77,9 @@ class GoalLedService:
             developer_instructions=(
                 "通过 .agentbench/action.json 提交 Action（兼容 match_request.json）。"
                 "首个请求必须是 rank01；后续由你决定对手、角色、seed 与候选数量。"
+                "默认探索批次必须提交 k=4 个彼此不同的策略候选，而不是同一候选的微小单点调参；"
+                "令四个候选在同一诊断对局条件下各产生一份可比较回放。"
+                "只有筛出的候选才进入少量确认局与四个固定 seed 的稳定性检查。"
             ),
             cwd=self.workspace,
             candidate_root=self.workspace,
@@ -288,6 +291,8 @@ class GoalLedService:
                 f"官方比赛反馈已写入 {feedback.relative_to(self.workspace)}。"
                 "阅读 replay.json、public-trace.jsonl 和 feedback.json；更新 research/ 中的"
                 "成功经验与失败假设，修改策略，并在准备好下一步时写新的 action.json。"
+                "常规探索请从共同 parent 产出 k=4 个有机制差异的策略包，各打一份诊断回放；"
+                "不要把单一反事实或单点动作修改当作前置要求。"
             ),
         )
         self._append(
