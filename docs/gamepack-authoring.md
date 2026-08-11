@@ -14,15 +14,35 @@
 | `replay_skill.md` | 游戏负责人 | 将官方 replay JSON 字段和事件翻译成自然语言游戏事实的方法与例子。 |
 | `sdk_interface.md` | 游戏负责人 | 候选策略的稳定公共入口、输入、输出、错误与确定性要求。 |
 | `manifest.yaml` | 框架/游戏负责人 | 上述资源路径、公共 SDK 摘要和 Goal 的允许/禁止读取边界。 |
+| `GOAL_CHARTER.md` | 游戏负责人 | Goal 的目标章程，装入受控工作区供模型阅读。 |
+| `evaluator/certification.yaml` | 游戏负责人 | 隐藏认证的 seed 与角色列表（认证配置随游戏走，不放框架层）。 |
 | `candidate_support/` | 游戏负责人 | 可供候选调用、但不包含人类实现的公共工具与协议代码。 |
 
 还需要在 `src/agentbench_hl/adapters/<game>/` 实现：
 
-- `arena.py`：以指定 candidate、对手 ID、角色与 seed 执行冻结官方比赛；
-- `replay.py`：保存原始 replay，并生成可审计的公共 trace 与自然语言事实；
-- `runtime.py`：将 GamePack、当前候选和 Experience 装入 Goal 的受控工作区；
-- `smoke.py`：验证候选可以编译/导入、在双方角色中产生合法动作；
-- 必要的 `policy_probe.py`：在固定公开状态集上导出确定性原子动作，供 IG 计算。
+- `arena.py`：以指定 candidate、对手 ID、角色与 seed 执行冻结官方比赛，产出 `ports.arena.MatchResult`（游戏特有的终局状态放入 `payload`）；
+- `replay.py`：保存原始 replay，并生成可审计的公共 trace 与自然语言事实（符合 `ports.replay.ReplayDecoder`）；
+- `runtime.py`：将 GamePack、当前候选和 Experience 装入 Goal 的受控工作区，并给出符合 `ports.population.PopulationEntry` 的对手池；
+- `smoke.py`：验证候选可以编译/导入、在各角色中产生合法动作；
+- 必要的 `policy_probe.py`：在固定公开状态集上导出确定性原子动作（复用 `domain.policy` 的通用比较逻辑），供 IG 计算；
+- `factory.py`：实现 `registry.GameAdapterFactory`（`build_run` / `resume_run`），把上述适配器装配成一个 `RunService`。
+
+## 注册游戏（唯一的一处框架接触点）
+
+在 `src/agentbench_hl/registry.py` 中为你的游戏名登记一个惰性工厂：
+
+```python
+def _mygame_factory():
+    from agentbench_hl.adapters.mygame.factory import MyGameAdapterFactory
+    return MyGameAdapterFactory()
+
+register_game("mygame", _mygame_factory)
+```
+
+这是接入新游戏时**唯一**需要触碰的框架文件。`core`（application）、`domain`、
+`ports`、`config` 均无需改动——框架只依赖 `ports.*` 抽象，并在运行时按
+`config.game` 从注册表装配对应适配器。`config.game` 只要求 `gamepacks/<game>/`
+目录存在即可，不再写死任何游戏名。
 
 ## 决策空间原则
 
@@ -52,9 +72,10 @@
 
 ## 配置与评测
 
-新增 `configs/experiments/<game>-goal-I.yaml`，固定：模型/provider 名称、由环境变量给
-出的密钥名称、运行根目录、网络策略、开发 seed、测量 epsilon 和课程初始设置。配置
-中只能引用 `${ENVIRONMENT_VARIABLE}`，不能包含任何密钥。
+新增 `configs/experiments/<game>-goal.yaml`，固定：`game: <game>`、模型/provider 名称、
+由环境变量给出的密钥名称、运行根目录、网络策略、开发 seed、测量 epsilon 和课程初始
+设置。配置中只能引用 `${ENVIRONMENT_VARIABLE}`，不能包含任何密钥。`game` 字段会按
+`gamepacks/<game>/` 是否存在来校验。
 
 Goal 只能通过 `action.json` 提交候选版本和下一位对手。框架执行比赛后回传公开结果与
 回放。每个完整候选保留版本、代码、Experience、比赛与指标；失败候选也可被保留为

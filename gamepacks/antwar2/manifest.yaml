@@ -7,6 +7,8 @@ decision_space: decision_space.yaml
 replay_skill: replay_skill.md
 development_matrix: development_matrix.yaml
 candidate_support: candidate_support
+goal_charter: GOAL_CHARTER.md
+evaluator: evaluator/certification.yaml
 public_sdk_tree_sha256: f54280bb6b4407609ee7cc0b4df405b37c8009d5049dbaa642f12b5648a9efe0
 learning_isolation:
   allowed:

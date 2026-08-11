@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentbench-hl"
 version = "0.1.0"
-description = "Reproducible Goal-led Human-Level research for AntWar2"
+description = "Reproducible Goal-led Human-Level research framework for pluggable competitive games"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

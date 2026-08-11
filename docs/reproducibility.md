@@ -63,8 +63,8 @@ python -m pytest tests/integration/test_live_preflight.py -m live -q
 
 ```bash
 abhl run init \
-  --config configs/experiments/antwar2-goal-k1.yaml \
-  --run-id antwar2-goal-k1
+  --config configs/experiments/antwar2-goal.yaml \
+  --run-id antwar2-goal
 ```
 
 初始化执行以下原子阶段：
@@ -88,8 +88,8 @@ Smoke 是运行门槛，不作为正式迭代曲线的第零点。第一次 impr
 
 ```bash
 abhl run resume \
-  --config configs/experiments/antwar2-goal-k1.yaml \
-  --run-id antwar2-goal-k1 \
+  --config configs/experiments/antwar2-goal.yaml \
+  --run-id antwar2-goal \
   --acts 1
 ```
 
@@ -97,8 +97,8 @@ abhl run resume \
 
 ```bash
 abhl run pursue \
-  --config configs/experiments/antwar2-goal-k1.yaml \
-  --run-id antwar2-goal-k1
+  --config configs/experiments/antwar2-goal.yaml \
+  --run-id antwar2-goal
 ```
 
 每个科研 act 包含：
@@ -148,8 +148,8 @@ cache key 重试。中断后的恢复复用已封存候选、已完成比赛和�
 ## 8. 审计
 
 ```bash
-abhl run status --run-root ../runs/antwar2-goal-k1
-abhl run audit --run-root ../runs/antwar2-goal-k1
+abhl run status --run-root ../runs/antwar2-goal
+abhl run audit --run-root ../runs/antwar2-goal
 ```
 
 `status` 报告整数 iteration、smoke/formal 比赛数、候选数、Experience 数、Champion、

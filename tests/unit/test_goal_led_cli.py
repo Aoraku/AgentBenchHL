@@ -11,7 +11,7 @@ def test_goal_led_start_command_accepts_config_and_run_id() -> None:
             "goal-led",
             "start",
             "--config",
-            "configs/experiments/antwar2-goal-I.yaml",
+            "configs/experiments/antwar2-goal.yaml",
             "--run-id",
             "pilot-rank01",
         ]
@@ -19,5 +19,5 @@ def test_goal_led_start_command_accepts_config_and_run_id() -> None:
 
     assert args.group == "goal-led"
     assert args.command == "start"
-    assert args.config == Path("configs/experiments/antwar2-goal-I.yaml")
+    assert args.config == Path("configs/experiments/antwar2-goal.yaml")
     assert args.run_id == "pilot-rank01"

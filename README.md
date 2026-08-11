@@ -68,8 +68,8 @@ YAML 固定；请按本机 provider 修改对应配置，而不是把密钥写�
 
 ```bash
 abhl goal-led start \
-  --config configs/experiments/antwar2-goal-I.yaml \
-  --run-id antwar2-goal-I
+  --config configs/experiments/antwar2-goal.yaml \
+  --run-id antwar2-goal
 ```
 
 每次 `start` 或 `continue` 只推进同一个持久 Goal 至下一个已提交 action 或反馈点；
@@ -77,8 +77,8 @@ abhl goal-led start \
 
 ```bash
 abhl goal-led continue \
-  --config configs/experiments/antwar2-goal-I.yaml \
-  --run-id antwar2-goal-I
+  --config configs/experiments/antwar2-goal.yaml \
+  --run-id antwar2-goal
 ```
 
 不要并发执行同一 `run-id`。运行根目录默认为仓库外的 `../runs/<run-id>/`，其中的

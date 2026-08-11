@@ -19,7 +19,7 @@ def test_live_goal_reaches_first_official_match() -> None:
         pytest.skip("AGENTBENCH_ROOT is required")
     repository = Path(__file__).parents[2]
     run = build_live_run(
-        repository / "configs/experiments/antwar2-goal-k1.yaml",
+        repository / "configs/experiments/antwar2-goal.yaml",
         run_id=f"antwar2-goal-smoke-{uuid.uuid4().hex[:10]}",
     )
     try:
