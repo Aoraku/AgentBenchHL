@@ -13,11 +13,11 @@ from pathlib import Path
 
 import yaml
 
-from agentbench_hl.adapters.antwar2.arena import AntWarArena
+from agentbench_hl.adapters.antwar2.arena import AntWar2Arena
 from agentbench_hl.adapters.antwar2.policy_probe import probe_policy_episode
 from agentbench_hl.adapters.antwar2.replay import decode_replay
 from agentbench_hl.adapters.antwar2.runtime import (
-    AntWarLayout,
+    AntWar2Layout,
     Opponent,
     audit_human_pool,
     build_backend,
@@ -104,7 +104,7 @@ def build_live_run(
         run_root / "provider-preflight",
     )
 
-    layout = AntWarLayout.from_root(
+    layout = AntWar2Layout.from_root(
         config.paths.agentbench_root,
         run_root / "frozen-build",
     )
@@ -142,14 +142,14 @@ def build_live_run(
         "-f",
         str(candidate_profile),
     )
-    arena = AntWarArena(
+    arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),
         opponents=opponents,
         artifact_root=run_root / "official-matches",
         timeout_s=180.0,
         candidate_command_prefix=candidate_command_prefix,
     )
-    certification_arena = AntWarArena(
+    certification_arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),
         opponents=opponents,
         artifact_root=run_root / "hidden-certification/matches",
@@ -263,7 +263,7 @@ def resume_live_run(
     if not verify_codex_identity(resources, codex_probe):
         raise ValueError("Codex App Server identity differs from frozen run")
 
-    layout = AntWarLayout.from_root(
+    layout = AntWar2Layout.from_root(
         config.paths.agentbench_root,
         run_root / "frozen-build",
     )
@@ -311,14 +311,14 @@ def resume_live_run(
         "-f",
         str(candidate_profile),
     )
-    arena = AntWarArena(
+    arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),
         opponents=opponents,
         artifact_root=run_root / "official-matches",
         timeout_s=180.0,
         candidate_command_prefix=candidate_command_prefix,
     )
-    certification_arena = AntWarArena(
+    certification_arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),
         opponents=opponents,
         artifact_root=run_root / "hidden-certification/matches",

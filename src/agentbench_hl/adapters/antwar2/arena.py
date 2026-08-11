@@ -17,7 +17,7 @@ from typing import Any, BinaryIO
 from agentbench_hl.ports.arena import MatchCase, MatchResult, ProcessSpec
 
 
-class AntWarMatchError(RuntimeError):
+class AntWar2MatchError(RuntimeError):
     """The native run did not produce a scientifically complete match."""
 
 
@@ -25,11 +25,11 @@ def _load_replay(path: Path) -> list[dict[str, Any]]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise AntWarMatchError(f"cannot read replay {path}: {exc}") from exc
+        raise AntWar2MatchError(f"cannot read replay {path}: {exc}") from exc
     if not isinstance(value, list) or not value:
-        raise AntWarMatchError("replay must be a non-empty JSON array")
+        raise AntWar2MatchError("replay must be a non-empty JSON array")
     if not all(isinstance(record, dict) for record in value):
-        raise AntWarMatchError("replay contains a non-object round")
+        raise AntWar2MatchError("replay contains a non-object round")
     return value
 
 
@@ -51,10 +51,10 @@ def match_result_from_replay(
     replay = _load_replay(source)
     terminal = replay[-1].get("round_state")
     if not isinstance(terminal, dict):
-        raise AntWarMatchError("replay has no terminal round_state")
+        raise AntWar2MatchError("replay has no terminal round_state")
     winner = terminal.get("winner")
     if winner not in {0, 1}:
-        raise AntWarMatchError("replay has no valid terminal winner")
+        raise AntWar2MatchError("replay has no valid terminal winner")
     replay_camps = terminal.get("camps")
     if (
         not isinstance(replay_camps, list)
@@ -63,7 +63,7 @@ def match_result_from_replay(
             isinstance(value, bool) or not isinstance(value, (int, float)) for value in replay_camps
         )
     ):
-        raise AntWarMatchError("replay has invalid terminal base-HP mapping")
+        raise AntWar2MatchError("replay has invalid terminal base-HP mapping")
     base_hp = (float(replay_camps[0]), float(replay_camps[1]))
     candidate_player = 0 if role == "P0" else 1
     opponent_player = 1 - candidate_player
@@ -94,7 +94,7 @@ def write_public_trace(replay_path: Path, trace_path: Path) -> None:
             for player in (0, 1):
                 operations = record.get(f"op{player}", [])
                 if not isinstance(operations, list):
-                    raise AntWarMatchError(f"round {round_index} P{player} operations are invalid")
+                    raise AntWar2MatchError(f"round {round_index} P{player} operations are invalid")
                 stream.write(
                     json.dumps(
                         {
@@ -111,7 +111,7 @@ def write_public_trace(replay_path: Path, trace_path: Path) -> None:
                 sequence += 1
             public_state = record.get("round_state")
             if not isinstance(public_state, dict):
-                raise AntWarMatchError(f"round {round_index} has no public state")
+                raise AntWar2MatchError(f"round {round_index} has no public state")
             stream.write(
                 json.dumps(
                     {
@@ -190,7 +190,7 @@ def _safe_environment(extra: Mapping[str, str]) -> dict[str, str]:
     forbidden_fragments = ("KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH")
     for key, value in extra.items():
         if any(fragment in key.upper() for fragment in forbidden_fragments):
-            raise AntWarMatchError(f"credential-like environment variable rejected: {key}")
+            raise AntWar2MatchError(f"credential-like environment variable rejected: {key}")
         environment[str(key)] = str(value)
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -209,7 +209,7 @@ def _start(spec: ProcessSpec) -> subprocess.Popen[bytes]:
     )
     if process.stdin is None or process.stdout is None or process.stderr is None:
         process.terminate()
-        raise AntWarMatchError("failed to open process pipes")
+        raise AntWar2MatchError("failed to open process pipes")
     return process
 
 
@@ -250,10 +250,10 @@ def _next_frame(
         codes = [process.poll() for process in processes]
         raise TimeoutError(f"{label} timed out; returncodes={codes}") from exc
     if kind == "error":
-        raise AntWarMatchError(f"{label} reader failed: {payload}") from payload
+        raise AntWar2MatchError(f"{label} reader failed: {payload}") from payload
     if kind == "eof":
         codes = [process.poll() for process in processes]
-        raise AntWarMatchError(f"{label} closed early; returncodes={codes}")
+        raise AntWar2MatchError(f"{label} closed early; returncodes={codes}")
     return payload
 
 
@@ -360,9 +360,9 @@ def run_native_match(
                 try:
                     message = json.loads(payload.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise AntWarMatchError("game emitted invalid JSON") from exc
+                    raise AntWar2MatchError("game emitted invalid JSON") from exc
                 if not isinstance(message, dict):
-                    raise AntWarMatchError("game message is not an object")
+                    raise AntWar2MatchError("game message is not an object")
                 public_players = message.get("player", [])
                 public_content = message.get("content", [])
                 if public_players or public_content:
@@ -371,7 +371,7 @@ def run_native_match(
                         or not isinstance(public_content, list)
                         or len(public_players) != len(public_content)
                     ):
-                        raise AntWarMatchError("game broadcast has invalid shape")
+                        raise AntWar2MatchError("game broadcast has invalid shape")
                     for raw_player, content in zip(public_players, public_content, strict=True):
                         player = int(raw_player)
                         _write(players[player].stdin, str(content).encode("utf-8"))
@@ -402,9 +402,9 @@ def run_native_match(
         )
         if any(code != 0 for code in returncodes):
             tails = [tail.decode("utf-8", errors="replace") for tail in stderr_tails]
-            raise AntWarMatchError(f"non-zero process return code: {returncodes}; stderr={tails}")
+            raise AntWar2MatchError(f"non-zero process return code: {returncodes}; stderr={tails}")
         if not ended:
-            raise AntWarMatchError("game exited without end_state")
+            raise AntWar2MatchError("game exited without end_state")
         write_public_trace(replay_path, trace_path)
         return match_result_from_replay(
             replay_path,
@@ -424,7 +424,7 @@ def run_native_match(
 Runner = Callable[..., MatchResult]
 
 
-class AntWarArena:
+class AntWar2Arena:
     def __init__(
         self,
         *,
@@ -468,7 +468,7 @@ class AntWarArena:
                 events_path=root / "transport-events.jsonl",
                 timeout_s=self.timeout_s,
             )
-        except (AntWarMatchError, TimeoutError, OSError, subprocess.TimeoutExpired) as exc:
+        except (AntWar2MatchError, TimeoutError, OSError, subprocess.TimeoutExpired) as exc:
             return MatchResult(
                 case=case,
                 status="incomplete",

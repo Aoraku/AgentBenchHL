@@ -56,6 +56,16 @@ class EloResult:
 
 @dataclass(frozen=True)
 class EloEstimate:
+    """Side-balanced Elo decomposition for a two-role, symmetric game.
+
+    ``p0``/``p1`` are the anchored ratings when the candidate plays each of the
+    two board sides; ``combined`` is the seat-averaged rating.  This shape is the
+    default for symmetric two-role games (matching the shared ``elo_p0``/
+    ``elo_p1`` metrics-schema columns).  Games with a different role structure
+    are expected to supply their own rating decomposition in their adapter
+    rather than reusing this two-seat estimate.
+    """
+
     p0: float
     p1: float
     combined: float

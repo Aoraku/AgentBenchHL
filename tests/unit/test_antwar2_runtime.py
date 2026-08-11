@@ -6,15 +6,15 @@ from pathlib import Path
 import pytest
 
 from agentbench_hl.adapters.antwar2.runtime import (
-    AntWarLayout,
-    AntWarRuntimeError,
+    AntWar2Layout,
+    AntWar2RuntimeError,
     safe_extract,
 )
 
 
 def test_layout_resolves_only_frozen_public_roots(tmp_path: Path) -> None:
     agentbench = tmp_path / "AgentBench"
-    layout = AntWarLayout.from_root(agentbench, tmp_path / "build")
+    layout = AntWar2Layout.from_root(agentbench, tmp_path / "build")
 
     assert layout.backend_archive == (
         agentbench / "backend_sources/corpus/30_antwar2/archives/gamecode_logic__141.zip"
@@ -33,7 +33,7 @@ def test_safe_extract_rejects_parent_traversal(tmp_path: Path) -> None:
     with zipfile.ZipFile(archive, "w") as package:
         package.writestr("../escape.txt", "forbidden")
 
-    with pytest.raises(AntWarRuntimeError, match="unsafe"):
+    with pytest.raises(AntWar2RuntimeError, match="unsafe"):
         safe_extract(archive, tmp_path / "target")
     assert not (tmp_path / "escape.txt").exists()
 

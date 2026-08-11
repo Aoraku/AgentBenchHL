@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-class AntWarRuntimeError(RuntimeError):
+class AntWar2RuntimeError(RuntimeError):
     """A frozen runtime resource failed an integrity requirement."""
 
 
@@ -28,7 +28,7 @@ def tree_sha256(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
-            raise AntWarRuntimeError(f"runtime tree contains a symlink: {path}")
+            raise AntWar2RuntimeError(f"runtime tree contains a symlink: {path}")
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
             continue
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -41,7 +41,7 @@ def tree_sha256(root: Path) -> str:
 
 
 @dataclass(frozen=True)
-class AntWarLayout:
+class AntWar2Layout:
     agentbench_root: Path
     build_root: Path
     backend_archive: Path
@@ -50,7 +50,7 @@ class AntWarLayout:
     public_sdk_root: Path
 
     @classmethod
-    def from_root(cls, agentbench_root: str | Path, build_root: str | Path) -> AntWarLayout:
+    def from_root(cls, agentbench_root: str | Path, build_root: str | Path) -> AntWar2Layout:
         agentbench = Path(agentbench_root).resolve()
         ladder = agentbench / "top_algorithms/corpus/30_antwar2_ladder"
         extracted = ladder / "extracted"
@@ -75,7 +75,7 @@ class AntWarLayout:
         if expected_sdk_sha256 is not None:
             actual = tree_sha256(self.public_sdk_root)
             if actual != expected_sdk_sha256:
-                raise AntWarRuntimeError(
+                raise AntWar2RuntimeError(
                     f"public SDK hash mismatch: expected {expected_sdk_sha256}, got {actual}"
                 )
 
@@ -94,7 +94,7 @@ def safe_extract(archive: Path, destination: Path) -> None:
                 or stat.S_ISLNK(mode)
                 or not target.is_relative_to(resolved_destination)
             ):
-                raise AntWarRuntimeError(f"unsafe archive member: {member.filename}")
+                raise AntWar2RuntimeError(f"unsafe archive member: {member.filename}")
         package.extractall(destination)
 
 
@@ -127,7 +127,7 @@ def _enable_windows_binary_transport(main_source: Path) -> bool:
     include_anchor = "#include <vector>"
     main_anchor = "int main(/*int argc, char *argv[]*/) {"
     if include_anchor not in text or main_anchor not in text:
-        raise AntWarRuntimeError("cannot apply Windows binary transport patch")
+        raise AntWar2RuntimeError("cannot apply Windows binary transport patch")
     text = text.replace(
         include_anchor,
         include_anchor + "\n#ifdef _WIN32\n#include <fcntl.h>\n#include <io.h>\n#endif",
@@ -152,7 +152,7 @@ class FrozenBackend:
     manifest_path: Path
 
 
-def build_backend(layout: AntWarLayout) -> FrozenBackend:
+def build_backend(layout: AntWar2Layout) -> FrozenBackend:
     layout.validate()
     archive_hash = sha256_file(layout.backend_archive)
     root = layout.build_root / f"backend-{archive_hash[:16]}"
@@ -170,11 +170,11 @@ def build_backend(layout: AntWarLayout) -> FrozenBackend:
     if root.exists():
         quarantine = root.with_name(f"{root.name}.invalid")
         if quarantine.exists():
-            raise AntWarRuntimeError(f"backend cache and quarantine both exist: {root}")
+            raise AntWar2RuntimeError(f"backend cache and quarantine both exist: {root}")
         root.rename(quarantine)
     safe_extract(layout.backend_archive, root)
     if not game_root.is_dir():
-        raise AntWarRuntimeError("backend archive has no game directory")
+        raise AntWar2RuntimeError("backend archive has no game directory")
     patched = _enable_windows_binary_transport(game_root / "src/main.cpp")
     completed = subprocess.run(
         ("make", "-C", str(game_root), f"-j{max(1, min(os.cpu_count() or 1, 8))}"),
@@ -185,7 +185,7 @@ def build_backend(layout: AntWarLayout) -> FrozenBackend:
     )
     if completed.returncode != 0 or not executable.is_file():
         diagnostic = (completed.stderr or completed.stdout)[-8000:]
-        raise AntWarRuntimeError(f"backend build failed: {diagnostic}")
+        raise AntWar2RuntimeError(f"backend build failed: {diagnostic}")
     compiler = subprocess.run(
         ("g++", "--version"),
         capture_output=True,
@@ -226,7 +226,7 @@ class Opponent:
     exclusion_diagnostic: str | None
 
 
-def audit_human_pool(layout: AntWarLayout) -> tuple[Opponent, ...]:
+def audit_human_pool(layout: AntWar2Layout) -> tuple[Opponent, ...]:
     layout.validate()
     pool: list[Opponent] = []
     with layout.human_manifest.open(encoding="utf-8", newline="") as handle:
@@ -234,7 +234,7 @@ def audit_human_pool(layout: AntWarLayout) -> tuple[Opponent, ...]:
             rank = int(row["rank"])
             packages = tuple(sorted(layout.human_extracted_root.glob(f"rank{rank:02d}__*")))
             if len(packages) != 1:
-                raise AntWarRuntimeError(
+                raise AntWar2RuntimeError(
                     f"rank{rank:02d} maps to {len(packages)} extracted packages"
                 )
             package = packages[0]
@@ -259,16 +259,16 @@ def audit_human_pool(layout: AntWarLayout) -> tuple[Opponent, ...]:
             )
     pool.sort(key=lambda item: item.rank)
     if [item.rank for item in pool] != list(range(1, len(pool) + 1)):
-        raise AntWarRuntimeError("human ranks must be contiguous from rank01")
+        raise AntWar2RuntimeError("human ranks must be contiguous from rank01")
     return tuple(pool)
 
 
-def materialize_bootstrap(layout: AntWarLayout, support_root: Path, destination: Path) -> None:
+def materialize_bootstrap(layout: AntWar2Layout, support_root: Path, destination: Path) -> None:
     """Copy only the public SDK and policy support; the Goal must create ai.py."""
 
     layout.validate()
     if destination.exists() and any(destination.iterdir()):
-        raise AntWarRuntimeError(f"bootstrap destination is not empty: {destination}")
+        raise AntWar2RuntimeError(f"bootstrap destination is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     for name in ("main.py", "common.py", "protocol.py"):
         source = support_root / name

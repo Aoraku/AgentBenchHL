@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agentbench_hl.adapters.antwar2.policy_probe import probe_policy_episode
-from agentbench_hl.adapters.antwar2.runtime import AntWarLayout
+from agentbench_hl.adapters.antwar2.runtime import AntWar2Layout
 
 REPLAY = Path(__file__).parents[1] / "golden/antwar2_replays/fixture.json"
 
@@ -19,7 +19,7 @@ def test_policy_probe_reconstructs_public_decision_states_in_a_subprocess(
     agentbench = os.environ.get("AGENTBENCH_ROOT")
     if not agentbench:
         pytest.skip("AGENTBENCH_ROOT is required for the frozen SDK probe")
-    layout = AntWarLayout.from_root(agentbench, tmp_path / "build")
+    layout = AntWar2Layout.from_root(agentbench, tmp_path / "build")
     layout.validate()
     repository = Path(__file__).parents[2]
     candidate = tmp_path / "candidate"
@@ -59,7 +59,7 @@ def test_policy_probe_runs_through_the_candidate_command_prefix(tmp_path: Path) 
     agentbench = os.environ.get("AGENTBENCH_ROOT")
     if not agentbench:
         pytest.skip("AGENTBENCH_ROOT is required for the frozen SDK probe")
-    layout = AntWarLayout.from_root(agentbench, tmp_path / "build")
+    layout = AntWar2Layout.from_root(agentbench, tmp_path / "build")
     layout.validate()
     repository = Path(__file__).parents[2]
     candidate = tmp_path / "candidate"

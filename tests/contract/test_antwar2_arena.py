@@ -8,11 +8,11 @@ from pathlib import Path
 import pytest
 
 from agentbench_hl.adapters.antwar2.arena import (
-    AntWarArena,
+    AntWar2Arena,
     match_result_from_replay,
 )
 from agentbench_hl.adapters.antwar2.runtime import (
-    AntWarLayout,
+    AntWar2Layout,
     audit_human_pool,
     build_backend,
     materialize_bootstrap,
@@ -75,7 +75,7 @@ def test_terminal_replay_becomes_role_aware_match_result(tmp_path: Path) -> None
 
 
 def test_human_pool_audit_is_ranked_and_records_unrunnable_entries(tmp_path: Path) -> None:
-    layout = AntWarLayout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
     pool = audit_human_pool(layout)
 
     assert [item.rank for item in pool] == list(range(1, 21))
@@ -91,7 +91,7 @@ def test_human_pool_audit_is_ranked_and_records_unrunnable_entries(tmp_path: Pat
 def test_public_sdk_and_existing_official_backend_match_frozen_hashes() -> None:
     if not AGENTBENCH_ROOT.is_dir() or not EXISTING_BUILD_ROOT.is_dir():
         pytest.skip("local frozen AntWar2 resources are unavailable")
-    layout = AntWarLayout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
+    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
 
     layout.validate(expected_sdk_sha256=EXPECTED_SDK_HASH)
     backend = build_backend(layout)
@@ -105,7 +105,7 @@ def test_public_sdk_and_existing_official_backend_match_frozen_hashes() -> None:
 def test_smoke_rejects_illegal_operation(tmp_path: Path) -> None:
     if not AGENTBENCH_ROOT.is_dir():
         pytest.skip("local frozen AntWar2 resources are unavailable")
-    layout = AntWarLayout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
@@ -130,7 +130,7 @@ class AI(BaseAgent):
 def test_smoke_runs_through_the_candidate_command_prefix(tmp_path: Path) -> None:
     if not AGENTBENCH_ROOT.is_dir():
         pytest.skip("local frozen AntWar2 resources are unavailable")
-    layout = AntWarLayout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
@@ -168,7 +168,7 @@ def test_match_failure_is_incomplete_not_loss(tmp_path: Path) -> None:
     candidate_root = tmp_path / "candidate"
     candidate_root.mkdir()
     (candidate_root / "main.py").write_text("", encoding="utf-8")
-    arena = AntWarArena(
+    arena = AntWar2Arena(
         game=ProcessSpec(("game",), tmp_path),
         opponents={
             "rank20": ProcessSpec(("python", "main.py"), opponent_root),
@@ -197,7 +197,7 @@ def test_match_failure_is_incomplete_not_loss(tmp_path: Path) -> None:
 def test_official_match_transport_completes_against_rank20(tmp_path: Path) -> None:
     if os.environ.get("ABHL_RUN_OFFICIAL_MATCH_TEST") != "1":
         pytest.skip("set ABHL_RUN_OFFICIAL_MATCH_TEST=1 to run native match")
-    layout = AntWarLayout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
+    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
     backend = build_backend(layout)
     pool = audit_human_pool(layout)
     rank20 = next(item for item in pool if item.opponent_id == "rank20")
@@ -218,7 +218,7 @@ class AI(BaseAgent):
         tmp_path / "candidate.sb",
         denied_read_roots=(layout.human_manifest.parent,),
     )
-    arena = AntWarArena(
+    arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parent.parent),
         opponents={
             "rank20": ProcessSpec(rank20.entry_command, rank20.package_root),
