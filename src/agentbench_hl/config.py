@@ -95,7 +95,7 @@ class MeasurementConfig:
 @dataclass(frozen=True)
 class EvaluatorConfig:
     certification_seeds: tuple[int, ...]
-    roles: tuple[Literal["P0", "P1"], ...]
+    roles: tuple[str, ...]
 
     @classmethod
     def load(cls, path: Path) -> EvaluatorConfig:
@@ -107,20 +107,33 @@ class EvaluatorConfig:
         if (
             not isinstance(raw_roles, list)
             or not raw_roles
-            or any(role not in {"P0", "P1"} for role in raw_roles)
+            or any(not isinstance(role, str) or not role for role in raw_roles)
             or len(set(raw_roles)) != len(raw_roles)
         ):
-            raise ValueError("roles must be unique P0/P1 values")
+            raise ValueError("roles must be unique non-empty strings")
         return cls(
             certification_seeds=_seeds(root.get("certification_seeds"), "certification_seeds"),
-            roles=cast(tuple[Literal["P0", "P1"], ...], tuple(raw_roles)),
+            roles=tuple(str(role) for role in raw_roles),
         )
+
+
+_SAFE_GAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}\Z")
+
+
+def _gamepacks_root(config_path: Path) -> Path:
+    """Locate the repository ``gamepacks/`` directory from a config file path.
+
+    Experiment configs live under ``configs/experiments/<name>.yaml`` inside the
+    repository, so the repository root is three levels up from the config file.
+    """
+
+    return config_path.resolve().parents[2] / "gamepacks"
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     schema_version: Literal["1.0"]
-    game: Literal["antwar2"]
+    game: str
     origin: Literal["from_scratch"]
     provider: ProviderConfig
     runtime: RuntimeConfig
@@ -134,6 +147,8 @@ class ExperimentConfig:
         cls,
         path: Path,
         env: Mapping[str, str] | None = None,
+        *,
+        gamepacks_root: Path | None = None,
     ) -> ExperimentConfig:
         environment = dict(os.environ if env is None else env)
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -142,8 +157,12 @@ class ExperimentConfig:
             raise ValueError("origin must be from_scratch")
         if root.get("schema_version") != "1.0":
             raise ValueError("schema_version must be 1.0")
-        if root.get("game") != "antwar2":
-            raise ValueError("game must be antwar2")
+        game = _text(root.get("game"), "game")
+        if not _SAFE_GAME.fullmatch(game):
+            raise ValueError("game must be a lowercase [a-z0-9_] identifier")
+        packs_root = gamepacks_root if gamepacks_root is not None else _gamepacks_root(path)
+        if not (packs_root / game).is_dir():
+            raise ValueError(f"no GamePack registered for game {game!r} under {packs_root}")
 
         provider = _mapping(root.get("provider"), "provider")
         runtime = _mapping(root.get("runtime"), "runtime")
@@ -175,7 +194,7 @@ class ExperimentConfig:
 
         return cls(
             schema_version="1.0",
-            game="antwar2",
+            game=game,
             origin="from_scratch",
             provider=ProviderConfig(
                 model=_text(provider.get("model"), "provider.model"),

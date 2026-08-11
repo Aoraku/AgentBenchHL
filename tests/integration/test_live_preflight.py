@@ -27,6 +27,7 @@ def test_new_run_requires_the_api_key_before_creating_artifacts(
     repository = tmp_path / "repository"
     config_root = repository / "configs/experiments"
     config_root.mkdir(parents=True)
+    (repository / "gamepacks/antwar2").mkdir(parents=True)
     config = config_root / "antwar2.yaml"
     config.write_text(
         """schema_version: "1.0"
@@ -183,6 +184,7 @@ def test_resume_live_run_rejects_an_unknown_run_before_provider_startup(
     repository = tmp_path / "repository"
     config_root = repository / "configs/experiments"
     config_root.mkdir(parents=True)
+    (repository / "gamepacks/antwar2").mkdir(parents=True)
     config = config_root / "antwar2.yaml"
     config.write_text(
         """schema_version: "1.0"

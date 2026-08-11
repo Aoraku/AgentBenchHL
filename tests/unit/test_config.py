@@ -30,6 +30,13 @@ measurement:
 """
 
 
+def _gamepacks_with(tmp_path: Path, *games: str) -> Path:
+    packs = tmp_path / "gamepacks"
+    for game in games:
+        (packs / game).mkdir(parents=True, exist_ok=True)
+    return packs
+
+
 def test_config_expands_public_paths_but_never_serializes_key(
     tmp_path: Path,
 ) -> None:
@@ -39,8 +46,10 @@ def test_config_expands_public_paths_but_never_serializes_key(
     config = ExperimentConfig.load(
         path,
         env={"AB_ROOT": "/bench", "ABHL_API_KEY": "secret-value"},
+        gamepacks_root=_gamepacks_with(tmp_path, "antwar2"),
     )
 
+    assert config.game == "antwar2"
     assert config.paths.agentbench_root == Path("/bench")
     assert config.paths.runs_root == (tmp_path / "runs").resolve()
     assert config.runtime.max_iterations is None
@@ -48,12 +57,41 @@ def test_config_expands_public_paths_but_never_serializes_key(
     assert "secret-value" not in repr(config.frozen_dict())
 
 
+def test_config_accepts_any_registered_gamepack(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.yaml"
+    path.write_text(VALID_CONFIG.replace("game: antwar2", "game: chess"), encoding="utf-8")
+
+    config = ExperimentConfig.load(
+        path,
+        env={"AB_ROOT": "/bench", "ABHL_API_KEY": "secret-value"},
+        gamepacks_root=_gamepacks_with(tmp_path, "chess"),
+    )
+
+    assert config.game == "chess"
+
+
+def test_config_rejects_game_without_gamepack(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.yaml"
+    path.write_text(VALID_CONFIG, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no GamePack registered"):
+        ExperimentConfig.load(
+            path,
+            env={"AB_ROOT": "/bench", "ABHL_API_KEY": "secret-value"},
+            gamepacks_root=_gamepacks_with(tmp_path, "snakego"),
+        )
+
+
 def test_config_rejects_non_from_scratch_origin(tmp_path: Path) -> None:
     path = tmp_path / "experiment.yaml"
     path.write_text(VALID_CONFIG.replace("from_scratch", "v239"), encoding="utf-8")
 
     with pytest.raises(ValueError, match="from_scratch"):
-        ExperimentConfig.load(path, env={"AB_ROOT": "/bench"})
+        ExperimentConfig.load(
+            path,
+            env={"AB_ROOT": "/bench"},
+            gamepacks_root=_gamepacks_with(tmp_path, "antwar2"),
+        )
 
 
 def test_evaluator_config_is_separate_from_goal_visible_config(
