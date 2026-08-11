@@ -23,11 +23,24 @@ from agentbench_hl.adapters.codex_goal.read_isolation import (
 )
 from agentbench_hl.ports.arena import MatchCase, ProcessSpec
 
-AGENTBENCH_ROOT = Path("/Users/qingle/Code/SAST/AgentBench")
-EXISTING_BUILD_ROOT = Path(
-    "/Users/qingle/Documents/SAST/AgentBenchFramework-hl/.agentbench/30_antwar2/build"
-)
+
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else None
+
+
+# Frozen AntWar2 resources live outside this repository and are provided per
+# machine through environment variables (see README). Tests that need them skip
+# when the variables are unset so the public suite never hard-codes local paths.
+AGENTBENCH_ROOT = _env_path("AGENTBENCH_ROOT")
+EXISTING_BUILD_ROOT = _env_path("AGENTBENCH_BUILD_ROOT")
 EXPECTED_SDK_HASH = "f54280bb6b4407609ee7cc0b4df405b37c8009d5049dbaa642f12b5648a9efe0"
+
+
+def _require_agentbench_root() -> Path:
+    if AGENTBENCH_ROOT is None or not AGENTBENCH_ROOT.is_dir():
+        pytest.skip("set AGENTBENCH_ROOT to a frozen AntWar2 backend to run this test")
+    return AGENTBENCH_ROOT
 
 
 def write_terminal_replay(path: Path, *, winner: int, bases: list[int]) -> Path:
@@ -75,7 +88,8 @@ def test_terminal_replay_becomes_role_aware_match_result(tmp_path: Path) -> None
 
 
 def test_human_pool_audit_is_ranked_and_records_unrunnable_entries(tmp_path: Path) -> None:
-    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    agentbench_root = _require_agentbench_root()
+    layout = AntWar2Layout.from_root(agentbench_root, tmp_path / "build")
     pool = audit_human_pool(layout)
 
     assert [item.rank for item in pool] == list(range(1, 21))
@@ -89,8 +103,13 @@ def test_human_pool_audit_is_ranked_and_records_unrunnable_entries(tmp_path: Pat
 
 
 def test_public_sdk_and_existing_official_backend_match_frozen_hashes() -> None:
-    if not AGENTBENCH_ROOT.is_dir() or not EXISTING_BUILD_ROOT.is_dir():
-        pytest.skip("local frozen AntWar2 resources are unavailable")
+    if (
+        AGENTBENCH_ROOT is None
+        or not AGENTBENCH_ROOT.is_dir()
+        or EXISTING_BUILD_ROOT is None
+        or not EXISTING_BUILD_ROOT.is_dir()
+    ):
+        pytest.skip("set AGENTBENCH_ROOT and AGENTBENCH_BUILD_ROOT to run this test")
     layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
 
     layout.validate(expected_sdk_sha256=EXPECTED_SDK_HASH)
@@ -103,9 +122,8 @@ def test_public_sdk_and_existing_official_backend_match_frozen_hashes() -> None:
 
 
 def test_smoke_rejects_illegal_operation(tmp_path: Path) -> None:
-    if not AGENTBENCH_ROOT.is_dir():
-        pytest.skip("local frozen AntWar2 resources are unavailable")
-    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    agentbench_root = _require_agentbench_root()
+    layout = AntWar2Layout.from_root(agentbench_root, tmp_path / "build")
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
@@ -128,9 +146,8 @@ class AI(BaseAgent):
 
 
 def test_smoke_runs_through_the_candidate_command_prefix(tmp_path: Path) -> None:
-    if not AGENTBENCH_ROOT.is_dir():
-        pytest.skip("local frozen AntWar2 resources are unavailable")
-    layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, tmp_path / "build")
+    agentbench_root = _require_agentbench_root()
+    layout = AntWar2Layout.from_root(agentbench_root, tmp_path / "build")
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
@@ -197,6 +214,8 @@ def test_match_failure_is_incomplete_not_loss(tmp_path: Path) -> None:
 def test_official_match_transport_completes_against_rank20(tmp_path: Path) -> None:
     if os.environ.get("ABHL_RUN_OFFICIAL_MATCH_TEST") != "1":
         pytest.skip("set ABHL_RUN_OFFICIAL_MATCH_TEST=1 to run native match")
+    if AGENTBENCH_ROOT is None or EXISTING_BUILD_ROOT is None:
+        pytest.skip("set AGENTBENCH_ROOT and AGENTBENCH_BUILD_ROOT to run native match")
     layout = AntWar2Layout.from_root(AGENTBENCH_ROOT, EXISTING_BUILD_ROOT)
     backend = build_backend(layout)
     pool = audit_human_pool(layout)
