@@ -85,8 +85,8 @@ class ExperienceRecord:
             or self.scientific_iteration < 0
         ):
             raise ValueError("scientific_iteration must be a non-negative integer")
-        if self.role not in {"P0", "P1"}:
-            raise ValueError("role must be P0 or P1")
+        if not isinstance(self.role, str) or not self.role:
+            raise ValueError("role must be a non-empty string")
         if self.verdict not in _VERDICTS:
             raise ValueError(f"unknown experience verdict: {self.verdict}")
         if self.selection not in _SELECTIONS:

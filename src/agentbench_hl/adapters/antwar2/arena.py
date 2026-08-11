@@ -74,8 +74,8 @@ def match_result_from_replay(
         result="win" if won else "loss",
         points=1.0 if won else 0.0,
         score_margin=base_hp[candidate_player] - base_hp[opponent_player],
-        terminal_base_hp=base_hp,
         rounds=len(replay),
+        payload={"terminal_base_hp": base_hp},
         replay_path=source,
         trace_path=None if trace_path is None else Path(trace_path).resolve(),
         events_path=None if events_path is None else Path(events_path).resolve(),
@@ -475,7 +475,6 @@ class AntWarArena:
                 result=None,
                 points=None,
                 score_margin=None,
-                terminal_base_hp=None,
                 rounds=None,
                 error=str(exc),
             )

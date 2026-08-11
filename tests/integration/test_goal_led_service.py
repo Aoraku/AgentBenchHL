@@ -68,8 +68,8 @@ class PublicReplayArena:
             result="win",
             points=1.0,
             score_margin=5.0,
-            terminal_base_hp=(5.0, 0.0),
             rounds=1,
+            payload={"terminal_base_hp": (5.0, 0.0)},
             replay_path=replay,
             trace_path=trace,
         )

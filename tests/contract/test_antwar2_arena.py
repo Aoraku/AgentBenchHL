@@ -71,7 +71,7 @@ def test_terminal_replay_becomes_role_aware_match_result(tmp_path: Path) -> None
     assert result.status == "complete"
     assert result.result == "win"
     assert result.score_margin == 7.0
-    assert result.terminal_base_hp == (0.0, 7.0)
+    assert result.payload["terminal_base_hp"] == (0.0, 7.0)
 
 
 def test_human_pool_audit_is_ranked_and_records_unrunnable_entries(tmp_path: Path) -> None:

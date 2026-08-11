@@ -774,8 +774,8 @@ def test_apparent_all_win_requires_two_additional_seed_waves_before_promotion(
                 result="win" if won else "loss",
                 points=1.0 if won else 0.0,
                 score_margin=10.0 if won else -10.0,
-                terminal_base_hp=(50.0, 0.0) if won else (0.0, 50.0),
                 rounds=4,
+                payload={"terminal_base_hp": (50.0, 0.0) if won else (0.0, 50.0)},
                 replay_path=replay,
             )
 
@@ -813,8 +813,8 @@ def test_certification_completes_only_after_frozen_matrix_all_wins(
                 result="win",
                 points=1.0,
                 score_margin=10.0,
-                terminal_base_hp=(50.0, 0.0),
                 rounds=4,
+                payload={"terminal_base_hp": (50.0, 0.0)},
                 replay_path=replay,
             )
 
@@ -857,8 +857,8 @@ def test_failed_hidden_certification_continues_learning_on_strongest_public_targ
                 result="win" if won else "loss",
                 points=1.0 if won else 0.0,
                 score_margin=10.0 if won else -10.0,
-                terminal_base_hp=(50.0, 0.0) if won else (0.0, 50.0),
                 rounds=4,
+                payload={"terminal_base_hp": (50.0, 0.0) if won else (0.0, 50.0)},
                 replay_path=replay,
             )
 
@@ -925,10 +925,12 @@ def test_curriculum_uses_the_selected_frontier_for_promotion_progress(
                 result="win" if case.candidate_id != "v000" and case.role == "P0" else "loss",
                 points=1.0 if case.candidate_id != "v000" and case.role == "P0" else 0.0,
                 score_margin=10.0,
-                terminal_base_hp=(50.0, 0.0)
-                if case.candidate_id != "v000" and case.role == "P0"
-                else (0.0, 50.0),
                 rounds=4,
+                payload={
+                    "terminal_base_hp": (50.0, 0.0)
+                    if case.candidate_id != "v000" and case.role == "P0"
+                    else (0.0, 50.0)
+                },
                 replay_path=replay,
             )
 

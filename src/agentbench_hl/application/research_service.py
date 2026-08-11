@@ -75,8 +75,8 @@ class ResearchService:
         return appended
 
     def context(self, *, target: str, role: str, max_records: int) -> ResearchContext:
-        if role not in {"P0", "P1"}:
-            raise ValueError("research context role must be P0 or P1")
+        if not isinstance(role, str) or not role:
+            raise ValueError("research context role must be a non-empty string")
         if max_records < 1:
             raise ValueError("max_records must be positive")
         relevant = [

@@ -154,8 +154,8 @@ class RunService:
         if not 0.0 <= required_win_rate <= 1.0:
             raise ValueError("required_win_rate must be in [0, 1]")
         self.required_win_rate = float(required_win_rate)
-        if role not in {"P0", "P1"}:
-            raise ValueError("run role must be P0 or P1")
+        if not isinstance(role, str) or not role:
+            raise ValueError("run role must be a non-empty string")
         self.root.mkdir(parents=True, exist_ok=True)
         self.research_root = self.root / "research"
         self.research_root.mkdir(exist_ok=True)
@@ -611,7 +611,7 @@ class RunService:
             "result": result.result,
             "points": result.points,
             "score_margin": result.score_margin,
-            "terminal_base_hp": result.terminal_base_hp,
+            "terminal_base_hp": result.payload.get("terminal_base_hp"),
             "rounds": result.rounds,
             "replay_path": None if result.replay_path is None else str(result.replay_path),
             "error": result.error,

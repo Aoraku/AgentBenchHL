@@ -288,7 +288,7 @@ class EvaluationService:
                         "result": result.result,
                         "points": result.points,
                         "score_margin": result.score_margin,
-                        "terminal_base_hp": result.terminal_base_hp,
+                        "terminal_base_hp": result.payload.get("terminal_base_hp"),
                         "rounds": result.rounds,
                         "replay_path": str(result.replay_path),
                         "trace_path": (

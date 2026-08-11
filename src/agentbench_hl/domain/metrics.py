@@ -48,8 +48,8 @@ class EloResult:
     points: float
 
     def __post_init__(self) -> None:
-        if self.role not in {"P0", "P1"}:
-            raise ValueError("Elo role must be P0 or P1")
+        if not isinstance(self.role, str) or not self.role:
+            raise ValueError("Elo role must be a non-empty string")
         if not 0 <= self.points <= 1:
             raise ValueError("Elo points must be in [0, 1]")
 
