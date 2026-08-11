@@ -7,7 +7,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 from agentbench_hl.application.candidate_service import CandidateService
@@ -31,9 +31,15 @@ from agentbench_hl.application.iteration_service import (
 from agentbench_hl.application.metrics_service import MetricsService
 from agentbench_hl.application.replay_service import ReplayService
 from agentbench_hl.application.research_service import ResearchService
+from agentbench_hl.application.run_results import (
+    CertificationResult,
+    IterationAdvanceResult,
+    RunResult,
+    advance_run,
+)
 from agentbench_hl.domain.events import FinalizedEvent
 from agentbench_hl.domain.experience import EvidenceWindow, ExperienceRecord
-from agentbench_hl.domain.lineage import CandidateWorkspace, LineageState
+from agentbench_hl.domain.lineage import CandidateWorkspace
 from agentbench_hl.domain.metrics import IterationMetrics, combine_usage
 from agentbench_hl.domain.models import Usage
 from agentbench_hl.domain.policy import (
@@ -54,36 +60,13 @@ _QUALIFICATION_SEED_OFFSETS = (0, 10_000, 20_000)
 _GOAL_ROTATION_INPUT_TOKENS = 64_000
 
 
-@dataclass(frozen=True)
-class RunResult:
-    root: Path
-    lineage: LineageState
-    match_id: str
-    metrics: IterationMetrics
-    events: tuple[FinalizedEvent, ...]
-
-    def event_count(self, event_type: str) -> int:
-        return sum(item.event_type == event_type for item in self.events)
-
-
-@dataclass(frozen=True)
-class IterationAdvanceResult:
-    version_id: str
-    parent_id: str
-    target_id: str
-    selection: str
-    evaluation: EvaluationResult
-    metrics: IterationMetrics
-
-
-@dataclass(frozen=True)
-class CertificationResult:
-    champion_id: str
-    passed: bool
-    total_cases: int
-    wins: int
-    incomplete_cases: tuple[str, ...]
-    failed_cases: tuple[str, ...]
+__all__ = [
+    "CertificationResult",
+    "IterationAdvanceResult",
+    "RunResult",
+    "RunService",
+    "advance_run",
+]
 
 
 class RunService:
@@ -1621,11 +1604,4 @@ class RunService:
         )
 
 
-def advance_run(
-    run: RunService,
-    *,
-    acts: int,
-) -> tuple[IterationAdvanceResult, ...]:
-    if isinstance(acts, bool) or acts < 1:
-        raise ValueError("acts must be a positive integer")
-    return tuple(run.advance_one_iteration() for _ in range(acts))
+

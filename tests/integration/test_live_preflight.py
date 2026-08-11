@@ -7,13 +7,13 @@ from pathlib import Path
 import pytest
 
 import agentbench_hl.application.live_run as live_run
+from agentbench_hl.adapters.antwar2.factory import official_human_ratings
 from agentbench_hl.adapters.antwar2.runtime import Opponent
 from agentbench_hl.adapters.codex_goal.read_isolation import (
     isolated_app_server_command,
     write_candidate_isolation_profile,
     write_read_isolation_profile,
 )
-from agentbench_hl.adapters.antwar2.factory import official_human_ratings
 from agentbench_hl.application.live_run import (
     build_live_run,
     probe_codex_installation,
