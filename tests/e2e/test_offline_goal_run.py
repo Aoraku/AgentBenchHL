@@ -11,6 +11,7 @@ from agentbench_hl.adapters.antwar2.policy_probe import (
     PolicyDecision,
     PolicyEpisodeTrace,
 )
+from agentbench_hl.adapters.antwar2.replay import decode_replay
 from agentbench_hl.adapters.antwar2.runtime import Opponent
 from agentbench_hl.adapters.antwar2.smoke import ValidationResult
 from agentbench_hl.adapters.filesystem.artifact_store import FilesystemArtifactStore
@@ -158,6 +159,7 @@ def build_offline_run(
         opponent_hashes={"rank20": opponent.archive_sha256},
         candidate_validator=candidate_validator,
         policy_probe=policy_probe,
+        replay_decoder=decode_replay,
         certification_roles=("P0", "P1"),
         certification_seeds=(11,),
     )
@@ -201,6 +203,7 @@ def test_resume_reuses_finalized_match(tmp_path: Path) -> None:
         runtime=goal,
         arena=resumed_arena,
         human_ratings={"rank20": 1000.0},
+        replay_decoder=decode_replay,
     )
     result = resumed.execute_until("checkpoint")
 
@@ -222,6 +225,7 @@ def test_resumed_run_can_advance_the_same_goal_and_long_run_curriculum(
         arena=FixtureArena(tmp_path),
         opponents=run.opponents,
         candidate_validator=run.candidate_validator,
+        replay_decoder=decode_replay,
     )
     result = resumed.advance_one_iteration()
 

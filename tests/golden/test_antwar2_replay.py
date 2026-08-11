@@ -45,7 +45,7 @@ def test_replay_service_materializes_deterministic_artifacts(tmp_path: Path) -> 
         (FIXTURES / "fixture.json").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
-    artifacts = ReplayService(tmp_path / "artifacts").materialize(
+    artifacts = ReplayService(tmp_path / "artifacts", decode=decode_replay).materialize(
         match_id="fixture",
         replay_path=replay,
     )

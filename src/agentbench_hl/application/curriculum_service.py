@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from agentbench_hl.adapters.antwar2.runtime import Opponent
+from agentbench_hl.ports.population import PopulationEntry
 
 
 @dataclass(frozen=True)
@@ -44,14 +44,14 @@ class CurriculumService:
     def __init__(
         self,
         *,
-        opponents: tuple[Opponent, ...],
+        opponents: tuple[PopulationEntry, ...],
         roles: tuple[str, ...],
         seeds: tuple[int, ...],
         matches: tuple[CurriculumMatch, ...],
         required_win_rate: float = 0.5,
     ) -> None:
-        if not roles or any(role not in {"P0", "P1"} for role in roles):
-            raise ValueError("curriculum roles must be P0/P1")
+        if not roles or any(not isinstance(role, str) or not role for role in roles):
+            raise ValueError("curriculum roles must be non-empty strings")
         if not seeds:
             raise ValueError("curriculum seeds cannot be empty")
         if not 0.0 <= required_win_rate <= 1.0:
@@ -113,7 +113,7 @@ class CurriculumService:
             ),
         )
 
-    def default_target(self) -> Opponent:
+    def default_target(self) -> PopulationEntry:
         status = self.status()
         candidates = [
             opponent

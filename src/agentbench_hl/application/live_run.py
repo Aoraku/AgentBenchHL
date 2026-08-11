@@ -16,6 +16,7 @@ import yaml
 
 from agentbench_hl.adapters.antwar2.arena import AntWarArena
 from agentbench_hl.adapters.antwar2.policy_probe import probe_policy_episode
+from agentbench_hl.adapters.antwar2.replay import decode_replay
 from agentbench_hl.adapters.antwar2.runtime import (
     AntWarLayout,
     Opponent,
@@ -314,6 +315,7 @@ def build_live_run(
             probe_policy_episode,
             command_prefix=candidate_command_prefix,
         ),
+        replay_decoder=decode_replay,
         certification_roles=tuple(evaluator.roles),
         certification_seeds=evaluator.certification_seeds,
         required_win_rate=0.5,
@@ -444,6 +446,7 @@ def resume_live_run(
             probe_policy_episode,
             command_prefix=candidate_command_prefix,
         ),
+        replay_decoder=decode_replay,
         certification_roles=tuple(evaluator.roles),
         certification_seeds=evaluator.certification_seeds,
         required_win_rate=0.5,

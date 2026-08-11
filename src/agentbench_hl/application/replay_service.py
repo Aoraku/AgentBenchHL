@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentbench_hl.adapters.antwar2.replay import decode_replay
+from agentbench_hl.ports.replay import ReplayDecoder
 
 
 @dataclass(frozen=True)
@@ -18,15 +18,16 @@ class ReplayArtifacts:
 
 
 class ReplayService:
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, decode: ReplayDecoder) -> None:
         self.root = Path(root)
+        self.decode = decode
 
     def materialize(self, *, match_id: str, replay_path: str | Path) -> ReplayArtifacts:
         source = Path(replay_path)
         raw = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
             raise ValueError("official replay must be a list of round objects")
-        report = decode_replay(raw, match_id=match_id)
+        report = self.decode(raw, match_id=match_id)
         target = self.root / match_id
         target.mkdir(parents=True, exist_ok=True)
         artifacts = ReplayArtifacts(

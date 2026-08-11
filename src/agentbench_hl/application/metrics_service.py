@@ -5,11 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from agentbench_hl.adapters.antwar2.policy_probe import (
-    DecisionSample,
-    compare_decisions,
-    occupancy_total_variation,
-)
 from agentbench_hl.domain.events import FinalizedEvent
 from agentbench_hl.domain.metrics import (
     EloResult,
@@ -18,6 +13,11 @@ from agentbench_hl.domain.metrics import (
     fit_anchored_elo,
 )
 from agentbench_hl.domain.models import Usage
+from agentbench_hl.domain.policy import (
+    DecisionSample,
+    compare_decisions,
+    occupancy_total_variation,
+)
 from agentbench_hl.ports.event_store import EventStore
 
 

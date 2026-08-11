@@ -10,12 +10,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from agentbench_hl.adapters.antwar2.policy_probe import (
-    PolicyEpisodeTrace,
-    compare_decisions,
-    compare_policy_episode,
-)
-from agentbench_hl.adapters.antwar2.runtime import Opponent
 from agentbench_hl.application.candidate_service import CandidateService
 from agentbench_hl.application.curriculum_service import (
     CurriculumComplete,
@@ -42,10 +36,17 @@ from agentbench_hl.domain.experience import EvidenceWindow, ExperienceRecord
 from agentbench_hl.domain.lineage import CandidateWorkspace, LineageState
 from agentbench_hl.domain.metrics import IterationMetrics, combine_usage
 from agentbench_hl.domain.models import Usage
+from agentbench_hl.domain.policy import (
+    PolicyEpisodeTrace,
+    compare_decisions,
+    compare_policy_episode,
+)
 from agentbench_hl.ports.agent_runtime import AgentRuntime, AgentSession, RunContext
 from agentbench_hl.ports.arena import Arena, MatchCase, MatchResult
 from agentbench_hl.ports.artifact_store import ArtifactStore
 from agentbench_hl.ports.event_store import EventStore
+from agentbench_hl.ports.population import PopulationEntry
+from agentbench_hl.ports.replay import ReplayDecoder
 from agentbench_hl.reporting.curves import build_curves
 
 _POLICY_PROBE_SCHEMA = "antwar2-round-v2"
@@ -110,12 +111,13 @@ class RunService:
         model: str = "gpt-5.5",
         model_provider: str = "OpenAI",
         candidate_validator: Callable[[Path], object] | None = None,
-        opponents: tuple[Opponent, ...] = (),
+        opponents: tuple[PopulationEntry, ...] = (),
         development_roles: tuple[str, ...] = ("P0", "P1"),
         development_seeds: tuple[int, ...] = (1,),
         backend_hash: str = "",
         opponent_hashes: Mapping[str, str] | None = None,
         policy_probe: Callable[..., PolicyEpisodeTrace] | None = None,
+        replay_decoder: ReplayDecoder | None = None,
         certification_roles: tuple[str, ...] = ("P0", "P1"),
         certification_seeds: tuple[int, ...] = (11, 12, 13),
         required_win_rate: float = 1.0,
@@ -146,6 +148,7 @@ class RunService:
         self.backend_hash = backend_hash
         self.opponent_hashes = dict(opponent_hashes or {})
         self.policy_probe = policy_probe
+        self.replay_decoder = replay_decoder
         self.certification_roles = certification_roles
         self.certification_seeds = certification_seeds
         if not 0.0 <= required_win_rate <= 1.0:
@@ -207,8 +210,9 @@ class RunService:
         certification_arena: Arena | None = None,
         human_ratings: Mapping[str, float] | None = None,
         candidate_validator: Callable[[Path], object] | None = None,
-        opponents: tuple[Opponent, ...] = (),
+        opponents: tuple[PopulationEntry, ...] = (),
         policy_probe: Callable[..., PolicyEpisodeTrace] | None = None,
+        replay_decoder: ReplayDecoder | None = None,
         certification_roles: tuple[str, ...] = ("P0", "P1"),
         certification_seeds: tuple[int, ...] = (11, 12, 13),
         required_win_rate: float = 1.0,
@@ -246,6 +250,7 @@ class RunService:
             candidate_validator=candidate_validator,
             opponents=opponents,
             policy_probe=policy_probe,
+            replay_decoder=replay_decoder,
             development_roles=tuple(
                 str(item) for item in value.get("development_roles", ["P0", "P1"])
             ),
@@ -641,10 +646,15 @@ class RunService:
         )
         return payload
 
+    def _replay_service(self) -> ReplayService:
+        if self.replay_decoder is None:
+            raise ValueError("run has no replay decoder; provide one via the game registry")
+        return ReplayService(self.root / "replays", decode=self.replay_decoder)
+
     def _ensure_replay_and_experience(self, match: Mapping[str, object]) -> None:
         if match["status"] != "complete" or not match.get("replay_path"):
             return
-        replay = ReplayService(self.root / "replays")
+        replay = self._replay_service()
         artifacts = replay.materialize(
             match_id=self.match_id,
             replay_path=Path(str(match["replay_path"])),
@@ -951,7 +961,7 @@ class RunService:
         evaluation: EvaluationResult,
         selection: str,
     ) -> None:
-        replay_service = ReplayService(self.root / "replays")
+        replay_service = self._replay_service()
         research = ResearchService(
             event_store=self.event_store,
             artifact_root=self.research_root,
