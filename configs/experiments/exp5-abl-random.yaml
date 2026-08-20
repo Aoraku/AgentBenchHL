@@ -1,0 +1,82 @@
+# 实验 5：选敌人顺序消融。5 组配置除 opponent_policy 外完全一致
+# （同游戏 antwar2、同模型、同 30 轮、同预算、同 ladder_scope）。
+# 消融组 E（对照）：每轮随机换对手，没有课程结构，用来界定顺序本身的价值。
+budget:
+  tokens: 60000000
+  wall_seconds: null
+curriculum:
+  advance_min_matches: 2
+  advance_streak: 1
+  advance_win_rate: 0.6
+  development_seeds:
+  - 1
+  - 2
+  ladder_scope: auto
+  opponent_policy: random
+  opponent_rank: null
+  opponent_start_rank: null
+  order: lowest_rank_first
+  seed_mode: fixed
+evaluation:
+  background_pool: true
+  pool_sample: 16
+  pool_seeds:
+  - 7
+game: antwar2
+goal:
+  code_constraint: any
+  experience_skills: true
+  history_mode: full
+  prompt_override: null
+  seed_policy_path: null
+isolation:
+  backend: auto
+  docker_image: null
+  rival_code_visible: false
+measurement:
+  epsilon: 0.01
+  information_gain: true
+  # 决策级行为信息增益：每轮拿 1 个配对 case 做线协议录制 + 冻结重放
+  # （成本 = 2 局录制对局 + 2 次本地重放）。0 = 关闭，曲线会记 null + 原因。
+  behavioral_ig_cases: 1
+  behavioral_ig_timeout_s: 900
+origin: from_scratch
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs
+provider:
+  api_key_env: ABHL_API_KEY
+  base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+  disable_response_storage: true
+  harness: codex
+  model: glm-5.2
+  # reasoning_effort 直接决定 agent 每次写多少 token。实测同一 prompt：
+  #   low   -> 336 output tokens / 3.6s
+  #   xhigh -> 1113 output tokens / 10.1s   （量 ×3.3）
+  # 模型本身很快（TTFT ~1s、93~110 tok/s），慢是因为 xhigh 让它写太多。
+  # 一轮迭代约 35k output tokens ≈ 318s，占该轮 850s 的 37%；
+  # 其余 63% 是 agent 自己在跑本地对局验证。
+  # 取 high：砍掉大部分冗余推理，又不像 low 那样明显掉代码质量。
+  # ⚠️ 这是**实验参数**：所有配置必须用同一档，否则主表跨模型/跨 harness 不可比。
+  reasoning_effort: high
+  # glm-5.2 不在 codex 自带的模型目录里（`codex debug models` 只返回自家模型），
+  # 不配这两项就会 "Unknown model … will use fallback model metadata"，
+  # 上下文窗口与压缩阈值全走兜底值。codex 0.147 只认这两个字段。
+  #
+  # context_window: 1M —— **当前是待核实的假设**（同事尚未回参数）。
+  # auto_compact_token_limit: 对话历史涨到这里就自动压缩。实测一个 2 轮 run 的
+  #   input token 从 5888 涨到 219571（膨胀全来自 agent 自己的工具调用历史），
+  #   期间从未触发压缩；实验二要跑 30~50 轮，不压缩必然撑爆窗口。
+  #   取 600k（60% 窗口）：留 40% 余量给单轮的大量工具输出，又不至于频繁丢历史。
+  context_window: 1000000
+  auto_compact_token_limit: 600000
+runtime:
+  agent_binary: null
+  branch_width: 1
+  codex_binary: codex
+  match_parallelism: 4
+  match_timeout_s: 1800
+  max_iterations: 30
+  network_access: disabled
+  rollout_k: 4
+schema_version: '1.1'

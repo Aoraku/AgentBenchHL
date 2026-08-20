@@ -127,12 +127,21 @@ def test_smoke_rejects_illegal_operation(tmp_path: Path) -> None:
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
+    # ⚠️ `BaseAgent` 的**唯一抽象方法是 `choose_bundle`**（见官方
+    # `games/antwar2/public_sdk/common.py`）。只覆盖 `choose_operations` 的类
+    # 根本无法实例化，那样测到的是"抽象方法未实现"，而不是本测试想测的
+    # "非法操作被拒"。所以这里必须两个都给：`choose_bundle` 让类可实例化，
+    # `choose_operations` 注入越界坐标。
     (candidate / "ai.py").write_text(
         """from common import BaseAgent
 from SDK.backend.model import Operation
 from SDK.utils.constants import OperationType
 
 class AI(BaseAgent):
+    def choose_bundle(self, state, player, bundles=None):
+        bundles = bundles or self.list_bundles(state, player)
+        return bundles[0]
+
     def choose_operations(self, state, player, bundles=None):
         return [Operation(OperationType.BUILD_TOWER, -99, -99)]
 """,
@@ -151,11 +160,13 @@ def test_smoke_runs_through_the_candidate_command_prefix(tmp_path: Path) -> None
     support = Path(__file__).parents[2] / "gamepacks/antwar2/candidate_support"
     candidate = tmp_path / "candidate"
     materialize_bootstrap(layout, support, candidate)
+    # 同上：实现官方那个抽象方法 `choose_bundle`，取第一个合法动作包。
     (candidate / "ai.py").write_text(
         "from common import BaseAgent\n\n"
         "class AI(BaseAgent):\n"
-        "    def choose_operations(self, state, player, bundles=None):\n"
-        "        return []\n",
+        "    def choose_bundle(self, state, player, bundles=None):\n"
+        "        bundles = bundles or self.list_bundles(state, player)\n"
+        "        return bundles[0]\n",
         encoding="utf-8",
     )
     marker = tmp_path / "prefix-used"

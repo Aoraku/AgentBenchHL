@@ -1,0 +1,38 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.decide
+candidate_support: candidate_support
+decision_space: '@agentbench:games/antwar/decision_space.yaml'
+game: antwar
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/antwar/replay_format.md'
+replay_skill: '@agentbench:games/antwar/replay_skill.md'
+roles:
+- P0
+- P1
+rules: '@agentbench:games/antwar/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: 97ec99b4b366aa3ddfeca444557704d3067e3da1824f4c2146fea3d5a030ef1c
+  evaluator/arena.py: 4a5c9401942555e4dec3d08dc5f90b132499efc25ef0b394a1019e6a4c293198
+  replay_format.md: c737b27347e7d070839f82485fdeeb5e75ec3ef2396827b32c6c9ddcbc1de9bd
+  replay_skill.md: 2e4ee40a6bacf04430e27af13922b888e5fbd851fd79453f27e3800671b0ff8f
+  rules.md: 053a545eb5281e9116e705db474db9d58e248bf3dd7d21210a8772b5f3d098d5

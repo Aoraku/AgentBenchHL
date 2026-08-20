@@ -1,0 +1,40 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.play
+candidate_support: candidate_support
+decision_space: '@agentbench:games/lostspace/decision_space.yaml'
+game: lostspace
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/lostspace/replay_format.md'
+replay_skill: '@agentbench:games/lostspace/replay_skill.md'
+roles:
+- P0
+- P1
+- P2
+- P3
+rules: '@agentbench:games/lostspace/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: 0dc2432aaea4ba15473c8559383c6adf8c0ed91fa76f41cda6eedc1ce957e75c
+  evaluator/arena.py: f3e7a413cb263d63b569c350d09e693cdc5b10808ee8ff97ee5e934ae067a360
+  replay_format.md: 042ff665bc3c123e62726ed27c7f198e2158824ed35b218ecb0308e2a3d55bb4
+  replay_skill.md: a59f605cd5083e8e52ac0c7985b8dffcbd3e535e424877744ff15adc0f00146d
+  rules.md: 5b5d34e6f8b75df1c84e734cb52c661de6644a6d0d1851738ed39cb21bdcfdcf

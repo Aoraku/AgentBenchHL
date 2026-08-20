@@ -1,0 +1,38 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.decide
+candidate_support: candidate_support
+decision_space: '@agentbench:games/generals/decision_space.yaml'
+game: generals
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/generals/replay_format.md'
+replay_skill: '@agentbench:games/generals/replay_skill.md'
+roles:
+- P0
+- P1
+rules: '@agentbench:games/generals/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: bf4de1aee68c583e051588ee35a30745ac6019a96a4885b05e6efcc34babbc2c
+  evaluator/arena.py: 2d2195add95f8408f6b5940ffba873743f1c1320ee9e533a38028d0c19a7a660
+  replay_format.md: 668717d4d7937fa8ee654acbed8850696d4a115645ad00cea74c12c4a3184580
+  replay_skill.md: e4bedda3415a1565d34c1f74f7d85d4d6c4305d175ae233c3c03a4a111818cc8
+  rules.md: 63c753552c132889dda8d246b56813d493757499e71ba78883c2f0f088345ba9

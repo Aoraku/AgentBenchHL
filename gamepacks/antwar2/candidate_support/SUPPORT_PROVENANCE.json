@@ -1,0 +1,125 @@
+{
+  "candidate_interface": "AI.choose_bundle",
+  "container_denied": [
+    {
+      "path": "SDK/alphazero.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/evaluate_models.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "SDK/native_adapter.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/train_example.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/train_mcts.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/train_mcts_10epoch.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/train_sweep.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/__init__.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/alphazero.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/base.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/env.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/logging_utils.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/policies.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "SDK/training/selfplay.py",
+      "reason": "training_or_rl"
+    },
+    {
+      "path": "ai.py",
+      "reason": "ready_made_strategy"
+    },
+    {
+      "path": "ai_greedy/ai.py",
+      "reason": "ready_made_strategy"
+    },
+    {
+      "path": "ai_greedy/runtime.py",
+      "reason": "ready_made_strategy"
+    },
+    {
+      "path": "ai_greedy.py",
+      "reason": "ready_made_strategy"
+    },
+    {
+      "path": "tools/ai_lab.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "tools/ai_lab_gui.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "tools/replay_style_lab.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "tools/run_local_match.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "tools/run_packaged_match.py",
+      "reason": "local_match_or_lab"
+    },
+    {
+      "path": "tools/setup_native.py",
+      "reason": "local_match_or_lab"
+    }
+  ],
+  "dropped": [],
+  "game": "antwar2",
+  "generated_files": [
+    "_bootstrap.py",
+    "main.py",
+    "ai_example.py",
+    "CANDIDATE_CONTRACT.md"
+  ],
+  "note": "官方 SDK 按容器边界过滤后 vendor（仅改名，未改内容）；container_denied 记录被剔除的本地对局工具/训练脚本/现成策略——对局只能通过 Action→Evaluator→Feedback 发生，agent 不该有能力自己打比赛；ai_example.py 只演示接口，策略是占位，保证第 0 轮的裸策略来自规则而非照抄；非对称游戏在单包内按 <track>_sdk/ 放多套，入口按 AGENTBENCH_ROLE 选择；ported_protocol_layer 非官方原版，是我们的纯 Python 移植；候选只需写 ai.py。装配逻辑见 scripts/gen_candidate_support.py",
+  "official_sdk": {
+    ".": {
+      "python_verified_authors": 69,
+      "source": "games/antwar2/public_sdk",
+      "source_player_id": "anon__1af2399735a5af49__4878311d5dfddacd__v4",
+      "track": null,
+      "tree_sha256": "92c37898b68b8ffc31098a4b507f66621d23fee1c3407fd2cf5b9851dfdedc58"
+    }
+  },
+  "ported_protocol_layer": [],
+  "renamed": [
+    "main.py → official_main.py"
+  ],
+  "schema_version": "2.1",
+  "tracks": []
+}

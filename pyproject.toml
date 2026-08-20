@@ -34,6 +34,15 @@ markers = ["live: opt-in system/provider tests; some tests may incur API cost"]
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+# 候选脚手架是**生成物**，里面 vendor 着官方 SDK 的原版字节
+# （由 scripts/gen_candidate_support.py 从 A 仓 games/<game>/public_sdk/ 装配）。
+# 官方代码不该按我们的风格规则改——改了就不再是"人类选手当年拿到的那份"，
+# 也会让 SUPPORT_PROVENANCE.json 里的 tree_sha256 失去意义。
+# 我们自己写的那几个文件的源头在 gamepacks/_shared/ 下，仍然照常检查。
+extend-exclude = [
+    "gamepacks/*/candidate_support",
+    "gamepacks/*/candidate_support-*",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

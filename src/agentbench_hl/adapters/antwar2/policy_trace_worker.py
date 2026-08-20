@@ -139,6 +139,22 @@ def _action_key(operation: object) -> str:
     return ":".join(str(int(token)) for token in operation.to_protocol_tokens())
 
 
+def _is_legal(state: object, player: int, operation: object, pending: list[object]) -> bool:
+    """官方合法性判定，且**判定自身崩溃时算非法**。
+
+    候选包自带的 SDK 在少数边界状态上会让 ``can_apply_operation`` 抛异常而不是
+    返回 False（antwar 侧的同类问题是满级时 ``[200,250][2]`` 越界）。枚举支持集
+    必须把每个候选动作都问一遍，所以一个格子的崩溃会掀翻整局探针，让这一轮
+    退回字母表近似。把异常判为非法在语义上也是对的：连合法性都算不出来的操作，
+    提交上去同样会被后端拒绝。
+    """
+
+    try:
+        return bool(state.can_apply_operation(player, operation, pending))
+    except Exception:  # noqa: BLE001 - SDK 边界 bug，视为非法
+        return False
+
+
 def _legal_support(state: object, player: int, pending: list[object]) -> tuple[str, ...]:
     from SDK.backend.model import Operation
     from SDK.utils.constants import TOWER_UPGRADE_TREE, VALID_CELLS, OperationType
@@ -165,7 +181,7 @@ def _legal_support(state: object, player: int, pending: list[object]) -> tuple[s
     )
     legal = {"HOLD"}
     legal.update(
-        _action_key(item) for item in candidates if state.can_apply_operation(player, item, pending)
+        _action_key(item) for item in candidates if _is_legal(state, player, item, pending)
     )
     return tuple(sorted(legal))
 

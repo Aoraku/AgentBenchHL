@@ -146,6 +146,10 @@ def codex_goal_runtime(
         reasoning_effort=config.provider.reasoning_effort,
         api_key=api_key,
         use_responses_proxy=use_responses_compat_proxy(config.provider.base_url),
+        sandbox_mode=config.isolation.agent_sandbox,
+        context_window=config.provider.context_window,
+        auto_compact_token_limit=config.provider.auto_compact_token_limit,
+        model_catalog=config.provider.model_catalog,
     )
 
 
@@ -189,19 +193,30 @@ def build_goal_led_service(
     run_id: str,
     resume: bool = False,
 ):
-    """Assemble the minimal Goal-led bridge without the Plan II controller."""
+    """Assemble the minimal Goal-led bridge without the Plan II controller.
 
+    实验配置里的 harness / 对手策略 / K / seed / 并行度 / 预算 / 消融开关全部在这里
+    落到 :class:`GoalLedService`，因此"网页表单填什么，后台就真的按什么跑"。
+    """
+
+    from agentbench_hl.adapters.contract.factory import build_goal_run
     from agentbench_hl.application.goal_led_service import GoalLedService
 
-    run = (
-        resume_live_run(config_path, run_id=run_id)
-        if resume
-        else build_live_run(config_path, run_id=run_id)
-    )
+    config = ExperimentConfig.load(Path(config_path).resolve())
+    # Plan I（服务化 Goal-led）统一走**游戏无关**的契约适配器：只依赖 A 的
+    # `evaluate()` + GamePack，因此任何游戏零代码接入。Plan II（`abhl run …`）
+    # 仍走 registry 里各游戏的原生 factory（含认证矩阵/策略探针等深度装配）。
+    run = build_goal_run(config_path, run_id=run_id, resume=resume)
     if isinstance(run.runtime, CodexGoalRuntime):
         # Plan I is a true long-running Goal.  Its turn duration is controlled
         # by Codex itself, not by the five-minute Plan II checkpoint budget.
         run.runtime.checkpoint_timeout_s = 3600.0
+    seeds = (
+        config.curriculum.development_seeds
+        if config.curriculum.seed_mode == "generalize"
+        else config.curriculum.development_seeds[:1]
+    )
+    roles = tuple(getattr(run.arena, "roles", ("P0", "P1")))
     return GoalLedService(
         run_root=run.root,
         bootstrap_root=run.bootstrap_root,
@@ -215,9 +230,42 @@ def build_goal_led_service(
             {
                 "opponent_id": item.opponent_id,
                 "rank": item.rank,
-                "score": float(item.score),
+                # 分数可以为空：AquaWar 的外部参考排名只有加权分名次、没有 Elo。
+                # 课程顺序由 rank 决定，硬要求分数会把 500+ 个可用对手全丢掉。
+                "score": (None if item.score is None else float(item.score)),
+                "score_source": getattr(item, "rank_source", "crawled"),
             }
             for item in run.opponents
-            if item.runnable and item.score is not None
+            if item.runnable and item.rank is not None
         ),
+        game=config.game,
+        roles=roles,
+        seeds=seeds,
+        rollout_k=config.runtime.rollout_k,
+        opponent_policy=config.curriculum.opponent_policy,
+        opponent_rank=config.curriculum.opponent_rank,
+        opponent_start_rank=config.curriculum.opponent_start_rank,
+        advance_min_matches=config.curriculum.advance_min_matches,
+        advance_win_rate=config.curriculum.advance_win_rate,
+        advance_streak=config.curriculum.advance_streak,
+        match_parallelism=config.runtime.match_parallelism,
+        prompt_override=config.goal.prompt_override,
+        experience_skills=config.goal.experience_skills,
+        code_constraint=config.goal.code_constraint,
+        history_mode=config.goal.history_mode,
+        rival_code_visible=config.isolation.rival_code_visible,
+        token_budget=config.budget.tokens,
+        wall_budget_s=config.budget.wall_seconds,
+        epsilon=config.measurement.epsilon,
+        measure_information_gain=config.measurement.information_gain,
+        behavioral_ig_cases=config.measurement.behavioral_ig_cases,
+        behavioral_ig_timeout_s=config.measurement.behavioral_ig_timeout_s,
+        behavioral_ig_coupling=config.measurement.behavioral_ig_coupling,
+        behavioral_ig_probe=config.measurement.behavioral_ig_probe,
+        # 行为 IG 的 |A| 与动作口径来自 A 仓 games/<game>/decision_space.yaml。
+        agentbench_root=config.paths.agentbench_root,
+        iteration_mode=config.runtime.iteration_mode,
+        # 在 codex 的 remote compaction（对本模型必死）之前主动换 thread。
+        thread_rotate_context_tokens=config.runtime.thread_rotate_context_tokens,
+        thread_rotate_each_iteration=config.runtime.thread_rotate_each_iteration,
     )

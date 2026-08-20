@@ -17,6 +17,75 @@ from agentbench_hl.adapters.codex_goal.protocol import JsonRpcStdioClient
 from agentbench_hl.adapters.codex_goal.responses_proxy import ResponsesCompatProxy
 from agentbench_hl.ports.agent_runtime import AgentSession, RunContext
 
+#: codex 自带 OS 沙箱的可选口径（``codex exec -s`` 的取值）。
+AGENT_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+
+#: 厂商官方 model catalog（``~/.codex/models.json`` 的内容），逐字照录厂商文档。
+#:
+#: 为什么必须用它，而不是自己写 ``model_context_window`` 两个键：
+#: 中转模型不在 codex 自带目录里，codex 会报 "Unknown model … will use fallback
+#: model metadata" 并用**兜底**的模型元数据。兜底值里包含压缩相关的窗口，
+#: 于是压缩会在一个我们没设过、也看不到的点上触发——实测 antwar2 在 97k 上下文
+#: 触发压缩并死掉，而我们当时在 config.toml 里写的是 200000。
+#: 给出完整 catalog 后，context_window / effective_context_window_percent 等
+#: 全部由这份声明决定，压缩线才变成一个我们能控制的数。
+#:
+#: 来源：https://docs.bigmodel.cn/cn/coding-plan/tool/codex
+ZHIPU_MODEL_CATALOG: tuple[dict[str, object], ...] = (
+    {
+        "slug": "glm-5.3",
+        "display_name": "glm-5.3",
+        "description": "Z.ai's latest flagship model",
+        "default_reasoning_level": "max",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Light reasoning"},
+            {"effort": "high", "description": "Enhanced reasoning"},
+            {"effort": "max", "description": "Deep reasoning"},
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 0,
+        "base_instructions": "",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "context_window": 1048576,
+        "max_context_window": 1048576,
+        "effective_context_window_percent": 95,
+        "supports_parallel_tool_calls": True,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+    },
+    {
+        "slug": "glm-5-turbo",
+        "display_name": "glm-5-turbo",
+        "description": "Agent-optimized model",
+        "default_reasoning_level": "max",
+        "supported_reasoning_levels": [],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 1,
+        "base_instructions": "",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "context_window": 204800,
+        "max_context_window": 204800,
+        "effective_context_window_percent": 95,
+        "supports_parallel_tool_calls": True,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+    },
+)
+
+MODEL_CATALOGS: dict[str, tuple[dict[str, object], ...]] = {"zhipu": ZHIPU_MODEL_CATALOG}
+
 
 def write_codex_config(
     codex_home: str | Path,
@@ -28,7 +97,30 @@ def write_codex_config(
     writable_roots: Sequence[str | Path] = (),
     tool_roots: Sequence[str | Path] = (),
     denied_roots: Sequence[str | Path] = (),
+    sandbox_mode: str = "danger-full-access",
+    context_window: int | None = None,
+    auto_compact_token_limit: int | None = None,
+    model_catalog: str | None = None,
 ) -> Path:
+    """写 codex 的 ``config.toml``。
+
+    ``sandbox_mode`` 决定**codex 自带的 OS 级沙箱**（不是候选对局的隔离）：
+
+    * ``danger-full-access``（默认）—— 关掉 codex 自己的沙箱。实测在本项目的服务器上，
+      codex 0.147 的 ``linux_sandbox`` 连自带的 ``workspace-write`` 预设都会对每次
+      ``exec_command`` 报 ``permission_denied``（连 PATH 里的 venv 都读不到），agent
+      因此一个文件都写不了、永远交不出 ``action.json``。**候选代码的隔离由我们自己的
+      bwrap 负责**（``adapters/isolation``），那才是科学上必须成立的一层：它把人类选手池
+      与评测器 tmpfs 掉。这里关掉的只是 agent 自己那层 OS 沙箱。
+    * ``read-only`` / ``workspace-write`` —— 交给 codex 管，附带下面的命名权限 profile。
+
+    **注意**：``danger-full-access`` 下 ``denied_roots`` 不再有强制力（deny 是靠沙箱执行的），
+    "agent 不许看人类选手代码"这条改由事后审计兜（``abhl run audit`` 的
+    ``reference_policy_leaks``）。这是"先跑通"的显式取舍，不是忘了。
+    """
+
+    if sandbox_mode not in AGENT_SANDBOX_MODES:
+        raise ValueError(f"sandbox_mode must be one of {AGENT_SANDBOX_MODES}: {sandbox_mode!r}")
     root = Path(codex_home)
     root.mkdir(parents=True, exist_ok=True)
     path = root / "config.toml"
@@ -42,36 +134,71 @@ def write_codex_config(
     if writable:
         scratch_root = sorted(writable)[0] / ".agentbench/runtime-tmp"
         scratch_root.mkdir(parents=True, exist_ok=True)
-    permission_lines = [
-        "[permissions.agentbench-hl]",
-        'description = "Isolated AgentBench HL candidate research workspace"',
-        "",
-        "[permissions.agentbench-hl.filesystem]",
-        '":root" = "deny"',
-        '":minimal" = "read"',
-        '":tmpdir" = "write"',
-        '":slash_tmp" = "write"',
-    ]
-    permission_lines.extend(
-        f"{quote(str(item))} = {quote('write' if item in writable else 'read')}"
-        for item in sorted(readable)
-    )
-    permission_lines.extend(f'{quote(str(item))} = "deny"' for item in sorted(denied))
-    permission_lines.extend(
-        (
-            "",
-            "[permissions.agentbench-hl.network]",
-            "enabled = false",
-            "",
+    sandboxed = sandbox_mode != "danger-full-access"
+    # 厂商官方 model catalog：给了就写 models.json，并让 codex 从那里读模型能力。
+    # 此时**不再**写 model_context_window——两处都写只会让"压缩线到底是多少"
+    # 变成一个要靠读 codex 源码才能回答的问题。
+    catalog_path: Path | None = None
+    if model_catalog is not None:
+        if model_catalog not in MODEL_CATALOGS:
+            raise ValueError(f"unknown model_catalog: {model_catalog!r}")
+        catalog_path = root / "models.json"
+        catalog_path.write_text(
+            json.dumps({"models": list(MODEL_CATALOGS[model_catalog])}, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
         )
-    )
+    permission_lines: list[str] = []
+    if sandboxed:
+        permission_lines = [
+            "[permissions.agentbench-hl]",
+            'description = "Isolated AgentBench HL candidate research workspace"',
+            "",
+            "[permissions.agentbench-hl.filesystem]",
+            '":root" = "deny"',
+            '":minimal" = "read"',
+            '":tmpdir" = "write"',
+            '":slash_tmp" = "write"',
+        ]
+        permission_lines.extend(
+            f"{quote(str(item))} = {quote('write' if item in writable else 'read')}"
+            for item in sorted(readable)
+        )
+        permission_lines.extend(f'{quote(str(item))} = "deny"' for item in sorted(denied))
+        permission_lines.extend(
+            (
+                "",
+                "[permissions.agentbench-hl.network]",
+                "enabled = false",
+                "",
+            )
+        )
     text = "\n".join(
         (
             'model_provider = "OpenAI"',
             f"model = {quote(model)}",
             f"review_model = {quote(model)}",
             f"model_reasoning_effort = {quote(reasoning_effort)}",
-            'default_permissions = "agentbench-hl"',
+            f"sandbox_mode = {quote(sandbox_mode)}",
+            # 模型能力优先走厂商官方 catalog（见 MODEL_CATALOGS 的详注）；
+            # 没有 catalog 时才退回手工声明这两个键，否则 codex 会用兜底元数据，
+            # 压缩会在一个我们没设过的点上触发。
+            *(
+                (f"model_catalog_json = {quote(str(catalog_path))}",)
+                if catalog_path is not None
+                else ()
+            ),
+            *(
+                (f"model_context_window = {int(context_window)}",)
+                if context_window is not None and catalog_path is None
+                else ()
+            ),
+            *(
+                (f"model_auto_compact_token_limit = {int(auto_compact_token_limit)}",)
+                if auto_compact_token_limit is not None
+                else ()
+            ),
+            *(('default_permissions = "agentbench-hl"',) if sandboxed else ()),
             "",
             "[model_providers.OpenAI]",
             'name = "OpenAI"',
@@ -130,6 +257,12 @@ class CodexGoalRuntime:
         reasoning_effort: str,
         api_key: str,
         use_responses_proxy: bool = False,
+        # codex 自带 OS 沙箱。默认关掉：实测它在服务器上会拒掉每一次 exec_command，
+        # agent 因此永远交不出 action.json。候选代码的隔离由我们自己的 bwrap 负责。
+        sandbox_mode: str = "danger-full-access",
+        context_window: int | None = None,
+        auto_compact_token_limit: int | None = None,
+        model_catalog: str | None = None,
         request_timeout_s: float = 30.0,
         # A stalled provider turn must not hold the research loop for fifteen
         # minutes.  The caller can override this for unusually long tasks,
@@ -143,6 +276,12 @@ class CodexGoalRuntime:
         self.reasoning_effort = reasoning_effort
         self._api_key = api_key
         self.use_responses_proxy = use_responses_proxy
+        if sandbox_mode not in AGENT_SANDBOX_MODES:
+            raise ValueError(f"sandbox_mode must be one of {AGENT_SANDBOX_MODES}")
+        self.sandbox_mode = sandbox_mode
+        self.context_window = context_window
+        self.auto_compact_token_limit = auto_compact_token_limit
+        self.model_catalog = model_catalog
         self.request_timeout_s = request_timeout_s
         self.checkpoint_timeout_s = checkpoint_timeout_s
         self.client: JsonRpcStdioClient | None = None
@@ -154,6 +293,18 @@ class CodexGoalRuntime:
         if not effort.strip():
             raise ValueError("turn reasoning effort cannot be empty")
         self.reasoning_effort = effort.strip()
+
+    def _permission_fields(self) -> dict[str, str]:
+        """线程级要不要引用命名权限 profile。
+
+        关掉 codex 自带沙箱时**必须不发**：config.toml 里没有 ``[permissions]`` 表，
+        codex 会直接拒掉 ``thread/start``（``default_permissions requires a
+        [permissions] table``）。少了这个判断，"关沙箱"就变成"根本起不来"。
+        """
+
+        if self.sandbox_mode == "danger-full-access":
+            return {}
+        return {"permissions": "agentbench-hl"}
 
     def _environment(self) -> dict[str, str]:
         allowed = (
@@ -214,6 +365,10 @@ class CodexGoalRuntime:
                 run_context.human_pool_root,
                 run_context.evaluator_root,
             ),
+            sandbox_mode=self.sandbox_mode,
+            context_window=self.context_window,
+            auto_compact_token_limit=self.auto_compact_token_limit,
+            model_catalog=self.model_catalog,
         )
         self.client = JsonRpcStdioClient(
             self.command,
@@ -260,11 +415,10 @@ class CodexGoalRuntime:
                 "runtimeWorkspaceRoots": [
                     str(item) for item in run_context.runtime_workspace_roots
                 ],
-                "permissions": "agentbench-hl",
+                **self._permission_fields(),
                 "approvalPolicy": "never",
                 "approvalsReviewer": "auto_review",
-                "ephemeral": False,
-                "historyMode": "paginated",
+                "ephemeral": False,                "historyMode": "paginated",
                 "environments": [],
                 "serviceName": "agentbench-hl",
             },
@@ -308,7 +462,7 @@ class CodexGoalRuntime:
                 "approvalPolicy": "never",
                 "approvalsReviewer": "auto_review",
                 "excludeTurns": True,
-                "permissions": "agentbench-hl",
+                **self._permission_fields(),
             },
         )
         thread_id = self._thread_id(result)
@@ -346,7 +500,7 @@ class CodexGoalRuntime:
                     str(item) for item in run_context.runtime_workspace_roots
                 ],
                 "effort": self.reasoning_effort,
-                "permissions": "agentbench-hl",
+                **self._permission_fields(),
             },
         )
         turn_value = turn.get("turn", {})

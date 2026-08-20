@@ -1,0 +1,98 @@
+# 实验 2：HL vs 人类（主线）—— antwar（第 27 届）。
+# 与 exp2-antwar2-conquest.yaml 是**同一套实验参数**，只换游戏；
+# 两份必须保持除 game / 池子相关项之外完全一致，否则 antwar↔antwar2 的对比不成立。
+#
+# 为什么 antwar 与 antwar2 值得一起刷：
+#   两者外壳同形（回放同结构、操作码同一族），但**核心机制不同**——
+#   antwar 的胜负由信息素（pheromone，2×19×19）驱动蚂蚁寻路决定，antwar2 没有这一层。
+#   所以它是检验"HL 学到的是游戏机制还是表层模式"的天然对照组：
+#   如果 agent 在 antwar2 上的经验能迁移到 antwar，说明它抓的是机制。
+#
+# 池子实况（load_pool + ranked_ladder 实测）：
+#   antwar : 池 644 / 可运行 122 / 有名次可运行 94，Elo 前 12 名 1183…855
+#   antwar2: 池 631 / 可运行 274 / 有名次可运行 229，Elo 前 12 名 1982…1661
+#   antwar 的 Elo 跨度（~330）远窄于 antwar2（~320 只是前 12 名，全池 599~1982），
+#   名次之间更挤 ⇒ 同样的 advance_win_rate 在 antwar 上更难稳定达成，这是预期现象，
+#   不要因此调 advance_* —— 那会让两个游戏的"前进"定义不一致。
+#
+# 跑法：abhl goal-led run --config <本文件> --run-id exp2-antwar-conquest
+#      不给 --iterations 即无限轮，靠 budget 收尾。
+budget:
+  # token 上限已去掉（null = 不限）。原来是 4 亿，含义是"该 run 累计 agent token
+  # 达到就正常收尾"——不是崩溃，但会在爬梯的关键时刻硬停：实测 antwar2 在
+  # 11.8 小时用掉 265M/400M，而它正卡在榜首上。爬梯本身没有"跑够就够了"的意思，
+  # 所以这个上限只会制造一个与研究目标无关的截断点。
+  tokens: null
+  # 墙钟保留 7 天作为安全网：无人值守时至少有一个终点，不会永久占用机器。
+  wall_seconds: 604800
+curriculum:
+  advance_min_matches: 2
+  advance_streak: 1
+  advance_win_rate: 0.6
+  development_seeds:
+  - 1
+  - 2
+  ladder_scope: auto
+  opponent_policy: ladder_up
+  opponent_rank: null
+  # 从第 10 名起（antwar 的 rank10 Elo=911，rank1=1183）。
+  opponent_start_rank: 10
+  order: lowest_rank_first
+  seed_mode: fixed
+# ⚠️ 这里**故意不写 evaluation 段**。
+# Elo **不占迭代进程的任何时间**，也不需要任何旋钮：
+# `_pool_elo()` 是纯计算——拿该 run 迄今已打完的官方对局，以每个对手在人类池里的
+# Elo 作固定锚点做一维 BT 极大似然（domain/pool_elo.py）。它**不额外打任何一局**。
+# 曾经的 `evaluation.background_pool / pool_sample / pool_seeds` 在 src/ 里没有任何
+# 消费方（死配置），写上去只会让人误以为"测 Elo 要额外跑 16 局"。
+game: antwar
+goal:
+  code_constraint: any
+  experience_skills: true
+  history_mode: full
+  prompt_override: null
+  seed_policy_path: null
+isolation:
+  backend: auto
+  docker_image: null
+  rival_code_visible: false
+measurement:
+  epsilon: 0.01
+  information_gain: true
+  # 决策级行为信息增益：每轮拿 1 个配对 case 做线协议录制 + 冻结重放
+  # （成本 = 2 局录制对局 + 2 次本地重放）。0 = 关闭，曲线会记 null + 原因。
+  behavioral_ig_cases: 1
+  behavioral_ig_timeout_s: 900
+origin: from_scratch
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs
+provider:
+  api_key_env: ABHL_API_KEY
+  base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+  disable_response_storage: true
+  harness: codex
+  model: glm-5.3
+  # ⚠️ 实验参数：必须与 exp2-antwar2-conquest.yaml 一致，否则主表跨游戏不可比。
+  # 取 high 的依据见那份配置的注释（xhigh 只是让它写更多，不是想更久）。
+  reasoning_effort: high
+  # 模型能力与压缩：全部与 exp2-antwar2-conquest.yaml 一致，完整理由见那份配置。
+  # 要点：模型能力交给厂商官方 catalog（不给的话 codex 用 fallback 元数据，
+  # 压缩会在一个我们没设过的点触发——实测 antwar2 死在 97k）；压缩本身对 glm
+  # 系列必死，所以把线设在 900k，靠 runtime 每轮换线程让它永远到不了。
+  model_catalog: zhipu
+  auto_compact_token_limit: 900000
+runtime:
+  agent_binary: null
+  branch_width: 1
+  codex_binary: codex
+  match_parallelism: 8
+  match_timeout_s: 1800
+  max_iterations: null
+  network_access: disabled
+  rollout_k: 4
+  # 与 exp2-antwar2-conquest.yaml 必须一致（理由见那份配置）：每轮无条件换线程，
+  # 因为阈值挡不住"单个 turn 内部"的上下文增长。
+  thread_rotate_each_iteration: true
+  thread_rotate_context_tokens: 60000
+schema_version: '1.1'

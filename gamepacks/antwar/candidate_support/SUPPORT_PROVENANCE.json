@@ -1,0 +1,28 @@
+{
+  "candidate_interface": "AI.decide",
+  "container_denied": [],
+  "dropped": [],
+  "game": "antwar",
+  "generated_files": [
+    "_bootstrap.py",
+    "main.py",
+    "ai_example.py",
+    "CANDIDATE_CONTRACT.md"
+  ],
+  "note": "官方 SDK 按容器边界过滤后 vendor（仅改名，未改内容）；container_denied 记录被剔除的本地对局工具/训练脚本/现成策略——对局只能通过 Action→Evaluator→Feedback 发生，agent 不该有能力自己打比赛；ai_example.py 只演示接口，策略是占位，保证第 0 轮的裸策略来自规则而非照抄；非对称游戏在单包内按 <track>_sdk/ 放多套，入口按 AGENTBENCH_ROLE 选择；ported_protocol_layer 非官方原版，是我们的纯 Python 移植；候选只需写 ai.py。装配逻辑见 scripts/gen_candidate_support.py",
+  "official_sdk": {
+    ".": {
+      "python_verified_authors": 20,
+      "source": "games/antwar/public_sdk",
+      "source_player_id": "anon__27ea3c7d4b29674d__10b23273291fbb11__v1",
+      "track": null,
+      "tree_sha256": "5ba8bf7e1dc379077b604abdf96c714b158c151b90c5f74d9bb326c1369703ed"
+    }
+  },
+  "ported_protocol_layer": [],
+  "renamed": [
+    "main.py → official_main.py"
+  ],
+  "schema_version": "2.1",
+  "tracks": []
+}

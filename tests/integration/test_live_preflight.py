@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -288,6 +289,14 @@ def test_seatbelt_profile_denies_hidden_read_but_allows_candidate(
     assert "human-policy" not in denied.stdout
 
 
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason=(
+        "write_candidate_isolation_profile 只实现了 macOS Seatbelt（非 darwin 直接抛 "
+        "RuntimeError）。在 Linux 服务器上让它红着，会让'跑测试'这件事失去意义——"
+        "真回归会被这条常红掩盖。Linux 侧的隔离能力另见 select_candidate_isolation。"
+    ),
+)
 def test_candidate_profile_declares_read_write_and_network_denials(tmp_path: Path) -> None:
     profile = write_candidate_isolation_profile(
         tmp_path / "candidate.sb",

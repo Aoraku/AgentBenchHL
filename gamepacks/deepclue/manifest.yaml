@@ -1,0 +1,33 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+decision_space: '@agentbench:games/deepclue/decision_space.yaml'
+game: deepclue
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/deepclue/replay_format.md'
+replay_skill: replay_skill.md
+roles:
+- P0
+rules: '@agentbench:games/deepclue/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: a4bd889977d61682449850a821ab964fc3e2b8946f6c4c9abf4f2bb45c2d823f
+  replay_format.md: 37e6e3aa179b93399a4df170f784ee9e0fb2dcf29d9cff8048514e97af3df85d
+  rules.md: 03e17b1243f6e419ad1214e7c1ed2daab75f45a11745df36e8aaa4218997c96b

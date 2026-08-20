@@ -1,0 +1,121 @@
+# 实验 2：HL vs 人类（主线）。从第 10 名开始，稳定击败一个就前进一名，不限轮数。
+# 为什么先用 antwar2：规则密集、池子最大（229 人）、Elo 跨度 599~1982，
+# 而 HL 对规则密集型游戏更友好——先在这里刷到 SOTA 再 broadcast 到 8 个游戏。
+# 主纵坐标看 pool_elo（跨轮可比）；不要看 win_rate：对手越换越强，胜率天然会掉。
+# 跑法：abhl goal-led run --config <本文件> --run-id exp2-antwar2-conquest
+#      不给 --iterations 即无限轮，靠 budget 收尾。
+budget:
+  # token 上限已去掉（null = 不限），理由见 exp2-antwar-conquest.yaml 的同段注释：
+  # 4 亿的上限会在爬梯关键时刻硬停（这个 run 11.8 小时就用掉 265M，而它正卡在榜首）。
+  tokens: null
+  # 墙钟保留 7 天作为安全网，避免无人值守时永久占用机器。
+  wall_seconds: 604800
+curriculum:
+  advance_min_matches: 2
+  advance_streak: 1
+  advance_win_rate: 0.6
+  development_seeds:
+  - 1
+  - 2
+  ladder_scope: auto
+  opponent_policy: ladder_up
+  opponent_rank: null
+  opponent_start_rank: 10
+  order: lowest_rank_first
+  seed_mode: fixed
+# ⚠️ 这里**故意不写 evaluation 段**。
+# Elo **不占迭代进程的任何时间**，也不需要任何旋钮：
+# `_pool_elo()` 是纯计算——拿该 run 迄今已打完的官方对局，以每个对手在人类池里的
+# Elo 作固定锚点做一维 BT 极大似然（domain/pool_elo.py）。它**不额外打任何一局**。
+# 曾经的 `evaluation.background_pool / pool_sample / pool_seeds` 在 src/ 里没有任何
+# 消费方（死配置），写上去只会让人误以为"测 Elo 要额外跑 16 局"。
+game: antwar2
+goal:
+  code_constraint: any
+  experience_skills: true
+  history_mode: full
+  prompt_override: null
+  seed_policy_path: null
+isolation:
+  backend: auto
+  docker_image: null
+  rival_code_visible: false
+measurement:
+  epsilon: 0.01
+  information_gain: true
+  # 决策级行为信息增益：每轮拿 1 个配对 case 做线协议录制 + 冻结重放
+  # （成本 = 2 局录制对局 + 2 次本地重放）。0 = 关闭，曲线会记 null + 原因。
+  behavioral_ig_cases: 1
+  behavioral_ig_timeout_s: 900
+origin: from_scratch
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs
+provider:
+  api_key_env: ABHL_API_KEY
+  base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+  disable_response_storage: true
+  harness: codex
+  # glm-5.3：厂商官方 codex 文档里**声明支持**的旗舰模型（glm-5.2 不在官方
+  # model catalog 里，codex 只能走 fallback 元数据，压缩线因此不可控——
+  # 见下面 model_catalog 的注释与 auto_compact_token_limit 的纠错记录）。
+  model: glm-5.3
+  # reasoning_effort 直接决定 agent 每次写多少 token。实测同一 prompt：
+  #   low   -> 336 output tokens / 3.6s
+  #   xhigh -> 1113 output tokens / 10.1s   （量 ×3.3）
+  # 模型本身很快（TTFT ~1s、93~110 tok/s），慢是因为 xhigh 让它写太多。
+  # 一轮迭代约 35k output tokens ≈ 318s。
+  #
+  # 历史记录：这一档曾经只占单轮 850s 的 37%，另外 63%（约 530s）是 agent 在容器里
+  # 自己跑本地对局验证——一件既不该发生（破坏容器隔离与 trajectories_seen 口径）、
+  # 也拿不到任何对手信息的事。现已从两侧堵掉：容器不再带本地对战/训练工具
+  # （scripts/gen_candidate_support.py 的 deny 清单 + application/container_guard.py 护栏），
+  # 且回放由 A 仓翻译成自然语言直接送进 Feedback（feedback/**/replay.md），
+  # agent 不必再写解析代码。
+  #
+  # 取 high：砍掉大部分冗余推理，又不像 low 那样明显掉代码质量。
+  # ⚠️ 这是**实验参数**：所有配置必须用同一档，否则主表跨模型/跨 harness 不可比。
+  reasoning_effort: high
+  # glm-5.2 不在 codex 自带的模型目录里（`codex debug models` 只返回自家模型），
+  # 不配这两项就会 "Unknown model … will use fallback model metadata"，
+  # 上下文窗口与压缩阈值全走兜底值。codex 0.147 只认这两个字段。
+  #
+  # 模型能力交给厂商官方 model catalog（见 adapters/codex_goal/app_server.py 的
+  # MODEL_CATALOGS）。这不是美化：不给 catalog 时 codex 报 "Unknown model …
+  # will use fallback model metadata"，压缩会在一个我们没设过、也看不见的点触发
+  # ——实测 antwar2 在 97k 上下文触发压缩并死掉，而当时我们声明的是 200000。
+  # 有了 catalog，context_window 由 catalog 说话（glm-5.3 = 1,048,576），
+  # 这里就不再写 context_window，避免"压缩线到底是多少"要靠读 codex 源码才能答。
+  model_catalog: zhipu
+  #
+  # ⚠️ 关于压缩，两版前的注释结论（"让主动压缩先触发就能躲开被动兜底"）已被实测
+  # 推翻，留在这里防止有人再走一遍：codex 0.147 的主动压缩与被动兜底走**同一条**
+  # remote 通道（二进制里有 `POST /responses/compact` 与 "You are performing a
+  # CONTEXT CHECKPOINT COMPACTION" 提示词），它要求响应里恰好一个 compaction
+  # output item；而 glm 系列对任何请求都返回 [reasoning, message] 两个 item
+  # （curl 直接验证过），于是压缩**一触发就必死**：
+  #   expected exactly one compaction output item, got 0 from 2 output items
+  # 所以"压缩阈值"这个旋钮救不了它，唯一的解是**永远不触发压缩**。
+  # 这里把压缩线设在 900k（catalog 窗口 1M 的 90%），配合 runtime 的每轮换线程
+  # （单轮上下文上界 ≈ 单轮增量，实测 < 120k），压缩永远到不了。
+  auto_compact_token_limit: 900000
+runtime:
+  agent_binary: null
+  branch_width: 1
+  codex_binary: codex
+  match_parallelism: 8
+  match_timeout_s: 1800
+  max_iterations: null
+  network_access: disabled
+  rollout_k: 4
+  # 每轮无条件换线程。为什么不能只靠阈值：阈值只能在 turn **之前**检查，而单个
+  # turn 内部（读 8 份 replay.md + 写 k 个候选，几十个请求）就能把上下文从 90k
+  # 推过压缩线——antwar2 死在 97k 时阈值是 110k，根本没轮到检查。每轮从零开始，
+  # 单轮增量才是上下文的上界。
+  #
+  # 代价是跨轮对话记忆断掉，靠 research/EXPERIENCE.md 接力。这条已有实测支持：
+  # antwar 轮转 6 次后 EXPERIENCE.md 长到 346 行并持续更新，第 7 轮打出首胜。
+  thread_rotate_each_iteration: true
+  # 保底阈值：单轮内部若异常膨胀，下一次 turn 前还会再换一次。
+  thread_rotate_context_tokens: 60000
+schema_version: '1.1'

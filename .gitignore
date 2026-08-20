@@ -21,6 +21,13 @@ codex-home/
 reports/curves/*.csv
 reports/curves/*.png
 
+# Offline analysis workspaces（events.jsonl 副本、逐版本全池评测结果、出图）。
+# 这些是**从 runs/ 派生**的本地产物：体积大（单个 analysis/ 目录 5 MB+）、
+# 可由 scripts/ 里的脚本从 run 目录重新生成，入库只会把仓库撑大且制造
+# "哪份才是最新"的歧义。真正要留档的图表请单独放到 overleaf-paper/。
+analysis/
+artifacts/
+
 # Local, one-off recovery helpers retained outside the public framework
 tools/
 

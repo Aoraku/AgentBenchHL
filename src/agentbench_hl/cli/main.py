@@ -185,6 +185,67 @@ def _parser() -> argparse.ArgumentParser:
         command = goal_led_commands.add_parser(name)
         command.add_argument("--config", type=Path, required=True)
         command.add_argument("--run-id", required=True)
+    drive = goal_led_commands.add_parser(
+        "run", help="连续推进 N 轮迭代（服务化用；可中断可 resume）"
+    )
+    drive.add_argument("--config", type=Path, required=True)
+    drive.add_argument("--run-id", required=True)
+    drive.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help=(
+            "跑多少轮。不给则用配置里的 runtime.max_iterations；"
+            "两者都不给 = 不限轮数（跑到 budget.tokens / budget.wall_seconds 耗尽）"
+        ),
+    )
+    pool = groups.add_parser("pool")
+    pool_commands = pool.add_subparsers(dest="command", required=True)
+    pool_audit = pool_commands.add_parser("audit", help="审计某游戏选手池的可运行性")
+    pool_audit.add_argument("game")
+    pool_audit.add_argument("--agentbench-root", type=Path, default=None)
+    pool_audit.add_argument(
+        "--verify",
+        action="store_true",
+        help="实际打一局 self-play smoke 验证（写 players/runnable.json）",
+    )
+    pool_audit.add_argument("--parallel", type=int, default=4)
+    pool_audit.add_argument("--attempts", type=int, default=2, help="任一次成功即判可用")
+    pool_audit.add_argument("--cpus-per-match", type=int, default=4)
+    pool_audit.add_argument(
+        "--all", action="store_true", help="验证全部可运行选手（默认只验证带 Elo 的）"
+    )
+    pool_audit.add_argument("--work-root", type=Path, default=None)
+    pool_audit.add_argument("--isolation", default="auto")
+    ladder = groups.add_parser("ladder")
+    ladder_commands = ladder.add_subparsers(dest="command", required=True)
+    ladder_eval = ladder_commands.add_parser(
+        "eval", help="全池实测评分：稀疏配对对战 + BT 拟合（可中断续跑）"
+    )
+    ladder_eval.add_argument("game")
+    ladder_eval.add_argument("--agentbench-root", type=Path, default=None)
+    ladder_eval.add_argument(
+        "--scope",
+        default="verified",
+        choices=("verified", "ranked", "all"),
+        help="参赛口径：审计通过 / 有 rank / 全部可运行",
+    )
+    ladder_eval.add_argument("--degree", type=int, default=6, help="每个选手大致对手数")
+    ladder_eval.add_argument("--seeds", default="7", help="逗号分隔的 seed 列表")
+    ladder_eval.add_argument("--parallel", type=int, default=4)
+    ladder_eval.add_argument("--cpus-per-match", type=int, default=3)
+    ladder_eval.add_argument("--timeout", type=float, default=900.0)
+    ladder_eval.add_argument("--work-root", type=Path, default=None)
+    ladder_eval.add_argument("--isolation", default="auto")
+    ladder_eval.add_argument(
+        "--plan-only", action="store_true", help="只打印赛程规模与成本估计，不跑对局"
+    )
+    metrics = groups.add_parser("metrics")
+    metrics_commands = metrics.add_subparsers(dest="command", required=True)
+    metrics_export = metrics_commands.add_parser(
+        "export", help="导出 run 的迭代指标（供服务端/报告消费）"
+    )
+    metrics_export.add_argument("--run-root", type=Path, required=True)
     lineage = groups.add_parser("lineage")
     lineage_commands = lineage.add_subparsers(dest="command", required=True)
     rollback = lineage_commands.add_parser("rollback")
@@ -203,25 +264,215 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             repository_root = arguments.config.resolve().parents[2]
             _load_env_file(repository_root / ".env")
+            resume = arguments.command != "start"
+            if arguments.command == "run":
+                # 连续多轮：run 目录已存在则按 resume 装配。
+                config_path = arguments.config.resolve()
+                from agentbench_hl.config import ExperimentConfig
+
+                config = ExperimentConfig.load(config_path)
+                resume = (config.paths.runs_root / arguments.run_id / "run-manifest.json").is_file()
             service = build_goal_led_service(
                 arguments.config.resolve(),
                 run_id=arguments.run_id,
-                resume=arguments.command == "continue",
+                resume=resume,
             )
             try:
                 with RunLease(service.root):
-                    outcome = service.start() if arguments.command == "start" else service.advance()
+                    if arguments.command == "run":
+                        from agentbench_hl.application.goal_led_driver import drive
+
+                        # 轮数优先级：CLI --iterations > config runtime.max_iterations >
+                        # 无限（None）。这样 max_iterations 才真正有消费点——它以前
+                        # 只被解析、没人读，配了也不生效。
+                        # None = 不限轮数，跑到预算耗尽为止（实验 2 需要）。
+                        iterations = arguments.iterations
+                        if iterations is None:
+                            iterations = config.runtime.max_iterations
+                        result = drive(service, iterations=iterations)
+                        payload = {
+                            "status": "finished",
+                            "run_root": str(service.root),
+                            **result.as_dict(),
+                        }
+                        outcome = result.last
+                    else:
+                        outcome = (
+                            service.start()
+                            if arguments.command == "start"
+                            else service.advance()
+                        )
+                        payload = {
+                            "status": "checkpoint",
+                            "run_root": str(service.root),
+                            "thread_id": outcome.thread_id,
+                            "workspace": str(outcome.workspace),
+                            "request_id": outcome.request_id,
+                            "match_count": outcome.match_count,
+                        }
             finally:
                 close = getattr(service.runtime, "close", None)
                 if callable(close):
                     close()
+        elif arguments.group == "pool" and arguments.command == "audit":
+            from agentbench_hl.adapters.contract.factory import (
+                _supports_compiled_players,
+                game_roles,
+            )
+            from agentbench_hl.adapters.contract.pool import (
+                load_pool,
+                ranked_ladder,
+                runnable_players,
+            )
+
+            root = (
+                arguments.agentbench_root.resolve()
+                if arguments.agentbench_root is not None
+                else Path(os.environ.get("AGENTBENCH_ROOT", ".")).resolve()
+            )
+            players = load_pool(
+                root,
+                arguments.game,
+                supports_compiled=_supports_compiled_players(root, arguments.game),
+            )
+            runnable = runnable_players(players)
+            ladder = ranked_ladder(players)
             payload = {
-                "status": "checkpoint",
-                "run_root": str(service.root),
-                "thread_id": outcome.thread_id,
-                "workspace": str(outcome.workspace),
-                "request_id": outcome.request_id,
-                "match_count": outcome.match_count,
+                "status": "ok",
+                "game": arguments.game,
+                "roles": list(game_roles(root, arguments.game)),
+                "players_total": len(players),
+                "players_runnable": len(runnable),
+                "players_ranked_runnable": len(ladder),
+                "top_runnable": [
+                    {"player_id": item.player_id, "rank": item.rank, "elo": item.elo}
+                    for item in ladder[:10]
+                ],
+                "unrunnable_examples": [
+                    {"player_id": item.player_id, "reason": item.exclusion_diagnostic}
+                    for item in players
+                    if not item.runnable
+                ][:5],
+            }
+            if arguments.verify:
+                from agentbench_hl.application.pool_audit import audit_pool
+
+                work_root = (
+                    arguments.work_root.resolve()
+                    if arguments.work_root is not None
+                    else Path("/tmp") / f"abhl-pool-audit-{arguments.game}"
+                )
+                report = audit_pool(
+                    arguments.game,
+                    root,
+                    work_root=work_root,
+                    ranked_only=not arguments.all,
+                    parallel=max(1, arguments.parallel),
+                    attempts=max(1, arguments.attempts),
+                    cpus_per_match=max(2, arguments.cpus_per_match),
+                    isolation_backend=arguments.isolation,
+                )
+                payload["audit"] = {
+                    "scope": report["scope"],
+                    "checked": report["checked"],
+                    "verified": report["verified"],
+                    "written_to": report.get("written_to"),
+                    "rejected": [
+                        {"player_id": row["player_id"], "reason": row["diagnostic"]}
+                        for row in report["rows"]  # type: ignore[union-attr]
+                        if isinstance(row, dict) and not row.get("verified")
+                    ],
+                }
+        elif arguments.group == "ladder" and arguments.command == "eval":
+            from agentbench_hl.adapters.contract.factory import (
+                _supports_compiled_players,
+                game_roles,
+            )
+            from agentbench_hl.adapters.contract.pool import load_pool
+            from agentbench_hl.application.ladder_eval import (
+                _select_players,
+                build_plan,
+                run_ladder,
+            )
+
+            root = (
+                arguments.agentbench_root.resolve()
+                if arguments.agentbench_root is not None
+                else Path(os.environ.get("AGENTBENCH_ROOT", ".")).resolve()
+            )
+            seeds = tuple(
+                int(item) for item in str(arguments.seeds).split(",") if item.strip()
+            ) or (7,)
+            work_root = (
+                arguments.work_root.resolve()
+                if arguments.work_root is not None
+                else Path("/tmp") / f"abhl-ladder-{arguments.game}"
+            )
+            if arguments.plan_only:
+                pool_players = load_pool(
+                    root,
+                    arguments.game,
+                    supports_compiled=_supports_compiled_players(root, arguments.game),
+                )
+                ids, note = _select_players(root, arguments.game, pool_players, arguments.scope)
+                plan = build_plan(
+                    arguments.game,
+                    ids,
+                    game_roles(root, arguments.game),
+                    degree=arguments.degree,
+                    seeds=seeds,
+                )
+                payload = {
+                    "status": "ok",
+                    "game": arguments.game,
+                    "scope": arguments.scope,
+                    "scope_note": note,
+                    "players": len(plan.players),
+                    "planned_matches": plan.total,
+                    "seeds": list(seeds),
+                    "degree": arguments.degree,
+                }
+            else:
+                report = run_ladder(
+                    arguments.game,
+                    root,
+                    work_root=work_root,
+                    scope=arguments.scope,
+                    degree=max(1, arguments.degree),
+                    seeds=seeds,
+                    parallel=max(1, arguments.parallel),
+                    cpus_per_match=max(2, arguments.cpus_per_match),
+                    timeout_s=arguments.timeout,
+                    isolation_backend=arguments.isolation,
+                )
+                payload = {
+                    "status": "ok",
+                    "game": arguments.game,
+                    "scope": report["scope"],
+                    "players": report["players"],
+                    "planned_matches": report["planned_matches"],
+                    "played_matches": report["played_matches"],
+                    "rated_players": report["rated_players"],
+                    "anchor_alignment": report["anchor_alignment"],
+                    "written_to": report.get("written_to"),
+                    "top": [
+                        row
+                        for row in report["ratings"][:10]  # type: ignore[index]
+                    ],
+                }
+        elif arguments.group == "metrics" and arguments.command == "export":
+            run_root = arguments.run_root.resolve()
+            store = JsonlEventStore(run_root / "events.jsonl")
+            rows = [
+                dict(event.payload)
+                for event in store.read_all()
+                if event.event_type == "IterationMetricsFinalized"
+            ]
+            payload = {
+                "status": "ok",
+                "run_root": str(run_root),
+                "schema_version": "1.1",
+                "iterations": rows,
             }
         elif arguments.group == "lineage" and arguments.command == "rollback":
             from agentbench_hl.application.run_lease import RunLease

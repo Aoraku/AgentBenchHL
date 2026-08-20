@@ -1,0 +1,38 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.judge
+candidate_support: candidate_support
+decision_space: '@agentbench:games/snakego/decision_space.yaml'
+game: snakego
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/snakego/replay_format.md'
+replay_skill: '@agentbench:games/snakego/replay_skill.md'
+roles:
+- P0
+- P1
+rules: '@agentbench:games/snakego/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: ab5ab9fae0d6722c21cb8a8fc0c7777ea5d3923a4d58f523a7a2b43c8c2bc009
+  evaluator/arena.py: d4e3f0b53993182f07e5eeb8898117993a73e91c4c989dbf109f652c5aec0a6f
+  replay_format.md: 2412b835eb23dd332c79ba365031996938ec12b3274f2ffc5d66b5afc105c170
+  replay_skill.md: 73a1ece5ad47e11628cda71d133478a1875e65e020eb676970b3e48b3505f308
+  rules.md: 16418da8a92e655015481886f94a0d95fb6c5a2bd3ed075957ac312881c256d6

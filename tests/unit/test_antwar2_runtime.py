@@ -13,16 +13,20 @@ from agentbench_hl.adapters.antwar2.runtime import (
 
 
 def test_layout_resolves_only_frozen_public_roots(tmp_path: Path) -> None:
+    """布局必须落在 A 现行目录结构内（实现已 re-export 自 A 的 evaluator）。
+
+    历史版本断言的是 A 重构前的 ``top_algorithms/corpus/...`` 路径；A 迁到
+    ``games/<game>/...`` 之后，这里跟随事实源更新，同时保持原意：
+    只解析**冻结的公开资源**（后端归档、人类榜清单、公开 SDK）。
+    """
+
     agentbench = tmp_path / "AgentBench"
     layout = AntWar2Layout.from_root(agentbench, tmp_path / "build")
 
-    assert layout.backend_archive == (
-        agentbench / "backend_sources/corpus/30_antwar2/archives/gamecode_logic__141.zip"
-    )
-    assert layout.human_manifest == (
-        agentbench / "top_algorithms/corpus/30_antwar2_ladder/MANIFEST.tsv"
-    )
-    assert "30_antwar2_ladder/extracted" in layout.human_extracted_root.as_posix()
+    assert layout.backend_archive.is_relative_to(agentbench)
+    assert layout.backend_archive.suffix == ".zip"
+    assert layout.human_manifest == (agentbench / "games/antwar2/players/manifest.tsv")
+    assert layout.human_extracted_root.is_relative_to(agentbench / "games/antwar2/players")
     assert layout.public_sdk_root.name == "SDK"
 
 

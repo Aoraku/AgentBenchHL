@@ -4,11 +4,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import random
 
-from SDK.backend.model import Operation
-from SDK.backend.state import BackendState
 from SDK.utils.actions import ActionBundle, ActionCatalog
+from SDK.backend.state import BackendState
 from SDK.utils.constants import MAX_ACTIONS
 from SDK.utils.features import FeatureExtractor
+from SDK.backend.model import Operation
 
 
 @dataclass(slots=True)
@@ -42,10 +42,7 @@ class BaseAgent(ABC):
         self._seed_override = seed
         self.rng = random.Random(seed)
         self.feature_extractor = FeatureExtractor(max_actions=max_actions)
-        self.catalog = ActionCatalog(
-            max_actions=max_actions,
-            feature_extractor=self.feature_extractor,
-        )
+        self.catalog = ActionCatalog(max_actions=max_actions, feature_extractor=self.feature_extractor)
 
     def list_bundles(self, state: BackendState, player: int) -> list[ActionBundle]:
         return self.catalog.build(state, player)
@@ -54,20 +51,26 @@ class BaseAgent(ABC):
         if self._seed_override is None:
             self.rng.seed((seed << 1) ^ player)
 
-    def on_self_operations(self, operations: list[Operation]) -> None:
+    def on_self_operations(self, operations) -> None:
         del operations
 
-    def on_opponent_operations(self, operations: list[Operation]) -> None:
+    def on_opponent_operations(self, operations) -> None:
         del operations
 
-    def on_round_state(self, public_round_state: object) -> None:
+    def on_round_state(self, public_round_state) -> None:
         del public_round_state
 
     @abstractmethod
-    def choose_operations(
-        self,
-        state: BackendState,
-        player: int,
-        bundles: list[ActionBundle] | None = None,
-    ) -> list[Operation]:
+    def choose_bundle(self, state: BackendState, player: int, bundles: list[ActionBundle] | None = None) -> ActionBundle:
         raise NotImplementedError
+
+    def choose_operations(self, state: BackendState, player: int, bundles: list[ActionBundle] | None = None) -> list[Operation]:
+        return list(self.choose_bundle(state, player, bundles=bundles).operations)
+
+    def choose_action_index(self, state: BackendState, player: int, bundles: list[ActionBundle] | None = None) -> int:
+        bundles = bundles or self.list_bundles(state, player)
+        target = self.choose_bundle(state, player, bundles=bundles)
+        for index, bundle in enumerate(bundles):
+            if bundle.operations == target.operations:
+                return index
+        return 0

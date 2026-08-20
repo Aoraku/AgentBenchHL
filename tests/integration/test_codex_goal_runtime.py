@@ -212,6 +212,7 @@ def test_goal_runtime_pauses_a_blocked_goal_before_explicit_resume(
         model="gpt-5.6",
         reasoning_effort="xhigh",
         api_key="fixture-secret-value",
+        sandbox_mode="workspace-write",
     )
     try:
         session = runtime.resume("thread-1", context)
@@ -408,9 +409,11 @@ def test_generated_codex_config_defines_a_restricted_named_permission_profile(
         writable_roots=(candidate, research),
         tool_roots=(tools,),
         denied_roots=(hidden,),
+        sandbox_mode="workspace-write",
     )
 
     text = config.read_text(encoding="utf-8")
+    assert 'sandbox_mode = "workspace-write"' in text
     assert 'default_permissions = "agentbench-hl"' in text
     assert "[permissions.agentbench-hl.filesystem]" in text
     assert '":root" = "deny"' in text
@@ -425,9 +428,123 @@ def test_generated_codex_config_defines_a_restricted_named_permission_profile(
     assert "enabled = false" in text
 
 
+def test_default_config_turns_off_the_harness_own_sandbox(tmp_path: Path) -> None:
+    """默认关掉 codex 自带 OS 沙箱，并且**不留**指向不存在 profile 的悬空引用。
+
+    为什么默认关：实测 codex 0.147 的 linux_sandbox 在服务器上会对每次 ``exec_command``
+    报 ``permission_denied``（连 PATH 里的 venv 都读不到），agent 一个文件都写不了，
+    永远交不出 ``action.json``。候选**对局**的隔离由我们自己的 bwrap 负责，与这一层无关。
+    """
+
+    config = write_codex_config(
+        tmp_path / "codex-home",
+        base_url="https://example.invalid/v1",
+        model="gpt-5.6",
+        reasoning_effort="xhigh",
+        readable_roots=(tmp_path / "candidate",),
+        writable_roots=(tmp_path / "candidate",),
+        denied_roots=(tmp_path / "human-pool",),
+    )
+
+    text = config.read_text(encoding="utf-8")
+    assert 'sandbox_mode = "danger-full-access"' in text
+    # 关沙箱时命名 profile 不生效，留着 default_permissions 只会让 codex 找不到 profile。
+    assert "default_permissions" not in text
+    assert "[permissions.agentbench-hl" not in text
+
+
+def test_model_metadata_is_written_so_the_harness_stops_guessing(tmp_path: Path) -> None:
+    """中转模型不在 codex 的模型目录里，不配元数据就会套兜底参数。
+
+    codex 0.147 只认 ``model_context_window`` 与 ``model_auto_compact_token_limit``
+    （``model_max_output_tokens`` / ``model_max_tokens`` 都会被 ``--strict-config`` 拒），
+    所以只写这两个。后者决定对话历史涨到多少就自动压缩 —— 实测一个 2 轮的 run
+    input token 从 5888 涨到 219571 都没触发压缩，长跑必须配上。
+    """
+
+    config = write_codex_config(
+        tmp_path / "codex-home",
+        base_url="https://example.invalid/v1",
+        model="glm-5.2",
+        reasoning_effort="xhigh",
+        context_window=200_000,
+        auto_compact_token_limit=160_000,
+    )
+
+    text = config.read_text(encoding="utf-8")
+    assert "model_context_window = 200000" in text
+    assert "model_auto_compact_token_limit = 160000" in text
+
+
+def test_model_metadata_is_omitted_when_unknown(tmp_path: Path) -> None:
+    """没配就**不写**，让 harness 用它自己的兜底值 —— 绝不替模型编一个窗口大小。"""
+
+    config = write_codex_config(
+        tmp_path / "codex-home",
+        base_url="https://example.invalid/v1",
+        model="glm-5.2",
+        reasoning_effort="xhigh",
+    )
+
+    text = config.read_text(encoding="utf-8")
+    assert "model_context_window" not in text
+    assert "model_auto_compact_token_limit" not in text
+
+
+def test_unknown_agent_sandbox_mode_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sandbox_mode"):
+        write_codex_config(
+            tmp_path / "codex-home",
+            base_url="https://example.invalid/v1",
+            model="gpt-5.6",
+            reasoning_effort="xhigh",
+            sandbox_mode="please-be-safe",
+        )
+
+
 def test_goal_runtime_uses_named_permissions_instead_of_a_nested_sandbox(
     tmp_path: Path,
 ) -> None:
+    log = tmp_path / "methods.log"
+    context = run_context(tmp_path)
+    runtime = CodexGoalRuntime(
+        command=(sys.executable, str(FAKE_SERVER), str(log)),
+        codex_home=tmp_path / "codex-home",
+        base_url="https://example.invalid/v1",
+        model="gpt-5.6",
+        reasoning_effort="xhigh",
+        api_key="fixture-secret-value",
+        sandbox_mode="workspace-write",
+    )
+    try:
+        session = runtime.start(context)
+        runtime.run_until_checkpoint(
+            session,
+            context,
+            lambda event: event.event_type == "AgentTurnCompleted",
+        )
+    finally:
+        runtime.close()
+
+    requests = [
+        json.loads(line) for line in log.with_suffix(".requests.jsonl").read_text().splitlines()
+    ]
+    thread_start = next(item for item in requests if item["method"] == "thread/start")
+    turn_start = next(item for item in requests if item["method"] == "turn/start")
+    assert thread_start["params"]["permissions"] == "agentbench-hl"
+    assert "sandbox" not in thread_start["params"]
+    assert turn_start["params"]["permissions"] == "agentbench-hl"
+    assert "sandboxPolicy" not in turn_start["params"]
+
+
+def test_runtime_omits_named_permissions_when_the_sandbox_is_off(tmp_path: Path) -> None:
+    """关沙箱时不能再引用命名 profile。
+
+    config.toml 里没有 ``[permissions]`` 表，仍然发 ``permissions: agentbench-hl``
+    会让 codex 直接拒掉 ``thread/start``（实测：``default_permissions requires a
+    [permissions] table``），于是"关沙箱"变成"根本起不来"。
+    """
+
     log = tmp_path / "methods.log"
     context = run_context(tmp_path)
     runtime = CodexGoalRuntime(
@@ -451,12 +568,11 @@ def test_goal_runtime_uses_named_permissions_instead_of_a_nested_sandbox(
     requests = [
         json.loads(line) for line in log.with_suffix(".requests.jsonl").read_text().splitlines()
     ]
-    thread_start = next(item for item in requests if item["method"] == "thread/start")
-    turn_start = next(item for item in requests if item["method"] == "turn/start")
-    assert thread_start["params"]["permissions"] == "agentbench-hl"
-    assert "sandbox" not in thread_start["params"]
-    assert turn_start["params"]["permissions"] == "agentbench-hl"
-    assert "sandboxPolicy" not in turn_start["params"]
+    for method in ("thread/start", "turn/start"):
+        params = next(item for item in requests if item["method"] == method)["params"]
+        assert "permissions" not in params, method
+    config = (tmp_path / "codex-home" / "config.toml").read_text(encoding="utf-8")
+    assert "default_permissions" not in config
 
 
 @pytest.mark.live

@@ -1,0 +1,28 @@
+{
+  "candidate_interface": "AI.play",
+  "container_denied": [],
+  "dropped": [],
+  "game": "lostspace",
+  "generated_files": [
+    "_bootstrap.py",
+    "main.py",
+    "ai_example.py",
+    "CANDIDATE_CONTRACT.md"
+  ],
+  "note": "官方 SDK 按容器边界过滤后 vendor（仅改名，未改内容）；container_denied 记录被剔除的本地对局工具/训练脚本/现成策略——对局只能通过 Action→Evaluator→Feedback 发生，agent 不该有能力自己打比赛；ai_example.py 只演示接口，策略是占位，保证第 0 轮的裸策略来自规则而非照抄；非对称游戏在单包内按 <track>_sdk/ 放多套，入口按 AGENTBENCH_ROLE 选择；ported_protocol_layer 非官方原版，是我们的纯 Python 移植；候选只需写 ai.py。装配逻辑见 scripts/gen_candidate_support.py",
+  "official_sdk": {
+    ".": {
+      "python_verified_authors": 26,
+      "source": "games/lostspace/public_sdk",
+      "source_player_id": "anon__05f6f8ed6f6e4af4__b2fadea01bb0427b__v1",
+      "track": null,
+      "tree_sha256": "995729bb66587b1a8063e59fad05af1568dcde94aa5035ba875be3a7278a0381"
+    }
+  },
+  "ported_protocol_layer": [],
+  "renamed": [
+    "main.py → lostspace_sdk.py"
+  ],
+  "schema_version": "2.1",
+  "tracks": []
+}

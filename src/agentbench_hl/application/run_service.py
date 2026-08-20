@@ -372,8 +372,22 @@ class RunService:
                 ),
                 None,
             )
+            # 只有"已经跑过至少一个 turn 却仍然没写 proposal"才算脱离契约。
+            # 否则会误伤**本轮刚创建、Goal 还没来得及动手**的候选：那种情况下每次
+            # advance 都会轮换线程，Goal 的上下文被反复清空（resume 形同虚设）。
+            worked_on = False
+            if pending_candidate is not None:
+                created_index = max(
+                    index for index, event in enumerate(events) if event is pending_candidate
+                )
+                worked_on = any(
+                    event.event_type
+                    in {"ModelUsageFinalized", "AgentTurnCompleted", "AgentTurnRejected"}
+                    for event in events[created_index + 1 :]
+                )
             pending_missing_proposal = bool(
                 pending_candidate
+                and worked_on
                 and not (
                     Path(str(pending_candidate.payload["path"])) / ".agentbench/proposal.json"
                 ).is_file()

@@ -1,25 +1,41 @@
-schema_version: "1.0"
-game: antwar2
-candidate_interface: AI.choose_operations
-rules: rules.md
-sdk_interface: sdk_interface.md
-decision_space: decision_space.yaml
-replay_skill: replay_skill.md
-development_matrix: development_matrix.yaml
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.choose_bundle
 candidate_support: candidate_support
-goal_charter: GOAL_CHARTER.md
+decision_space: '@agentbench:games/antwar2/decision_space.yaml'
+development_matrix: development_matrix.yaml
 evaluator: evaluator/certification.yaml
-public_sdk_tree_sha256: f54280bb6b4407609ee7cc0b4df405b37c8009d5049dbaa642f12b5648a9efe0
+game: antwar2
+goal_charter: GOAL_CHARTER.md
 learning_isolation:
   allowed:
-    - frozen_gamepack
-    - public_sdk
-    - active_candidate
-    - run_local_public_replays
-    - run_local_experience
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
   forbidden:
-    - human_source
-    - certification_matrix
-    - reference_policy_versions
-    - reference_policy_replays
-    - cross_run_codex_memory
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+public_sdk_tree_sha256: f54280bb6b4407609ee7cc0b4df405b37c8009d5049dbaa642f12b5648a9efe0
+replay_format: '@agentbench:games/antwar2/replay_format.md'
+replay_skill: '@agentbench:games/antwar2/replay_skill.md'
+roles:
+- P0
+- P1
+rules: '@agentbench:games/antwar2/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: cabb1a24610c530db36a0f4ee7216129e25499ce63d7429798dbfc3246591fe6
+  evaluator/arena.py: 7fff9969cd9039d08d8ddce9b2abe3b8e643edd6654a1ffb29e7a38fc331aff9
+  replay_format.md: 74d3c055ef8384026b4a85d248a9b2365da0dec91eb59e353a212385783558ed
+  replay_skill.md: c678c8d1c34c901011a525fb2060603e1f2005f84e3409b57e73d8607bd6e704
+  rules.md: b6d5a4241587e94f7c16412d12a04fd57f32a506ca96505866c2eddd4a19cac9

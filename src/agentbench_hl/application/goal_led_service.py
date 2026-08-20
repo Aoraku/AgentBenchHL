@@ -1,22 +1,79 @@
 """Thin bridge for a single Goal-led research run.
 
-The Goal decides every scientific action.  This module only executes the
-declarative official matches that the Goal writes into its isolated workspace
-and returns public evidence to that same Goal thread.
+Goal 决定科学动作；本模块负责执行它写下的官方对局、把公开证据交还给同一个 Goal 线程，
+并按实验配置施加**框架级约束**：
+
+- 对手选择策略（`application/opponent_policy.py`，六个枚举）；
+- 每轮候选数 K、座次、seed（``seed_mode`` 决定固定还是泛化）；
+- 一轮内对局**并行**执行（32 核服务器的关键；默认 1 保持旧行为）；
+- token / wall 预算守卫所需的度量事件（``IterationMetricsFinalized``）；
+- Goal prompt 覆盖、经验文档开关、策略语言约束、对手代码可见性（消融）。
+
+新增参数全部有默认值，默认行为与重构前一致。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import shutil
+import subprocess
+import time
+from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from agentbench_hl.adapters.filesystem.event_store import JsonlEventStore
+from agentbench_hl.adapters.transcript.coupling import (
+    COUPLING_COMMON_RANDOM,
+    normalize_coupling,
+)
+from agentbench_hl.application.behavioral_ig import (
+    BehavioralIgCase,
+    BehavioralIgMeasurement,
+    measure_behavioral_ig,
+)
+from agentbench_hl.application.candidate_diversity import (
+    NEAR_DUPLICATE_LINES as DIVERSITY_THRESHOLD_LINES,
+)
+from agentbench_hl.application.candidate_diversity import feedback_note as diversity_note
+from agentbench_hl.application.candidate_diversity import spread as candidate_spread
+from agentbench_hl.application.candidate_preflight import check_candidate
+from agentbench_hl.application.conquest import (
+    AdvanceRule,
+    ConquestState,
+)
+from agentbench_hl.application.conquest import evaluate as conquest_evaluate
+from agentbench_hl.application.conquest import round_results as conquest_rounds
+from agentbench_hl.application.container_guard import assert_sealed
+from agentbench_hl.application.decision_space import load_information_gain_spec
 from agentbench_hl.application.goal_led_protocol import MatchRequest
+from agentbench_hl.application.info_gain import (
+    outcome_counts,
+    outcome_ig_nats,
+    paired_margin_shift,
+    replay_divergence,
+)
+from agentbench_hl.application.opponent_policy import (
+    SELF_DECIDE,
+    LadderEntry,
+    build_policy,
+)
+from agentbench_hl.application.replay_narration import NARRATION_FILENAME, narrate_case
+from agentbench_hl.application.support_probe import provider_for
 from agentbench_hl.domain.events import FinalizedEvent
+from agentbench_hl.domain.pool_elo import estimate_pool_elo
 from agentbench_hl.ports.agent_runtime import AgentRuntime, AgentSession, RunContext
 from agentbench_hl.ports.arena import Arena, MatchCase, MatchResult
+from agentbench_hl.ports.policy_probe import probe_availability
+
+EXPERIENCE_FILE = "EXPERIENCE.md"
+
+#: 行为 IG 的探针口径。一个 run 只能用一种，混用会让曲线的相邻两点口径不同。
+BEHAVIORAL_IG_PROBES = ("transcript_replay", "in_process_first")
 
 
 @dataclass(frozen=True)
@@ -25,6 +82,13 @@ class GoalLedOutcome:
     workspace: Path
     request_id: str
     match_count: int
+    iteration: int = 0
+    win_rate: float | None = None
+    stop_reason: str | None = None
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
 class GoalLedService:
@@ -40,6 +104,34 @@ class GoalLedService:
         model_provider: str,
         runnable_opponent_ids: tuple[str, ...],
         public_leaderboard: tuple[dict[str, object], ...],
+        game: str = "",
+        roles: tuple[str, ...] = ("P0", "P1"),
+        seeds: tuple[int, ...] = (1,),
+        rollout_k: int = 4,
+        opponent_policy: str = SELF_DECIDE,
+        opponent_rank: int | None = None,
+        opponent_start_rank: int | None = None,
+        advance_min_matches: int = 2,
+        advance_win_rate: float = 0.6,
+        advance_streak: int = 1,
+        match_parallelism: int = 1,
+        prompt_override: str | None = None,
+        experience_skills: bool = True,
+        code_constraint: str = "any",
+        history_mode: str = "full",
+        rival_code_visible: bool = False,
+        token_budget: int | None = None,
+        wall_budget_s: int | None = None,
+        epsilon: float = 0.02,
+        measure_information_gain: bool = True,
+        behavioral_ig_cases: int = 1,
+        behavioral_ig_timeout_s: float = 900.0,
+        behavioral_ig_coupling: str = COUPLING_COMMON_RANDOM,
+        behavioral_ig_probe: str = "transcript_replay",
+        agentbench_root: str | Path | None = None,
+        iteration_mode: str = "lockstep",
+        thread_rotate_context_tokens: int | None = None,
+        thread_rotate_each_iteration: bool = False,
     ) -> None:
         self.root = Path(run_root).resolve()
         self.bootstrap_root = Path(bootstrap_root).resolve()
@@ -52,7 +144,85 @@ class GoalLedService:
         self.public_leaderboard = tuple(
             sorted(public_leaderboard, key=lambda row: int(row["rank"]))
         )
+        self.game = game
+        self.roles = tuple(roles)
+        self.seeds = tuple(seeds)
+        self.rollout_k = max(1, int(rollout_k))
+        self.match_parallelism = max(1, int(match_parallelism))
+        self.prompt_override = prompt_override
+        self.experience_skills = experience_skills
+        self.code_constraint = code_constraint
+        if history_mode not in ("full", "no_notes", "memoryless"):
+            raise ValueError("history_mode must be full, no_notes or memoryless")
+        self.history_mode = history_mode
+        # 实验 4：no_notes / memoryless 都不写经验文档；memoryless 还会每轮换新会话。
+        if history_mode in ("no_notes", "memoryless"):
+            self.experience_skills = False
+        self.rival_code_visible = rival_code_visible
+        self.token_budget = token_budget
+        self.wall_budget_s = wall_budget_s
+        # ε 只用于经验分布的 KL 正则化（与 Plan II 的 measurement.epsilon 同一含义）。
+        self.epsilon = float(epsilon)
+        self.measure_information_gain = bool(measure_information_gain)
+        # 决策级行为 IG：每轮拿几个配对 case 做线协议录制 + 冻结重放。
+        # 0 = 关闭（此时 behavioral_ig 记 null 并写明是被关掉的，不是"测不出来"）。
+        self.behavioral_ig_cases = max(0, int(behavioral_ig_cases))
+        self.behavioral_ig_timeout_s = float(behavioral_ig_timeout_s)
+        # 随机流耦合口径：非法值直接报错，不静默降级成"没耦合"。
+        self.behavioral_ig_coupling = normalize_coupling(behavioral_ig_coupling)
+        if behavioral_ig_probe not in BEHAVIORAL_IG_PROBES:
+            raise ValueError(f"behavioral_ig_probe must be one of {BEHAVIORAL_IG_PROBES}")
+        # 一个 run 只用一种探针，否则同一条曲线会混口径（见 _behavioral_ig 的说明）。
+        self.behavioral_ig_probe = behavioral_ig_probe
+        self.agentbench_root = (
+            Path(agentbench_root).resolve() if agentbench_root is not None else None
+        )
+        if iteration_mode not in ("lockstep", "goal_autonomous"):
+            raise ValueError("iteration_mode must be lockstep or goal_autonomous")
+        self.iteration_mode = iteration_mode
+        # 会话轮转阈值：见 config.RuntimeConfig.thread_rotate_context_tokens 的详注。
+        # 目的只有一个——让 codex 的 remote compaction 永远不被触发。
+        self.thread_rotate_context_tokens = (
+            int(thread_rotate_context_tokens)
+            if thread_rotate_context_tokens is not None and int(thread_rotate_context_tokens) > 0
+            else None
+        )
+        self.thread_rotate_each_iteration = bool(thread_rotate_each_iteration)
         self.events = JsonlEventStore(self.root / "events.jsonl")
+        self._usage_cursor = 0
+        self.policy_name = opponent_policy
+        self.advance_rule = AdvanceRule(
+            min_matches=max(1, int(advance_min_matches)),
+            win_rate=float(advance_win_rate),
+            streak=max(1, int(advance_streak)),
+        )
+        self.policy = build_policy(
+            opponent_policy,
+            self._ladder(),
+            target_rank=opponent_rank,
+            start_rank=opponent_start_rank,
+            seed=abs(hash(str(self.root))) % 10_000,
+        )
+
+    # ------------------------------------------------------------------ state
+
+    def _ladder(self) -> tuple[LadderEntry, ...]:
+        entries = [
+            LadderEntry(
+                opponent_id=str(row["opponent_id"]),
+                rank=int(row["rank"]),
+                score=(float(row["score"]) if row.get("score") is not None else None),
+            )
+            for row in self.public_leaderboard
+            if row.get("opponent_id") is not None and row.get("rank") is not None
+        ]
+        if entries:
+            return tuple(entries)
+        # 没有 rank 锚点时（例如全匿名池）退化为可运行 id 顺序。
+        return tuple(
+            LadderEntry(opponent_id=item, rank=index + 1, score=None)
+            for index, item in enumerate(sorted(self.runnable_opponent_ids))
+        )
 
     @property
     def workspace(self) -> Path:
@@ -65,21 +235,153 @@ class GoalLedService:
     def _append(self, event_type: str, payload: dict[str, object], key: str) -> None:
         self.events.append(FinalizedEvent.create(event_type, payload, key))
 
-    def _context(self, prompt: str) -> RunContext:
+    def _append_telemetry(
+        self, event_type: str, payload: dict[str, object], key: str
+    ) -> None:
+        """写**纯遥测**事件：撞键只记一条诊断，绝不打断迭代。
+
+        科学事件（对局结果、指标、快照）必须严格幂等——撞键说明有真实的重复记账，
+        应当立刻暴露。但遥测（token 用量之类）不参与任何结论：为了它把一次长跑
+        终止是明显的代价错配。历史教训：一个 ``agent-usage`` 键冲突让 antwar
+        在第 43 轮整个 run 崩掉，而丢失的信息只是几条 token 计数。
+        """
+
+        try:
+            self._append(event_type, payload, key)
+        except ValueError as error:
+            with suppress(ValueError):
+                self._append(
+                    "TelemetryAppendSkipped",
+                    {"event_type": event_type, "key": key, "error": str(error)},
+                    f"telemetry-skipped:{key}",
+                )
+
+    # ----------------------------------------------------------- instructions
+
+    def _developer_instructions(self, *, iteration: int, cleared: int) -> str:
+        """每轮下发的操作契约。
+
+        这段话的第一职责不是"教它写代码"，而是**把容器契约讲清楚**：它只能读 6 样
+        东西、只能通过一条通道交东西出去、对局完全不由它负责。历史上没讲清这件事的
+        代价是实测的：一轮 850s 里约 530s 被 agent 拿去在容器内自己跑对局验证，
+        而那件事既不该发生、也得不到任何关于人类对手的信息。
+        """
+
+        parts = [
+            "【你在一个隔离容器里，没有网络】你只有一条对外通道：把 Action 写进 "
+            ".agentbench/action.json。评测器（Evaluator）在容器之外，它持有人类选手池、"
+            "负责跑完所有对局，然后把 Feedback 写回 feedback/ 交给你。",
+            "**对局不由你负责，你也没有能力自己打比赛**：容器里没有对手代码、"
+            "没有可运行的游戏后端、没有本地对战工具、没有训练脚本。"
+            "不要写脚本去自评测、自对弈或估算胜率——那只会烧掉本轮的时间预算，"
+            "而且得不到任何关于对手的信息（对手根本不在容器里）。"
+            "你的策略强度**只由评测器回传的 Feedback 定义**。",
+            "你可以读的东西只有这 6 样：gamepack/rules.md（规则）、"
+            "gamepack/decision_space.yaml（决策空间）、"
+            "gamepack/replay_skill.md 与 gamepack/replay_format.md（回放阅读指南）、"
+            "leaderboard.json（人类排行榜，只有 id/rank/score）、"
+            "你自己历次写的代码、以及 research/ 下你自己写的经验。"
+            "另外还有一份格式示例与接口契约（CANDIDATE_CONTRACT.md / ai_example.py）。",
+            "每轮你只需要做一件事：站在上面这些材料之上，把回放读透、想清楚，"
+            "然后写出符合格式的新策略。",
+            "通过 .agentbench/action.json 提交 Action（兼容 match_request.json）。"
+            "字段：action_id、rollouts[{candidate_id}]、selected_rival、roles、seeds、rationale。",
+            f"默认探索批次提交 k={self.rollout_k} 个候选。"
+            f"**k 个候选 = k 个不同的优化尝试，不是同一个尝试做 {self.rollout_k} 遍。**"
+            "每个候选必须承载一个**独立的、可被单独证伪的假设**（不同的取胜路径 / "
+            "不同的游戏机制 / 不同的资源分配哲学），并在 rationale 里写清"
+            "「这个候选赌的是哪条机制、如果它错了会在回放里看到什么」。"
+            "反例（会被判为伪多样性）：四个候选是同一份代码换了阈值、"
+            "换了造兵顺序里的一个数字、或只改了一个常量——那样一轮只探到 1 个点，"
+            f"却花掉了 {self.rollout_k} 倍的对局开销。"
+            f"量化下限：任意两个候选之间的代码差异不少于 "
+            f"{DIVERSITY_THRESHOLD_LINES} 行且落在不同的判断路径上；"
+            "框架会逐轮度量 pairwise 差异并把结果写进反馈。"
+            "候选目录规则："
+            ".agentbench/rollouts/<candidate_id>/ 会**叠加**到工作区当前版本之上，"
+            "所以每个候选目录里必须放它自己的 main.py（以及被改动的模块）；"
+            "只放 README 不算差异，会被判为无效候选并跳过。",
+            self.policy.instruction(iteration=iteration, k=self.rollout_k, cleared=cleared),
+            f"本轮座次：{list(self.roles)}；seed：{list(self.seeds)}。",
+        ]
+        if self.code_constraint == "if_else":
+            parts.append(
+                "策略语言约束：只允许可解释的 if-else / 规则表达式，禁止搜索、随机化与学习型组件。"
+            )
+        if self.experience_skills:
+            parts.append(
+                f"每轮必须更新 research/{EXPERIENCE_FILE}：记录本轮假设、证据、结论与下一步。"
+                "**经验是这套框架里最值钱的东西**——对手的行为规律、你试过且失败的"
+                "机制假设、以及「哪条游戏机制可以被用来超越对手」，都要写下来，"
+                "否则下一轮等于从零开始。"
+            )
+        else:
+            parts.append("本轮消融关闭了经验文档：不要维护 research/ 下的经验总结。")
+        if self.rival_code_visible:
+            parts.append(
+                "本轮消融开启了『对手代码可见』：你可以阅读 rival-source/ 下提供的对手实现，"
+                "可先蒸馏其有效行为再寻找弱点超越（distill_then_beat）。"
+            )
+        else:
+            parts.append(
+                "你看不到任何对手源码，只能从回放与排行榜推断对手行为。"
+            )
+        # ── HL 的核心理念。这段是这套框架区别于 RL 的全部所在，必须每轮重申 ──
+        # 不写在这里的后果是实测过的：agent 会滑向"多加几条 if 试试"的随机游走，
+        # 每轮都在动参数却说不出为什么，于是经验文档退化成 changelog、学习曲线走平。
+        parts.append(
+            "【怎么变强 —— 这套方法的核心】"
+            "① **代码必须可解释**：每条规则都要能说出「在什么局面下、因为什么机制、所以做什么」。"
+            "写不出理由的分支就是噪声，删掉它比留着更有价值。"
+            "② **先模仿，再超越**：对手排名比你高，说明它的行为里有你还没有的东西。"
+            "先从回放里把它的决策规律**蒸馏**出来（它开局造什么、在什么阈值上转攻、"
+            "对你的动作如何反应），复制到能打平；然后回到 rules.md 找它**没有利用**的机制，"
+            "用那条机制超过它。直接空想一个新战术、跳过模仿这一步，通常比抄它更慢。"
+            "③ **经验是用来规划的，不是用来记账的**：research/ 里要写下"
+            "「下一步该验证哪个假设、用什么证据判定它成立」，而不是罗列改了什么。"
+            "每轮开始先读自己上轮写的下一步，先回答它。"
+            "④ **一轮 = k 个不同的尝试**："
+            f"这一轮的 {self.rollout_k} 个候选之间要走**不同的取胜路径**"
+            "（例如：压制对手产能 / 抢经济后期成型 / 利用某条被对手忽视的机制），"
+            "彼此可以完全不像。"
+            "把同一份代码复制 k 份、各改一个阈值，是这套方法最常见也最贵的失效方式。"
+            "每个候选**改多少由证据决定**：从 rules.md 的机制和回放里读出"
+            "「哪里出了问题、为什么」，该改一条规则就改一条，该换整条战略就换整条。"
+            "框架对改动幅度没有偏好，只要求你在 rationale 里说清三件事："
+            "这个候选依据的是哪条机制 / 哪段回放证据、它赌的核心假设是什么、"
+            "回放里出现什么现象就算它被证伪。"
+            "⑤ **旧版本留得住**：把历史版本的策略留在文件里、保持可调用。"
+            "这样 (a) 某条路线被证伪时，你能退回上一版的行为，而不必凭记忆重写；"
+            "(b) 你能把两个历史版本**按局面组合**"
+            "（例如「若第 20 回合我方仍无建筑就走旧节奏，否则走新节奏」）——"
+            "这类组合要求旧版本没被覆盖掉。"
+            "怎么实现随你：继承、组合/委托、可替换部件、显式参数表都行。"
+            "⑥ **座次可以不对称**：P0 与 P1 的地形、先后手、对手行为都不同，"
+            "最优策略也不必相同。你的入口类拿得到 player 参数，"
+            "完全可以让 P0 和 P1 走**两条不同的策略**（例如内部持有两个委托对象，"
+            "按 player 分派）。如果回放显示你在某个座次一直输、另一个座次能赢，"
+            "那就该只改输的那个座次，而不是改一份共用代码去迁就两边。"
+        )
+        return "".join(parts)
+
+    def _context(self, prompt: str, *, iteration: int = 0, cleared: int = 0) -> RunContext:
         research = self.workspace / "research"
+        objective = (
+            self.prompt_override
+            or "从规则出发，经公开回放持续研究并最终击败全部可运行人类选手（刷 SOTA Elo / 胜率）"
+        )
         return RunContext(
-            objective="从规则出发，经公开 rank01 回放持续研究并最终击败全部可运行人类",
+            objective=objective,
             initial_prompt=prompt,
             base_instructions=(
-                "你是唯一的研究控制器。自行规划、改代码、阅读公开回放、写入经验；"
-                "不要联网、不要读取人类源码、不要网格搜索。"
+                "你是容器里唯一的研究者。你的工作是：读规则与回放 → 想清楚 → 写策略代码。"
+                "不要联网、不要找对手源码、不要自己跑对局或写评测脚本"
+                "（容器里没有对手也没有后端，那么做只是白烧时间）、不要网格搜索。"
+                "对局由容器外的评测器负责，你只通过 .agentbench/action.json 交货、"
+                "通过 feedback/ 收货。"
             ),
-            developer_instructions=(
-                "通过 .agentbench/action.json 提交 Action（兼容 match_request.json）。"
-                "首个请求必须是 rank01；后续由你决定对手、角色、seed 与候选数量。"
-                "默认探索批次必须提交 k=4 个彼此不同的策略候选，而不是同一候选的微小单点调参；"
-                "令四个候选在同一诊断对局条件下各产生一份可比较回放。"
-                "只有筛出的候选才进入少量确认局与四个固定 seed 的稳定性检查。"
+            developer_instructions=self._developer_instructions(
+                iteration=iteration, cleared=cleared
             ),
             cwd=self.workspace,
             candidate_root=self.workspace,
@@ -93,8 +395,17 @@ class GoalLedService:
             model_provider=self.model_provider,
         )
 
+    # ------------------------------------------------------------------ state
+
     def _write_state(self, thread_id: str, request_count: int) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        previous: dict[str, object] = {}
+        if self._state_path.is_file():
+            try:
+                previous = json.loads(self._state_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                previous = {}
+        started_at = previous.get("started_at") or time.time()
         self._state_path.write_text(
             json.dumps(
                 {
@@ -108,6 +419,11 @@ class GoalLedService:
             + "\n",
             encoding="utf-8",
         )
+        # 预算计时单独存，避免改变 goal-led-state.json 的既有 schema。
+        (self.root / "goal-led-budget.json").write_text(
+            json.dumps({"started_at": started_at}, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def _load_state(self) -> tuple[str, int]:
         value = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -117,13 +433,106 @@ class GoalLedService:
             raise ValueError("goal-led state is invalid")
         return thread_id, count
 
-    def _turn(self, session: AgentSession, prompt: str) -> AgentSession:
-        context = self._context(prompt)
-        return self.runtime.run_until_checkpoint(
+    def _started_at(self) -> float:
+        path = self.root / "goal-led-budget.json"
+        if path.is_file():
+            try:
+                return float(json.loads(path.read_text(encoding="utf-8"))["started_at"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                return time.time()
+        return time.time()
+
+    # ------------------------------------------------------------ agent turns
+
+    def _turn(
+        self, session: AgentSession, prompt: str, *, iteration: int = 0, cleared: int = 0
+    ) -> AgentSession:
+        context = self._context(prompt, iteration=iteration, cleared=cleared)
+        session = self.runtime.run_until_checkpoint(
             session,
             context,
             lambda event: getattr(event, "event_type", "") == "AgentTurnCompleted",
         )
+        self._persist_agent_usage()
+        return self._enforce_iteration_mode(session, iteration=iteration)
+
+    def _enforce_iteration_mode(self, session: AgentSession, *, iteration: int) -> AgentSession:
+        """迭代轮数由**框架**决定，而不是由 Goal 自己宣布"我做完了"。
+
+        codex 的 Goal 可以在一个 turn 里把自己的状态置成 ``complete``；此时
+        ``run_until_checkpoint`` 会提前返回，若不处理，后续轮次就跑不动了——
+        "指定 N 轮"这个承诺会在统计上被 Goal 单方面打破。
+
+        ``lockstep``（默认）：把这件事记成事件，并把 goal 重新 ``paused``，
+        由驱动器继续推进剩余轮次。
+        ``goal_autonomous``：尊重 Goal 的判断（提前收敛），用于对照实验。
+        """
+
+        status = str(getattr(session, "goal_status", "") or "")
+        if status != "complete":
+            return session
+        self._append(
+            "GoalDeclaredComplete",
+            {"iteration": iteration, "iteration_mode": self.iteration_mode},
+            f"goal-led-declared-complete:{iteration}",
+        )
+        if self.iteration_mode != "lockstep":
+            return session
+        pause = getattr(self.runtime, "pause", None)
+        if callable(pause):
+            session = pause(session)
+        return session
+
+    def _persist_agent_usage(self) -> None:
+        """把 harness 内存里的用量事件落到 events.jsonl。
+
+        harness（codex app-server / cc）只把映射后的事件放在内存列表里，而 token 预算
+        守卫、token 曲线、成本核算都需要持久化数据。这里增量把带 ``total_tokens``
+        的事件写进事件流；没有用量信息就什么都不写（绝不估算）。
+
+        幂等键为什么**不能**用内存列表下标
+        ----------------------------------
+        曾经用的是 ``agent-usage:{内存下标}``。那个下标只在**当前进程**里单调，
+        而账本是跨进程持久的，两者一旦错位就会撞键：
+
+        * ``resume`` 起一个新进程，harness 的 ``events`` 从 0 重新计数，
+          于是 ``agent-usage:0`` 会带着一份**不同的** payload 再写一次；
+        * ``_append`` 撞上已存在的键且 payload 不同 ⇒ ``ValueError``，
+          整个 run 被一个纯记账问题打死（实测 antwar 死在 ``agent-usage:64``）。
+
+        改成按**账本里已有的 AgentTokenUsage 条数**发号：序号只依赖持久状态，
+        重启后自然接着往下走，不会回退去抢占已用过的键。
+        """
+
+        events = getattr(self.runtime, "events", None)
+        if not isinstance(events, list):
+            return
+        sequence = sum(
+            1 for event in self.events.read_all() if event.event_type == "AgentTokenUsage"
+        )
+        for index in range(self._usage_cursor, len(events)):
+            event = events[index]
+            payload = getattr(event, "payload", None)
+            if not isinstance(payload, Mapping):
+                continue
+            tokens = payload.get("total_tokens")
+            if not isinstance(tokens, int):
+                continue
+            self._append_telemetry(
+                "AgentTokenUsage",
+                {
+                    "harness": getattr(self.runtime, "harness", "codex"),
+                    "total_tokens": tokens,
+                    "input_tokens": payload.get("input_tokens"),
+                    "output_tokens": payload.get("output_tokens"),
+                    "source_event": getattr(event, "event_type", ""),
+                },
+                f"agent-usage:{sequence}",
+            )
+            sequence += 1
+        self._usage_cursor = len(events)
+
+    # --------------------------------------------------------------- requests
 
     def _request_path(self) -> Path | None:
         action = self.workspace / ".agentbench" / "action.json"
@@ -149,7 +558,10 @@ class GoalLedService:
         if path is None:
             raise ValueError("Goal did not submit a new action.json")
         request = MatchRequest.from_path(path)
-        if request.opponent_id not in self.runnable_opponent_ids:
+        if (
+            self.policy_name == SELF_DECIDE
+            and request.opponent_id not in self.runnable_opponent_ids
+        ):
             raise ValueError(f"request names unknown or unrunnable opponent: {request.opponent_id}")
         archive = self.workspace / ".agentbench" / "processed-requests"
         archive.mkdir(parents=True, exist_ok=True)
@@ -159,29 +571,192 @@ class GoalLedService:
         path.replace(destination)
         return request
 
+    def _assign_opponents(
+        self, request: MatchRequest, *, iteration: int, cleared: int
+    ) -> tuple[dict[str, str], str | None]:
+        """返回 candidate_id -> opponent_id 映射与"被框架覆盖"的说明。"""
+
+        if self.policy_name == SELF_DECIDE:
+            return {cid: request.opponent_id for cid in request.candidate_ids}, None
+        prescribed = self.policy.select(
+            iteration=iteration, k=len(request.candidate_ids) or self.rollout_k, cleared=cleared
+        )
+        prescribed = tuple(item for item in prescribed if item in self.runnable_opponent_ids)
+        if not prescribed:
+            return {cid: request.opponent_id for cid in request.candidate_ids}, (
+                f"policy {self.policy_name} produced no runnable opponent; kept Goal's choice"
+            )
+        mapping: dict[str, str] = {}
+        for index, candidate_id in enumerate(request.candidate_ids):
+            mapping[candidate_id] = prescribed[index % len(prescribed)]
+        note = None
+        if set(mapping.values()) != {request.opponent_id}:
+            note = (
+                f"framework opponent policy {self.policy_name} overrode the Goal's "
+                f"selected_rival {request.opponent_id!r}"
+            )
+        return mapping, note
+
+    def _effective_seeds(self, request: MatchRequest) -> tuple[int, ...]:
+        if self.policy_name == SELF_DECIDE:
+            return request.seeds
+        return self.seeds or request.seeds
+
+    def _effective_roles(self, request: MatchRequest) -> tuple[str, ...]:
+        if self.policy_name == SELF_DECIDE:
+            return request.roles
+        return tuple(role for role in self.roles if role in set(request.roles)) or request.roles
+
+    # ------------------------------------------------------------- snapshots
+
+    _CODE_SUFFIXES = (".py", ".pyi")
+
+    @property
+    def candidate_interface(self) -> str | None:
+        """GamePack 声明的候选入口契约（如 ``AI.choose_operations``）。
+
+        物化后的 GamePack 里有 ``gamepack-manifest.json``；没有声明就返回 ``None``，
+        前置校验只做"入口存在 + 语法 + 启动不崩"这些通用检查。
+        """
+
+        if getattr(self, "_candidate_interface_cache", "unset") != "unset":
+            return self._candidate_interface_cache  # type: ignore[return-value]
+        value: str | None = None
+        manifest = self.gamepack_root / "gamepack-manifest.json"
+        if manifest.is_file():
+            try:
+                document = json.loads(manifest.read_text(encoding="utf-8"))
+                raw = document.get("candidate_interface")
+                value = str(raw) if isinstance(raw, str) and raw.strip() else None
+            except (json.JSONDecodeError, OSError):
+                value = None
+        self._candidate_interface_cache: str | None = value
+        return value
+
+    def _code_fingerprint(self, root: Path) -> str:
+        """候选代码指纹（只看代码文件，忽略 README/笔记），用于识别"假多样性"。"""
+
+        digest = hashlib.sha256()
+        for path in sorted(root.rglob("*")):
+            if not path.is_file() or path.suffix not in self._CODE_SUFFIXES:
+                continue
+            relative = path.relative_to(root).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
+
     def _snapshot_root(self, request: MatchRequest, candidate_id: str) -> Path:
-        if len(request.candidate_ids) == 1:
-            source = self.workspace
-        else:
-            source = self.workspace / ".agentbench" / "rollouts" / candidate_id
-        if not (source / "main.py").is_file():
-            raise ValueError(f"candidate snapshot {candidate_id} has no main.py")
+        """把一个候选物化成独立快照。
+
+        语义（宽容且明确）：``.agentbench/rollouts/<candidate_id>/`` 是**叠加层**，
+        覆盖在工作区当前版本之上。因此 Goal 只需为每个候选放差异文件；只放了
+        README 的情况会被下面的指纹去重识别为"无代码差异"，并作为协议问题反馈回去，
+        而不是让整个 run 崩掉。
+        """
+
+        overlay = self.workspace / ".agentbench" / "rollouts" / candidate_id
         destination = self.root / "snapshots" / candidate_id
         if destination.exists():
             raise ValueError(f"candidate snapshot already exists: {candidate_id}")
-        ignored = shutil.ignore_patterns("feedback", "research", "snapshots", "processed-requests")
-        shutil.copytree(source, destination, ignore=ignored)
+        ignored = shutil.ignore_patterns(
+            "feedback", "research", "snapshots", "processed-requests", "rollouts", "runtime-tmp"
+        )
+        base = self.workspace
+        if len(request.candidate_ids) == 1 and overlay.is_dir() and (overlay / "main.py").is_file():
+            base = overlay
+            shutil.copytree(base, destination, ignore=ignored)
+        else:
+            shutil.copytree(base, destination, ignore=ignored)
+            if overlay.is_dir():
+                shutil.copytree(overlay, destination, dirs_exist_ok=True)
+        if not (destination / "main.py").is_file():
+            shutil.rmtree(destination, ignore_errors=True)
+            raise ValueError(
+                f"candidate {candidate_id} has no main.py after overlaying "
+                f".agentbench/rollouts/{candidate_id}/ onto the workspace"
+            )
         self._append(
             "GoalVersionSnapshot",
-            {"candidate_id": candidate_id, "path": str(destination)},
+            {
+                "candidate_id": candidate_id,
+                "path": str(destination),
+                "code_fingerprint": self._code_fingerprint(destination),
+            },
             f"goal-led-snapshot:{candidate_id}",
         )
         return destination
 
+    def _materialize_candidates(
+        self, request: MatchRequest
+    ) -> tuple[dict[str, Path], list[str]]:
+        """物化全部候选，返回 (可评测候选, 协议问题说明)。
+
+        - 缺 main.py 的候选被跳过并记录原因；
+        - 与已有候选**代码完全相同**的候选被跳过（避免把"同一策略跑两遍"当成
+          k 个候选，从而污染探索多样性的统计）。
+        """
+
+        usable: dict[str, Path] = {}
+        notes: list[str] = []
+        fingerprints: dict[str, str] = {}
+        for candidate_id in request.candidate_ids:
+            try:
+                root = self._snapshot_root(request, candidate_id)
+            except ValueError as error:
+                notes.append(f"{candidate_id}: {error}")
+                continue
+            fingerprint = self._code_fingerprint(root)
+            duplicate = next(
+                (other for other, value in fingerprints.items() if value == fingerprint), None
+            )
+            if duplicate is not None:
+                notes.append(
+                    f"{candidate_id}: 与 {duplicate} 的代码完全相同（只有非代码文件不同），"
+                    "已跳过；请把每个候选的差异化 main.py 放进 "
+                    f".agentbench/rollouts/{candidate_id}/"
+                )
+                continue
+            fingerprints[candidate_id] = fingerprint
+            # ★ 前置校验：在烧掉 k×座次×seed 局对局之前，先确认这个包**能启动**。
+            # 线上真实教训：缺一个 ai.py 让 5 轮迭代全部变成"0 回合判负"，
+            # 曲线上是一条毫无信息的水平线。这里约 1 秒就能判掉，并给出可执行的原因。
+            issues = check_candidate(
+                candidate_id,
+                root,
+                candidate_interface=self.candidate_interface,
+            )
+            if issues:
+                notes.extend(issue.as_note() for issue in issues)
+                self._append(
+                    "CandidatePreflightRejected",
+                    {
+                        "candidate_id": candidate_id,
+                        "issues": [
+                            {"kind": issue.kind, "detail": issue.detail} for issue in issues
+                        ],
+                    },
+                    f"goal-led-preflight:{candidate_id}",
+                )
+                continue
+            usable[candidate_id] = root
+        return usable, notes
+
+    # ----------------------------------------------------------- match rounds
+
     @staticmethod
     def _result_row(
-        result: MatchResult, replay: Path | None, trace: Path | None
+        result: MatchResult,
+        replay: Path | None,
+        trace: Path | None,
+        narration: Path | None = None,
+        narration_note: str = "",
     ) -> dict[str, object]:
+        payload = result.payload or {}
+        # ★ 必须把对战器的诊断带进反馈：候选侧超时/非法/崩溃在契约里算"有效负局"
+        # （status=complete, result=loss, rounds=0），如果反馈里只有"你输了"而没有
+        # "因为第一帧格式非法"，Goal 就拿不到可执行信息，会在同一个坑里反复迭代。
+        # 这是**自己**程序的失败原因，属于公开信息，不涉及对手代码。
+        diagnostic = payload.get("game_error") or None
         return {
             "candidate_id": result.case.candidate_id,
             "opponent_id": result.case.opponent_id,
@@ -194,54 +769,208 @@ class GoalLedService:
             "rounds": result.rounds,
             "replay_path": None if replay is None else str(replay),
             "trace_path": None if trace is None else str(trace),
+            # 自然语言回放：agent 真正该读的那份（由 A 仓翻译）。
+            "narration_path": None if narration is None else str(narration),
+            "narration_note": narration_note,
             "error": result.error,
+            "diagnostic": diagnostic,
+            "evaluator_status": payload.get("evaluator_status"),
         }
 
-    def _execute(self, request: MatchRequest) -> tuple[Path, int]:
+    def _run_one(
+        self,
+        *,
+        request: MatchRequest,
+        candidate_id: str,
+        candidate_root: Path,
+        opponent_id: str,
+        role: str,
+        seed: int,
+        feedback_root: Path,
+    ) -> dict[str, object]:
+        result = self.arena.run_case(
+            MatchCase(candidate_id, opponent_id, role, seed), candidate_root
+        )
+        case_root = feedback_root / candidate_id / f"{role}-seed-{seed}"
+        case_root.mkdir(parents=True, exist_ok=True)
+        replay = None
+        trace = None
+        if result.replay_path is not None and Path(result.replay_path).is_file():
+            replay = case_root / "replay.json"
+            shutil.copy2(result.replay_path, replay)
+        if result.trace_path is not None and Path(result.trace_path).is_file():
+            trace = case_root / "public-trace.jsonl"
+            shutil.copy2(result.trace_path, trace)
+        # Feedback 通道的主体是**自然语言回放**，不是裸 JSON：
+        # 裸 JSON 逼着 agent 每轮重写一遍解析代码（实测吃掉 63% 墙钟），
+        # 而翻译只需在 A 仓做一次。裸 JSON 仍然保留在旁边，供它核对细节。
+        payload = result.payload or {}
+        narration, note = narrate_case(
+            self.game,
+            replay,
+            case_root / NARRATION_FILENAME,
+            match_id=f"{candidate_id}/{role}-seed-{seed}",
+            perspective=role,
+            opponent_id=opponent_id,
+            official_winner=role if result.result == "win" else None,
+            official_rounds=result.rounds,
+            diagnostic=str(payload.get("game_error") or ""),
+            agentbench_root=self.agentbench_root,
+        )
+        return self._result_row(result, replay, trace, narration, note)
+
+    def _execute(
+        self, request: MatchRequest, *, iteration: int, cleared: int
+    ) -> tuple[Path, int, dict[str, object], list[dict[str, object]], dict[str, Path]]:
         feedback_root = self.workspace / "feedback" / request.request_id
         feedback_root.mkdir(parents=True, exist_ok=False)
+        assignment, override_note = self._assign_opponents(
+            request, iteration=iteration, cleared=cleared
+        )
+        roles = self._effective_roles(request)
+        seeds = self._effective_seeds(request)
         self._append(
             "GoalMatchRequested",
             {
                 "request_id": request.request_id,
                 "candidate_ids": list(request.candidate_ids),
                 "opponent_id": request.opponent_id,
-                "roles": list(request.roles),
-                "seeds": list(request.seeds),
+                "opponent_assignment": dict(assignment),
+                "opponent_policy": self.policy_name,
+                "policy_override": override_note,
+                "roles": list(roles),
+                "seeds": list(seeds),
+                "rollout_k": self.rollout_k,
                 "rationale": request.rationale,
+                # 轮次要写进事件：征服进度与曲线横坐标都靠它把逐局记录分组。
+                "iteration": iteration,
             },
             f"goal-led-request:{request.request_id}",
         )
+
+        jobs: list[dict[str, object]] = []
+        usable, protocol_notes = self._materialize_candidates(request)
+        for candidate_id, candidate_root in usable.items():
+            for role in roles:
+                for seed in seeds:
+                    jobs.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "candidate_root": candidate_root,
+                            "opponent_id": assignment[candidate_id],
+                            "role": role,
+                            "seed": seed,
+                        }
+                    )
+        if not jobs:
+            # 协议问题（例如每个候选都没放 main.py）：不跑对局，但**不终止 run**，
+            # 把可执行的修正说明写成反馈交回 Goal，让它下一轮自己改对。
+            feedback = feedback_root / "feedback.json"
+            summary = {
+                "played": 0,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "infra_errors": 0,
+                "win_rate": None,
+                "protocol_error": True,
+                "protocol_notes": protocol_notes,
+            }
+            feedback.write_text(
+                json.dumps(
+                    {
+                        "request_id": request.request_id,
+                        "protocol_error": True,
+                        "protocol_notes": protocol_notes,
+                        "how_to_fix": (
+                            "每个候选必须能独立跑起来：把该候选的 main.py（以及它依赖的模块）"
+                            "放到 .agentbench/rollouts/<candidate_id>/；该目录会叠加到工作区之上。"
+                            "候选之间必须有**代码**差异，只改 README 不算。"
+                        ),
+                        "summary": summary,
+                        "matches": [],
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self._append(
+                "GoalProtocolViolation",
+                {"request_id": request.request_id, "notes": protocol_notes},
+                f"goal-led-protocol:{request.request_id}",
+            )
+            return feedback, 0, summary, [], {}
+
         rows: list[dict[str, object]] = []
-        for candidate_id in request.candidate_ids:
-            candidate_root = self._snapshot_root(request, candidate_id)
-            for role in request.roles:
-                for seed in request.seeds:
-                    result = self.arena.run_case(
-                        MatchCase(candidate_id, request.opponent_id, role, seed),
-                        candidate_root,
+        if self.match_parallelism > 1 and len(jobs) > 1:
+            # 并行前先串行预热后端构建（A 的 build cache 有 quarantine 竞态）。
+            warmup = getattr(self.arena, "warmup", None)
+            if callable(warmup):
+                try:
+                    warmup(Path(str(jobs[0]["candidate_root"])))
+                except Exception:  # noqa: BLE001 - 预热失败交由正式对局报诊断
+                    pass
+            with ThreadPoolExecutor(max_workers=self.match_parallelism) as pool:
+                futures = [
+                    pool.submit(
+                        self._run_one,
+                        request=request,
+                        feedback_root=feedback_root,
+                        candidate_id=str(job["candidate_id"]),
+                        candidate_root=Path(str(job["candidate_root"])),
+                        opponent_id=str(job["opponent_id"]),
+                        role=str(job["role"]),
+                        seed=int(job["seed"]),  # type: ignore[arg-type]
                     )
-                    case_root = feedback_root / candidate_id / f"{role}-seed-{seed}"
-                    case_root.mkdir(parents=True, exist_ok=True)
-                    replay = None
-                    trace = None
-                    if result.replay_path is not None and result.replay_path.is_file():
-                        replay = case_root / "replay.json"
-                        shutil.copy2(result.replay_path, replay)
-                    if result.trace_path is not None and result.trace_path.is_file():
-                        trace = case_root / "public-trace.jsonl"
-                        shutil.copy2(result.trace_path, trace)
-                    row = self._result_row(result, replay, trace)
-                    rows.append(row)
-                    self._append(
-                        "GoalMatchCompleted",
-                        {"request_id": request.request_id, **row},
-                        f"goal-led-match:{request.request_id}:{candidate_id}:{role}:{seed}",
+                    for job in jobs
+                ]
+                rows = [future.result() for future in futures]
+        else:
+            for job in jobs:
+                rows.append(
+                    self._run_one(
+                        request=request,
+                        feedback_root=feedback_root,
+                        candidate_id=str(job["candidate_id"]),
+                        candidate_root=Path(str(job["candidate_root"])),
+                        opponent_id=str(job["opponent_id"]),
+                        role=str(job["role"]),
+                        seed=int(job["seed"]),  # type: ignore[arg-type]
                     )
+                )
+        for row in rows:
+            self._append(
+                "GoalMatchCompleted",
+                {"request_id": request.request_id, **row},
+                "goal-led-match:{rid}:{cid}:{role}:{seed}".format(
+                    rid=request.request_id,
+                    cid=row["candidate_id"],
+                    role=row["role"],
+                    seed=row["seed"],
+                ),
+            )
+
+        summary = self._summarize(rows)
+        if protocol_notes:
+            summary["protocol_notes"] = protocol_notes
         feedback = feedback_root / "feedback.json"
         feedback.write_text(
             json.dumps(
-                {"request_id": request.request_id, "rationale": request.rationale, "matches": rows},
+                {
+                    "request_id": request.request_id,
+                    "rationale": request.rationale,
+                    "opponent_policy": self.policy_name,
+                    "opponent_assignment": {
+                        candidate: assignment[candidate] for candidate in usable
+                    },
+                    "policy_override": override_note,
+                    "protocol_notes": protocol_notes,
+                    "summary": summary,
+                    "matches": rows,
+                },
                 ensure_ascii=False,
                 sort_keys=True,
                 indent=2,
@@ -249,7 +978,859 @@ class GoalLedService:
             + "\n",
             encoding="utf-8",
         )
-        return feedback, len(rows)
+        self._write_combined_narration(feedback_root, rows)
+        return feedback, len(rows), summary, rows, dict(usable)
+
+    def _write_combined_narration(
+        self, feedback_root: Path, rows: Sequence[Mapping[str, object]]
+    ) -> Path | None:
+        """把本轮全部对局的自然语言复盘并成一份 ``all-replays.md``。
+
+        为什么值得单独做一份：一轮的墙钟 ≈ **往返次数** × 单次延迟，而单次延迟
+        几乎与上下文大小无关（实测同一个小问题在 reasoning_effort=high 下要 9.8s，
+        输入只有 58 tokens；一轮 30~68 次往返里工具执行只占 1%）。也就是说
+        agent 每多读一个文件，就要多付一次约 13 秒的"思考税"。
+        antwar2 一轮 8 局、8 份 replay.md 分 8 次读，光这一项就是 ~100s。
+
+        并成一份后 agent 一次读完：多出来的 prefill 只有几秒且有 95% 缓存命中，
+        省下的是 7 次思考税。单局文件**照旧保留**——要核对某一局的具体数字时仍然
+        用得上，也不动冻结产物的完整性。
+        """
+
+        sections: list[str] = []
+        index: list[str] = []
+        for position, row in enumerate(rows, start=1):
+            label = (
+                f"{row.get('candidate_id')} · {row.get('role')} · seed {row.get('seed')} "
+                f"vs {row.get('opponent_id')}"
+            )
+            verdict = f"{row.get('status')}/{row.get('result')}"
+            index.append(f"{position}. {label} — {verdict}")
+            body: str
+            path = row.get("narration_path")
+            if isinstance(path, str) and Path(path).is_file():
+                body = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+            else:
+                # 没有复盘本身就是信息（评测器失败/崩溃），要如实写出来而不是留空。
+                note = row.get("narration_note") or row.get("diagnostic") or row.get("error")
+                body = f"（这一局没有自然语言复盘：{note or '原因未记录'}）"
+            sections.append(f"## {position}. {label}\n\n判决：{verdict}\n\n{body}\n")
+
+        if not sections:
+            return None
+        document = (
+            "# 本轮全部对局复盘\n\n"
+            "这一份是本轮每一局 `replay.md` 的合并版，**读这一份就够了**。\n"
+            "需要核对某一局的具体数字时，单局文件仍在各自的 "
+            "`<candidate>/<role>-seed-<seed>/replay.md`。\n\n"
+            "## 目录\n\n" + "\n".join(index) + "\n\n---\n\n" + "\n---\n\n".join(sections)
+        )
+        combined = feedback_root / "all-replays.md"
+        combined.write_text(document, encoding="utf-8")
+        return combined
+
+    # ------------------------------------------------------------ aggregation
+
+    def _opponent_score(self, opponent_id: str) -> float | None:
+        for row in self.public_leaderboard:
+            if str(row.get("opponent_id")) == opponent_id and row.get("score") is not None:
+                return float(row["score"])  # type: ignore[arg-type]
+        return None
+
+    def _pool_elo(self) -> dict[str, object] | None:
+        """候选相对**固定人类池**的 Elo（累积锚定 MLE）。
+
+        用该 run 迄今**全部** complete 官方对局（跨轮、跨对手），以每个对手在人类池
+        里的 Elo 为固定锚点做一维 BT 极大似然估计。这是唯一跨轮/跨游戏可比的量：
+
+        * ``elo_vs_opponent`` 只看当轮胜率、锚点还随对手切换而变，有序课程下
+          "换更强的对手"会表现成假下降；
+        * 这里换对手只是换锚点，尺子（人类池 Elo 刻度）始终不变。
+
+        不额外烧机时——用的就是已经打完的局。详见 ``domain/pool_elo.py``。
+        """
+
+        rows = [row for row in self._match_rows_from_events() if row.get("status") == "complete"]
+        if not rows:
+            return None
+        anchors = {
+            str(row.get("opponent_id")): (
+                float(row["score"]) if row.get("score") is not None else None  # type: ignore[arg-type]
+            )
+            for row in self.public_leaderboard
+        }
+        estimate = estimate_pool_elo(rows, anchors)
+        return None if estimate is None else estimate.as_dict()
+
+    def _summarize(self, rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        scored = [row for row in rows if row.get("status") == "complete"]
+        infra = [row for row in rows if row.get("status") != "complete"]
+        wins = sum(1 for row in scored if row.get("result") == "win")
+        draws = sum(1 for row in scored if row.get("result") == "draw")
+        losses = sum(1 for row in scored if row.get("result") == "loss")
+        played = len(scored)
+        win_rate = (wins + 0.5 * draws) / played if played else None
+
+        per_candidate: dict[str, dict[str, float]] = {}
+        for row in scored:
+            entry = per_candidate.setdefault(
+                str(row["candidate_id"]), {"played": 0.0, "points": 0.0, "margin": 0.0}
+            )
+            entry["played"] += 1
+            entry["points"] += float(row.get("points") or 0.0)
+            if isinstance(row.get("score_margin"), (int, float)):
+                entry["margin"] += float(row["score_margin"])  # type: ignore[arg-type]
+        best_candidate = None
+        best_key: tuple[float, float] | None = None
+        for candidate_id, entry in per_candidate.items():
+            played_count = entry["played"] or 1.0
+            # 排序键用 (得分率, 平均分差)：全败的一轮里所有候选得分率都是 0，
+            # 此时只有分差能区分"差一点"和"被打爆"。不这样做的话 best_candidate
+            # 退化成字典序，下一轮的基线就是随机挑的——那才是真正的 0 信号。
+            key = (entry["points"] / played_count, entry["margin"] / played_count)
+            if best_key is None or key > best_key:
+                best_candidate, best_key = candidate_id, key
+        best_rate = None if best_key is None else best_key[0]
+
+        # 单对手 Elo 估计：以对手已知 Elo 为锚，按胜率做 logistic 反推。
+        elo_estimate = None
+        opponent_ids = sorted({str(row["opponent_id"]) for row in scored})
+        anchors = [self._opponent_score(item) for item in opponent_ids]
+        anchor_values = [value for value in anchors if value is not None]
+        if win_rate is not None and anchor_values:
+            probability = _clip(win_rate, 0.02, 0.98)
+            anchor = sum(anchor_values) / len(anchor_values)
+            elo_estimate = anchor + 400.0 * math.log10(probability / (1.0 - probability))
+
+        # 连续奖励：胜负是二值的，但**分差**不是。
+        #
+        # 为什么必须报它：只看胜率，一轮全败就等于 0 信号，agent 无从判断"这次改动
+        # 是差一点还是差很远"。而 score_margin（终局分差）与 rounds（撑了多少回合）
+        # 都是逐局连续量，早就落在事件里，只是从来没端到 agent 面前。实测 antwar2
+        # 对 rank1 连续 15 轮胜率恒为 0，如果那 15 轮的分差在收窄，那就是**有**梯度的。
+        #
+        # 逐候选报，因为"哪个候选离赢最近"才是下一轮该继续推的方向。
+        margins = [
+            float(row["score_margin"])
+            for row in scored
+            if isinstance(row.get("score_margin"), (int, float))
+        ]
+        per_candidate_margin: dict[str, list[float]] = {}
+        per_candidate_rounds: dict[str, list[int]] = {}
+        for row in scored:
+            candidate = str(row["candidate_id"])
+            if isinstance(row.get("score_margin"), (int, float)):
+                per_candidate_margin.setdefault(candidate, []).append(
+                    float(row["score_margin"])  # type: ignore[arg-type]
+                )
+            if isinstance(row.get("rounds"), int):
+                per_candidate_rounds.setdefault(candidate, []).append(int(row["rounds"]))
+        margin_by_candidate = {
+            candidate: {
+                "mean": round(sum(values) / len(values), 2),
+                "best": round(max(values), 2),
+                "worst": round(min(values), 2),
+                "rounds_mean": (
+                    round(
+                        sum(per_candidate_rounds[candidate])
+                        / len(per_candidate_rounds[candidate]),
+                        1,
+                    )
+                    if per_candidate_rounds.get(candidate)
+                    else None
+                ),
+            }
+            for candidate, values in per_candidate_margin.items()
+        }
+
+        # 失败原因汇总：0 回合判负这种情况没有回放可看，诊断是唯一的可执行线索。
+        diagnostics: dict[str, int] = {}
+        for row in rows:
+            detail = row.get("diagnostic")
+            if isinstance(detail, str) and detail.strip():
+                key = detail.strip()[:200]
+                diagnostics[key] = diagnostics.get(key, 0) + 1
+        zero_round_losses = sum(
+            1
+            for row in scored
+            if row.get("result") == "loss" and int(row.get("rounds") or 0) == 0
+        )
+
+        return {
+            "played": played,
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "infra_errors": len(infra),
+            "win_rate": win_rate,
+            "elo_vs_opponent": elo_estimate,
+            "opponent_ids": opponent_ids,
+            "best_candidate_id": best_candidate,
+            "best_candidate_win_rate": best_rate,
+            "zero_round_losses": zero_round_losses,
+            # 连续量：全败的一轮里，这些才是唯一的梯度来源。
+            "margin_mean": round(sum(margins) / len(margins), 2) if margins else None,
+            "margin_best": round(max(margins), 2) if margins else None,
+            "margin_by_candidate": margin_by_candidate,
+            "diagnostics": [
+                {"detail": detail, "count": count}
+                for detail, count in sorted(
+                    diagnostics.items(), key=lambda item: (-item[1], item[0])
+                )
+            ],
+        }
+
+    def _token_total(self) -> int | None:
+        """全 run 累计 token 用量。
+
+        harness 的用量事件是**会话累计值**语义（codex 的 ``tokenUsage/updated``
+        报的是当前 thread 的总量，单调增），所以在**单个 thread 内**要取最大值，
+        求和会把同一份累计量重复叠加。
+
+        但会话轮转把这件事变成了分段问题
+        --------------------------------
+        ``thread_rotate_each_iteration`` 之后每轮都换新 thread，计数**归零重来**。
+        此时对全 run 取全局 max，等于只记住"最贵的那一段"：实测 sota-antwar
+        跑了 44 段、各段峰值 69k~137k，全局 max 报 169k，而真实总消耗约 4.9M——
+        差了 29 倍。预算守卫因此永远不会触发，token 曲线也画成一条阶梯。
+
+        正确做法：**按 thread 分段取各段峰值，再把各段相加**。
+        分段边界用会话事件（``GoalLedStarted`` / ``GoalSessionReset`` /
+        ``GoalSessionRotated``）识别，与 ``_thread_context_tokens`` 同一套口径。
+        """
+
+        segments: list[int] = []
+        current: int | None = None
+        for event in self.events.read_all():
+            if event.event_type in ("GoalLedStarted", "GoalSessionReset", "GoalSessionRotated"):
+                if current is not None:
+                    segments.append(current)
+                current = None
+                continue
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            value = payload.get("total_tokens")
+            if isinstance(value, int):
+                current = value if current is None else max(current, value)
+        if current is not None:
+            segments.append(current)
+        return sum(segments) if segments else None
+
+    def _token_event_sum(self) -> int | None:
+        total = 0
+        seen = False
+        for event in self.events.read_all():
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            value = payload.get("total_tokens")
+            if isinstance(value, int):
+                total += value
+                seen = True
+        return total if seen else None
+
+    def _match_rows_from_events(self) -> list[dict[str, object]]:
+        """从事件流还原逐局记录（带轮次），供征服判定与轨迹计数使用。"""
+
+        rows: list[dict[str, object]] = []
+        iteration = 0
+        for event in self.events.read_all():
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            if event.event_type == "GoalMatchRequested":
+                value = payload.get("iteration")
+                iteration = int(value) if isinstance(value, int) else iteration + 1
+                continue
+            if event.event_type != "GoalMatchCompleted":
+                continue
+            rows.append(
+                {
+                    "iteration": iteration,
+                    "opponent_id": payload.get("opponent_id"),
+                    "status": payload.get("status"),
+                    "points": payload.get("points"),
+                    "rounds": payload.get("rounds"),
+                    "replay_path": payload.get("replay_path"),
+                }
+            )
+        return rows
+
+    def _conquest_state(self) -> ConquestState | None:
+        """有序课程（ladder_up / ladder_down）的当前进度；其它策略返回 None。"""
+
+        sequence = self.policy.target_sequence()
+        if not sequence:
+            return None
+        rows = self._match_rows_from_events()
+        return conquest_evaluate(
+            sequence, conquest_rounds(rows), rule=self.advance_rule
+        )
+
+    def _cleared_count(self) -> int:
+        """课程推进用的"已征服对手数"。
+
+        有序课程按目标序列判定（只有对**当前目标**稳定达标才 +1，见
+        :mod:`application.conquest`）；其它策略退回"历史上得分率 > 0.5 的对手数"，
+        它只用于生成指令文案，不影响对手选择。
+        """
+
+        state = self._conquest_state()
+        if state is not None:
+            return state.cleared
+
+        outcomes: dict[str, list[float]] = {}
+        for event in self.events.read_all():
+            if event.event_type != "GoalMatchCompleted":
+                continue
+            payload = event.payload
+            if payload.get("status") != "complete":
+                continue
+            opponent = str(payload.get("opponent_id"))
+            outcomes.setdefault(opponent, []).append(float(payload.get("points") or 0.0))
+        return sum(1 for points in outcomes.values() if points and sum(points) / len(points) > 0.5)
+
+    def _trajectories_seen(self) -> int:
+        """agent 已经能读到的**完整轨迹**数（实验 2 的横坐标之一）。
+
+        判据：非影子对局、状态 complete、且回放文件真的落到了反馈目录里
+        （0 回合判负没有回放，不算"看过一条轨迹"）。
+        """
+
+        total = 0
+        for row in self._match_rows_from_events():
+            if row.get("shadow") or row.get("status") != "complete":
+                continue
+            if row.get("replay_path"):
+                total += 1
+        return total
+
+    def _iteration_index(self) -> int:
+        return sum(
+            1 for event in self.events.read_all() if event.event_type == "GoalFeedbackDelivered"
+        )
+
+    def _previous_win_rate(self) -> float | None:
+        latest = None
+        for event in self.events.read_all():
+            if event.event_type != "IterationMetricsFinalized":
+                continue
+            value = event.payload.get("win_rate")
+            if isinstance(value, (int, float)):
+                latest = float(value)
+        return latest
+
+    # ------------------------------------------------------- information gain
+
+    def _snapshot_paths(self) -> dict[str, Path]:
+        """所有已物化候选快照（candidate_id → 路径），来自事件流。"""
+
+        table: dict[str, Path] = {}
+        for event in self.events.read_all():
+            if event.event_type != "GoalVersionSnapshot":
+                continue
+            candidate = event.payload.get("candidate_id")
+            path = event.payload.get("path")
+            if isinstance(candidate, str) and isinstance(path, str):
+                table[candidate] = Path(path)
+        return table
+
+    def _previous_champion(self) -> tuple[str, Path] | None:
+        """上一轮最优候选（作为本轮的配对基线）。"""
+
+        champion: str | None = None
+        for event in self.events.read_all():
+            if event.event_type != "IterationMetricsFinalized":
+                continue
+            value = event.payload.get("best_candidate_id")
+            if isinstance(value, str) and value:
+                champion = value
+        if champion is None:
+            return None
+        path = self._snapshot_paths().get(champion)
+        if path is None or not path.is_dir():
+            return None
+        return champion, path
+
+    def _run_shadow_matches(
+        self,
+        *,
+        request: MatchRequest,
+        baseline_id: str,
+        baseline_root: Path,
+        cases: Sequence[Mapping[str, object]],
+    ) -> list[dict[str, object]]:
+        """把基线策略放到**完全相同**的 case 上再跑一遍（不计入本轮胜率）。"""
+
+        shadow_root = self.workspace / "feedback" / request.request_id / "shadow"
+        jobs = [
+            {
+                "opponent_id": str(case["opponent_id"]),
+                "role": str(case["role"]),
+                "seed": int(case["seed"] or 0),  # type: ignore[arg-type]
+            }
+            for case in cases
+        ]
+        if not jobs:
+            return []
+
+        def run(job: Mapping[str, object]) -> dict[str, object]:
+            return self._run_one(
+                request=request,
+                feedback_root=shadow_root,
+                candidate_id=baseline_id,
+                candidate_root=baseline_root,
+                opponent_id=str(job["opponent_id"]),
+                role=str(job["role"]),
+                seed=int(job["seed"]),  # type: ignore[arg-type]
+            )
+
+        if self.match_parallelism > 1 and len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=self.match_parallelism) as pool:
+                rows = list(pool.map(run, jobs))
+        else:
+            rows = [run(job) for job in jobs]
+        for row in rows:
+            self._append(
+                "ShadowMatchCompleted",
+                {"request_id": request.request_id, "baseline_id": baseline_id, **row},
+                "goal-led-shadow:{rid}:{role}:{seed}".format(
+                    rid=request.request_id, role=row["role"], seed=row["seed"]
+                ),
+            )
+        return rows
+
+    # ------------------------------------------------ 决策级行为信息增益
+
+    @property
+    def behavioral_ig_root(self) -> Path:
+        """录制/重放产物目录。``<root>/transcripts`` 需要对沙箱内选手进程可写。"""
+
+        return self.root / "behavioral-ig"
+
+    def _inprocess_behavioral_ig(
+        self,
+        *,
+        baseline_root: Path,
+        candidate_root: Path,
+        pairs: Sequence[tuple[Mapping[str, object], Mapping[str, object]]],
+    ) -> tuple[float | None, str]:
+        """进程内策略探针（Plan II 的 ``ai.py`` 契约）：在公开回放上重驱动策略。
+
+        它能拿到**精确**的每态合法支撑集，保真度高于通用线协议探针，所以优先用它；
+        但它要求候选包能被 import 成一个策略对象，Plan I 的 ``main.py`` 进程契约不满足。
+        """
+
+        from agentbench_hl.domain.policy import (  # noqa: PLC0415 - 仅在需要时加载
+            compare_decisions,
+            compare_policy_episode,
+        )
+
+        binding, reason = probe_availability(self.game, candidate_root)
+        if binding is None:
+            return None, reason
+        values: list[float] = []
+        for _baseline_row, candidate_row in pairs:
+            replay = candidate_row.get("replay_path")
+            if not isinstance(replay, str) or not Path(replay).is_file():
+                continue
+            match_id = "{role}-seed-{seed}".format(
+                role=candidate_row.get("role"), seed=candidate_row.get("seed")
+            )
+            role = str(candidate_row.get("role"))
+            try:
+                baseline_trace = binding.probe(
+                    baseline_root, replay, match_id=match_id, role=role
+                )
+                candidate_trace = binding.probe(
+                    candidate_root, replay, match_id=match_id, role=role
+                )
+            except Exception as error:  # noqa: BLE001 - 探针失败必须如实记录
+                return None, f"in-process probe failed: {type(error).__name__}: {error}"
+            samples = compare_policy_episode(baseline_trace, candidate_trace)
+            comparison = compare_decisions(samples, epsilon=self.epsilon)
+            if comparison.mean_kl_nats is not None:
+                values.append(float(comparison.mean_kl_nats))
+        if not values:
+            return None, "in-process probe available but no paired replay produced decisions"
+        return sum(values) / len(values), f"measured with {binding.schema}"
+
+    def _wire_behavioral_ig(
+        self,
+        *,
+        request: MatchRequest,
+        iteration: int,
+        baseline_id: str,
+        baseline_root: Path,
+        candidate_id: str,
+        candidate_root: Path,
+        pairs: Sequence[tuple[Mapping[str, object], Mapping[str, object]]],
+    ) -> BehavioralIgMeasurement:
+        """通用线协议探针（Plan I 的 ``main.py`` 进程契约）。
+
+        口径来自 A 仓 ``games/<game>/decision_space.yaml`` 的 ``information_gain:`` 段；
+        流程见 :mod:`agentbench_hl.application.behavioral_ig`。完整 trace 会落到
+        ``<run>/behavioral-ig/trace-<iteration>.json``，曲线脚本读它。
+        """
+
+        spec, note = load_information_gain_spec(
+            self.game, agentbench_root=self.agentbench_root
+        )
+        if spec is None:
+            return BehavioralIgMeasurement(value=None, reason=note)
+        cases = tuple(
+            BehavioralIgCase(
+                opponent_id=str(candidate_row.get("opponent_id")),
+                role=str(candidate_row.get("role")),
+                seed=int(candidate_row.get("seed") or 0),
+            )
+            for _baseline_row, candidate_row in pairs
+        )
+        feedback_root = self.workspace / "feedback" / request.request_id / "behavioral-ig"
+
+        def run_match(
+            player_id: str, root: Path, case: BehavioralIgCase
+        ) -> Mapping[str, object]:
+            return self._run_one(
+                request=request,
+                feedback_root=feedback_root,
+                candidate_id=player_id,
+                candidate_root=root,
+                opponent_id=case.opponent_id,
+                role=case.role,
+                seed=case.seed,
+            )
+
+        measurement = measure_behavioral_ig(
+            spec=spec,
+            epsilon=self.epsilon,
+            work_root=self.behavioral_ig_root,
+            baseline_id=baseline_id,
+            baseline_root=baseline_root,
+            candidate_id=candidate_id,
+            candidate_root=candidate_root,
+            cases=cases,
+            run_match=run_match,
+            replay_timeout_s=self.behavioral_ig_timeout_s,
+            max_cases=self.behavioral_ig_cases,
+            coupling=self.behavioral_ig_coupling,
+            # 逐决策点的真实 |A(s)|。有状态探针的游戏（antwar/antwar2）走精确枚举，
+            # 其余游戏自动回落到字母表常量并在 support_mode 里如实标注。
+            support_provider=provider_for(self.game),
+        )
+        trace_path = self.behavioral_ig_root / f"trace-{iteration:04d}.json"
+        try:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_path.write_text(
+                json.dumps(measurement.trace_document(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            # 落盘失败不该让整轮迭代崩掉：数值已经在事件里了。
+            pass
+        return measurement
+
+    def _behavioral_ig(
+        self,
+        *,
+        request: MatchRequest,
+        iteration: int,
+        baseline_id: str,
+        baseline_root: Path,
+        candidate_id: str,
+        candidate_root: Path,
+        pairs: Sequence[tuple[Mapping[str, object], Mapping[str, object]]],
+    ) -> tuple[float | None, str, dict[str, object]]:
+        """决策级行为信息增益（nats/决策）。
+
+        **一个 run 只用一种探针**（``behavioral_ig_probe``）。这不是洁癖：两种探针的
+        |A| 与动作口径不同，如果按"先试进程内、失败退线协议"逐轮自动切换，同一条曲线上
+        相邻两点就可能来自不同口径，斜率完全没有意义。实测 antwar2 的进程内探针每轮都
+        ``TimeoutExpired``，正好会造出这种混口径曲线（还白烧几分钟墙钟）。
+
+        默认 ``transcript_replay``：它对 8 个游戏 / 9 条角色轨都做过零点校准与灵敏度验收。
+        ``in_process_first`` 保留给需要更高保真度、且确认该游戏探针可用的场合。
+        测不出来就记 ``None`` + 原因——绝不用别的量顶替。
+        """
+
+        reason = ""
+        if self.behavioral_ig_probe == "in_process_first":
+            value, reason = self._inprocess_behavioral_ig(
+                baseline_root=baseline_root, candidate_root=candidate_root, pairs=pairs
+            )
+            if value is not None:
+                return value, reason, {"behavioral_ig_probe": "in_process_policy_probe"}
+        if self.behavioral_ig_cases <= 0:
+            note = "wire probe disabled (behavioral_ig_cases=0)"
+            return None, f"{reason}; {note}" if reason else note, {}
+        measurement = self._wire_behavioral_ig(
+            request=request,
+            iteration=iteration,
+            baseline_id=baseline_id,
+            baseline_root=baseline_root,
+            candidate_id=candidate_id,
+            candidate_root=candidate_root,
+            pairs=pairs,
+        )
+        payload = measurement.payload()
+        payload["behavioral_ig_probe"] = "transcript_replay"
+        payload["behavioral_ig_reason"] = (
+            f"{reason}; {measurement.reason}" if reason else measurement.reason
+        )
+        return measurement.value, str(payload["behavioral_ig_reason"]), payload
+
+    def _measure_information_gain(
+        self,
+        *,
+        request: MatchRequest,
+        iteration: int,
+        summary: Mapping[str, object],
+        rows: Sequence[Mapping[str, object]],
+        candidate_roots: Mapping[str, Path],
+    ) -> dict[str, object]:
+        """配对影子对局 + 三个层次的信息增益度量（见 :mod:`.info_gain` 模块说明）。"""
+
+        empty: dict[str, object] = {
+            "outcome_ig_nats": None,
+            "behavioral_ig": None,
+            "behavioral_ig_probe": None,
+            "behavioral_action_disagreement": None,
+            "behavioral_occupancy_shift": None,
+            "behavioral_ig_decisions": 0,
+            "behavior_divergence_frac": None,
+            "behavior_identical": None,
+            "paired_margin_shift": None,
+            "paired_cases": 0,
+            "baseline_candidate_id": None,
+        }
+        if not self.measure_information_gain:
+            return {**empty, "behavioral_ig_reason": "information gain measurement disabled"}
+        best = summary.get("best_candidate_id")
+        if not isinstance(best, str) or not best:
+            return {**empty, "behavioral_ig_reason": "no scored candidate this iteration"}
+        baseline = self._previous_champion()
+        if baseline is None:
+            return {
+                **empty,
+                "behavioral_ig_reason": "no paired baseline yet (first scored iteration)",
+            }
+        baseline_id, baseline_root = baseline
+        candidate_root = candidate_roots.get(best) or (self.root / "snapshots" / best)
+        candidate_rows = [
+            row
+            for row in rows
+            if row.get("candidate_id") == best and row.get("status") == "complete"
+        ]
+        if not candidate_rows:
+            return {**empty, "behavioral_ig_reason": "best candidate has no complete match"}
+        shadow_rows = self._run_shadow_matches(
+            request=request,
+            baseline_id=baseline_id,
+            baseline_root=baseline_root,
+            cases=candidate_rows,
+        )
+        key = lambda row: (  # noqa: E731 - 局部配对键
+            str(row.get("opponent_id")),
+            str(row.get("role")),
+            int(row.get("seed") or 0),
+        )
+        shadow_by_case = {key(row): row for row in shadow_rows if row.get("status") == "complete"}
+        pairs = [
+            (shadow_by_case[key(row)], row) for row in candidate_rows if key(row) in shadow_by_case
+        ]
+        if not pairs:
+            return {
+                **empty,
+                "baseline_candidate_id": baseline_id,
+                "behavioral_ig_reason": "shadow matches produced no paired observation",
+            }
+        baseline_paired = [item[0] for item in pairs]
+        candidate_paired = [item[1] for item in pairs]
+        ig = outcome_ig_nats(
+            outcome_counts(baseline_paired),
+            outcome_counts(candidate_paired),
+            epsilon=self.epsilon,
+        )
+        divergences: list[float] = []
+        identical_flags: list[bool] = []
+        for baseline_row, candidate_row in pairs:
+            left = baseline_row.get("replay_path")
+            right = candidate_row.get("replay_path")
+            if not isinstance(left, str) or not isinstance(right, str):
+                continue
+            report = replay_divergence(left, right)
+            if not report.get("available"):
+                continue
+            identical_flags.append(bool(report.get("identical")))
+            value = report.get("divergence_frac")
+            if isinstance(value, (int, float)):
+                divergences.append(float(value))
+        behavioral, reason, behavioral_payload = self._behavioral_ig(
+            request=request,
+            iteration=iteration,
+            baseline_id=baseline_id,
+            baseline_root=baseline_root,
+            candidate_id=best,
+            candidate_root=Path(candidate_root),
+            pairs=pairs,
+        )
+        payload: dict[str, object] = {
+            "outcome_ig_nats": round(ig, 6),
+            **behavioral_payload,
+            "behavioral_ig": None if behavioral is None else round(behavioral, 6),
+            "behavioral_ig_reason": reason,
+            "behavior_divergence_frac": (
+                round(sum(divergences) / len(divergences), 6) if divergences else None
+            ),
+            "behavior_identical": (
+                all(identical_flags) if identical_flags else None
+            ),
+            "paired_margin_shift": paired_margin_shift(baseline_paired, candidate_paired),
+            "paired_cases": len(pairs),
+            "baseline_candidate_id": baseline_id,
+        }
+        self._append(
+            "InformationGainMeasured",
+            {
+                "request_id": request.request_id,
+                "research_iteration": iteration,
+                "candidate_id": best,
+                "epsilon": self.epsilon,
+                "baseline_outcomes": outcome_counts(baseline_paired),
+                "candidate_outcomes": outcome_counts(candidate_paired),
+                **payload,
+            },
+            f"goal-led-ig:{request.request_id}",
+        )
+        return payload
+
+    def _emit_iteration_metrics(
+        self,
+        *,
+        request: MatchRequest,
+        iteration: int,
+        summary: Mapping[str, object],
+        rows: Sequence[Mapping[str, object]] = (),
+        candidate_roots: Mapping[str, Path] | None = None,
+        spread: Mapping[str, object] | None = None,
+    ) -> None:
+        previous = self._previous_win_rate()
+        win_rate = summary.get("win_rate")
+        outcome_shift = (
+            abs(float(win_rate) - previous)
+            if isinstance(win_rate, (int, float)) and previous is not None
+            else None
+        )
+        gain = self._measure_information_gain(
+            request=request,
+            iteration=iteration,
+            summary=summary,
+            rows=rows,
+            candidate_roots=candidate_roots or {},
+        )
+        tokens = self._token_total()
+        pool_elo = self._pool_elo()
+        payload: dict[str, object] = {
+            "schema_version": "1.1",
+            "research_iteration": iteration,
+            "request_id": request.request_id,
+            "game": self.game,
+            "model": self.model,
+            "harness": getattr(self.runtime, "harness", "codex"),
+            "opponent_policy": self.policy_name,
+            "opponent_ids": summary.get("opponent_ids"),
+            "candidate_ids": list(request.candidate_ids),
+            "rollout_k": self.rollout_k,
+            # 探索多样性：pairwise 代码行差异（口径见 application/candidate_diversity.py）。
+            # code_fingerprint 互异只能排除"逐字节相同"，排不掉"同一骨架换阈值"——
+            # 后者让一轮 k 个候选退化成 1 个假设，是学习曲线走平最常见的原因。
+            "candidate_spread": spread,
+            "candidate_spread_verdict": (spread or {}).get("verdict"),
+            "matches": summary.get("played"),
+            "win_rate": win_rate,
+            "draw_rate": (
+                summary.get("draws") / summary["played"]  # type: ignore[operator]
+                if summary.get("played")
+                else None
+            ),
+            "elo_vs_opponent": summary.get("elo_vs_opponent"),
+            # 全池 Elo：用该 run 迄今全部对局做累积锚定 MLE（见 domain/pool_elo.py）。
+            # 这是唯一跨轮、跨游戏可比的量——elo_vs_opponent 的锚点会随对手切换而跳，
+            # 有序课程下"换更强对手"会画成假下降。
+            # 仍保留 fixed_pool_elo 这个字段名给"真跑一遍全池"的慢通道；
+            # 两者口径不同，所以分开记，不互相冒充。
+            "pool_elo": (pool_elo or {}).get("elo"),
+            "pool_elo_detail": pool_elo,
+            "fixed_pool_elo": None,
+            # 信息增益：配对影子对局给出结果分布 KL（nats/局，全游戏可得）；
+            # 决策级行为 IG 走通用线协议探针（口径见 A 仓 decision_space.yaml 的
+            # information_gain 段），测不出来就记 null + 原因，绝不用别的量顶替。
+            "outcome_ig_nats": gain.get("outcome_ig_nats"),
+            "behavioral_ig": gain.get("behavioral_ig"),
+            "behavioral_ig_reason": gain.get("behavioral_ig_reason"),
+            "behavioral_ig_probe": gain.get("behavioral_ig_probe"),
+            # |A| 的口径必须跟着数一起走：读者要能看出 KL 用的支撑集是精确枚举
+            # 还是"操作类型字母表"这个测量约定。
+            "behavioral_ig_support_mode": gain.get("support_mode"),
+            "behavioral_ig_support_cardinality": gain.get("support_cardinality"),
+            # 精确覆盖率：|A(s)| 有多少个决策点是真枚举出来的、多少个退回了常量。
+            # 只报 support_mode 不够——"mixed"这个标签本身不说明精确了多少。
+            "behavioral_ig_support_exact_decisions": gain.get("support_exact_decisions"),
+            "behavioral_ig_support_exact_fraction": gain.get("support_exact_fraction"),
+            "behavioral_ig_support_notes": gain.get("support_alignment_notes"),
+            # 随机流耦合口径：这个数是"公共随机流下的策略偏离"还是"严格确定性下的 KL"，
+            # 必须跟着数一起出现，否则读者无从判断可比性。
+            "behavioral_ig_coupling": gain.get("behavioral_ig_coupling"),
+            "behavioral_ig_decisions": gain.get("behavioral_ig_decisions"),
+            # 无测量假设的对照量：动作分歧率（KL 只是它在声明 |A| 下的单调重标度）。
+            "behavioral_action_disagreement": gain.get("behavioral_action_disagreement"),
+            # 状态占据位移：与 policy KL 分开报告，永不相加。
+            "behavioral_occupancy_shift": gain.get("behavioral_occupancy_shift"),
+            "behavior_divergence_frac": gain.get("behavior_divergence_frac"),
+            "behavior_identical": gain.get("behavior_identical"),
+            "paired_margin_shift": gain.get("paired_margin_shift"),
+            "paired_cases": gain.get("paired_cases"),
+            "baseline_candidate_id": gain.get("baseline_candidate_id"),
+            "outcome_shift": outcome_shift,
+            "best_candidate_id": summary.get("best_candidate_id"),
+            "total_tokens": tokens,
+            "token_events_sum": self._token_event_sum(),
+            "total_wall_time_s": round(time.time() - self._started_at(), 3),
+            "infra_errors": summary.get("infra_errors"),
+            # 实验 2 的第二个横坐标：agent 到目前为止真正能读到的完整轨迹数。
+            "trajectories_seen": self._trajectories_seen(),
+            # 实验 5：有序课程的征服进度（非有序策略为 null）。
+            "conquest": (
+                self._conquest_state().summary if self._conquest_state() is not None else None
+            ),
+            "ladder_size": len(self.public_leaderboard),
+            "history_mode": self.history_mode,
+            # 会话轮转：这一轮开始时 harness 的上下文占用，以及迄今换过几个 thread。
+            # 记它是因为"agent 是否还记得上一轮"会影响读者对学习曲线的解释——
+            # 轮转后经验只能来自 research/ 下的文件，而不是对话记忆。
+            "thread_context_tokens": self._thread_context_tokens(),
+            "thread_rotations": sum(
+                1 for event in self.events.read_all() if event.event_type == "GoalSessionRotated"
+            ),
+        }
+        self._append(
+            "IterationMetricsFinalized", payload, f"goal-led-metrics:{request.request_id}"
+        )
+
+    # ---------------------------------------------------------------- budgets
+
+    def budget_status(self) -> dict[str, object]:
+        tokens = self._token_total()
+        elapsed = time.time() - self._started_at()
+        exhausted: str | None = None
+        if self.token_budget is not None and tokens is not None and tokens >= self.token_budget:
+            exhausted = "token_budget"
+        elif self.wall_budget_s is not None and elapsed >= self.wall_budget_s:
+            exhausted = "wall_budget"
+        return {
+            "tokens": tokens,
+            "token_budget": self.token_budget,
+            "elapsed_s": round(elapsed, 3),
+            "wall_budget_s": self.wall_budget_s,
+            "exhausted": exhausted,
+        }
+
+    # ------------------------------------------------------------- feedback
 
     def _pending_feedback(self) -> tuple[MatchRequest, Path, int] | None:
         delivered = {
@@ -277,6 +1858,62 @@ class GoalLedService:
             return request, feedback, match_count
         return None
 
+    def _margin_note(self, summary: Mapping[str, object]) -> str:
+        """逐候选分差段落。
+
+        分差是连续量：胜负二值化之后信息就没了，但"差多少"一直在。全败的一轮
+        尤其需要它——那时胜率恒为 0，唯一能说明"哪个方向对"的就是分差和
+        撑住的回合数。实测 antwar2 对 rank1 连续 15 轮胜率为 0，如果只报胜率，
+        那 15 轮对 agent 而言完全等价，等于白跑。
+        """
+
+        by_candidate = summary.get("margin_by_candidate")
+        if not isinstance(by_candidate, Mapping) or not by_candidate:
+            return ""
+        ranked = sorted(
+            by_candidate.items(),
+            key=lambda item: -float(item[1].get("mean", 0.0)),  # type: ignore[union-attr]
+        )
+        parts = [
+            "{name}: 平均分差 {mean:+g}（最好 {best:+g}，最差 {worst:+g}{rounds}）".format(
+                name=name,
+                mean=stats.get("mean"),  # type: ignore[union-attr]
+                best=stats.get("best"),  # type: ignore[union-attr]
+                worst=stats.get("worst"),  # type: ignore[union-attr]
+                rounds=(
+                    f"，均撑 {stats.get('rounds_mean')} 回合"  # type: ignore[union-attr]
+                    if stats.get("rounds_mean") is not None  # type: ignore[union-attr]
+                    else ""
+                ),
+            )
+            for name, stats in ranked
+        ]
+        return (
+            "\n\n**逐候选分差**（终局分差，正=你领先；胜负只是它过不过零，"
+            "所以即使全败也要看这个数在往哪边走）：\n- " + "\n- ".join(parts) + "\n"
+        )
+
+    def _feedback_headline(self, summary: Mapping[str, object] | None) -> str:
+        """下发给 agent 的成绩摘要。抽成独立方法是为了可单测。"""
+
+        if summary is None:
+            return ""
+        if summary.get("protocol_error"):
+            notes = "；".join(str(item) for item in (summary.get("protocol_notes") or []))
+            return (
+                "本轮**没有产生任何有效对局**，因为候选包不符合提交格式："
+                f"{notes}。请先修好格式：每个候选的 main.py 放到 "
+                ".agentbench/rollouts/<candidate_id>/（该目录叠加到工作区之上），"
+                "候选之间必须有代码差异。修好后重新写 action.json。"
+            )
+        if summary.get("win_rate") is None:
+            return ""
+        headline = (
+            f"本轮胜率 {float(summary['win_rate']):.2%}"  # type: ignore[arg-type]
+            f"（{summary.get('wins')}胜/{summary.get('draws')}平/{summary.get('losses')}负）。"
+        )
+        return headline + self._margin_note(summary)
+
     def _deliver_feedback(
         self,
         session: AgentSession,
@@ -284,42 +1921,269 @@ class GoalLedService:
         feedback: Path,
         match_count: int,
         request_count: int,
+        summary: Mapping[str, object] | None = None,
+        prompt_next: bool = True,
+        spread: Mapping[str, object] | None = None,
+        handoff: str = "",
     ) -> GoalLedOutcome:
-        session = self._turn(
-            session,
-            (
-                f"官方比赛反馈已写入 {feedback.relative_to(self.workspace)}。"
-                "阅读 replay.json、public-trace.jsonl 和 feedback.json；更新 research/ 中的"
-                "成功经验与失败假设，修改策略，并在准备好下一步时写新的 action.json。"
-                "常规探索请从共同 parent 产出 k=4 个有机制差异的策略包，各打一份诊断回放；"
-                "不要把单一反事实或单点动作修改当作前置要求。"
+        iteration = request_count + 1
+        headline = self._feedback_headline(summary)
+        if summary is not None and summary.get("win_rate") is not None:
+            if summary.get("protocol_notes"):
+                headline += (
+                    "注意：部分候选被跳过 —— "
+                    + "；".join(str(item) for item in summary["protocol_notes"])  # type: ignore[index]
+                    + "。"
+                )
+            # 0 回合判负 = 你的程序在第一帧就被判死（超时/非法/崩溃）。
+            # 这时没有回放可读，对战器诊断是唯一线索，必须直接说出来。
+            zero_rounds = int(summary.get("zero_round_losses") or 0)
+            diagnostics = summary.get("diagnostics") or []
+            if zero_rounds and isinstance(diagnostics, list) and diagnostics:
+                details = "；".join(
+                    f"{item.get('detail')}（{item.get('count')} 局）"
+                    for item in diagnostics[:3]
+                    if isinstance(item, Mapping)
+                )
+                headline += (
+                    f"其中 {zero_rounds} 局是**第 0 回合就判负**（没有回放可读），"
+                    f"对战器诊断：{details}。"
+                    "请先按诊断把协议/启动问题修好，再谈策略强度。"
+                )
+            elif isinstance(diagnostics, list) and diagnostics:
+                details = "；".join(
+                    f"{item.get('detail')}（{item.get('count')} 局）"
+                    for item in diagnostics[:3]
+                    if isinstance(item, Mapping)
+                )
+                headline += f"对战器诊断：{details}。"
+        experience_hint = (
+            f"更新 research/{EXPERIENCE_FILE} 中的成功经验与失败假设，"
+            if self.experience_skills
+            else ""
+        )
+        if prompt_next:
+            # 这一次 turn 是全轮里最贵的（读 k 份回放 + 写 k 个候选），也是最容易把
+            # 上下文推过压缩阈值的地方，所以进它之前必须再查一次轮转。
+            if not handoff:
+                session, handoff = self._rotate_if_needed(session, iteration=iteration)
+            # 伪多样性是"这一轮白花了 k 倍对局"级别的浪费，所以它必须出现在
+            # 下一轮提示词的**开头**，而不是埋在末尾的通用要求里。
+            spread_note = diversity_note(spread)
+            session = self._turn(
+                session,
+                (
+                    handoff
+                    + (f"{spread_note}\n" if spread_note else "")
+                    + f"官方比赛反馈已写入 {feedback.relative_to(self.workspace)}。{headline}"
+                    "**先读同目录下的 all-replays.md** —— 那是本轮每一局回放被翻译成的"
+                    "自然语言复盘（判决、对手画像、你的浪费、逐回合时间线）合并成的**一份**文件，"
+                    "一次读完即可，不要逐局去读单局的 replay.md（那样每多读一个文件"
+                    "就多花一次模型往返；单局文件只在你要核对某个具体数字时才用）。"
+                    "不需要自己写代码去解析 replay.json。汇总数字看 feedback.json。"
+                    f"{experience_hint}修改策略，并在准备好下一步时写新的 action.json。"
+                    f"常规探索请从共同 parent 产出 k={self.rollout_k} 个候选，"
+                    "**每个候选一个不同的优化假设**（不同取胜路径/不同机制，"
+                    f"任意两个之间代码差异 ≥ {DIVERSITY_THRESHOLD_LINES} 行），"
+                    "各打一份诊断回放；不要把单一反事实或单点动作修改当作前置要求。"
+                    "候选改多少由证据决定（从机制与回放里读出该怎么改），"
+                    "但请把旧版本文件留着，以便回退与按局面组合；"
+                    "提交前跑 selfcheck.py 确认每个候选都是合法代码。"
+                ),
+                iteration=iteration,
+                cleared=self._cleared_count(),
+            )
+            self._append(
+                "GoalFeedbackDelivered",
+                {"request_id": request.request_id, "feedback_path": str(feedback)},
+                f"goal-led-feedback:{request.request_id}",
+            )
+        else:
+            # 末轮：反馈文件已经落盘（产物完整、可复盘），但不再驱动 agent 思考——
+            # 那一轮的产出必然被丢弃，纯烧墙钟与 token。
+            self._append(
+                "GoalFeedbackWithheld",
+                {
+                    "request_id": request.request_id,
+                    "feedback_path": str(feedback),
+                    "reason": "final iteration; not prompting for work that would be discarded",
+                },
+                f"goal-led-feedback-withheld:{request.request_id}",
+            )
+        self._write_state(session.thread_id, request_count + 1)
+        return GoalLedOutcome(
+            thread_id=session.thread_id,
+            workspace=self.workspace,
+            request_id=request.request_id,
+            match_count=match_count,
+            iteration=iteration,
+            win_rate=(
+                float(summary["win_rate"])  # type: ignore[arg-type]
+                if summary is not None and summary.get("win_rate") is not None
+                else None
             ),
         )
-        self._append(
-            "GoalFeedbackDelivered",
-            {"request_id": request.request_id, "feedback_path": str(feedback)},
-            f"goal-led-feedback:{request.request_id}",
-        )
-        self._write_state(session.thread_id, request_count + 1)
-        return GoalLedOutcome(session.thread_id, self.workspace, request.request_id, match_count)
 
-    def _run_request(self, session: AgentSession, request_count: int) -> GoalLedOutcome:
+    def _run_request(
+        self, session: AgentSession, request_count: int, *, prompt_next: bool = True
+    ) -> GoalLedOutcome:
+        cleared = self._cleared_count()
         request = self._consume_request()
-        if request_count == 0 and request.opponent_id != "rank01":
-            raise ValueError("the first Goal-led official request must target rank01")
-        feedback, match_count = self._execute(request)
+        if request_count == 0 and self.policy_name == SELF_DECIDE:
+            top = self._ladder()[0].opponent_id
+            if request.opponent_id != top:
+                raise ValueError(
+                    f"the first Goal-led official request must target the top-ranked opponent {top}"
+                )
+        feedback, match_count, summary, rows, candidate_roots = self._execute(
+            request, iteration=request_count + 1, cleared=cleared
+        )
+        # 探索多样性：本轮 k 个候选到底是 k 个尝试还是一个尝试的 k 份复制。
+        # 同一份度量走两条路——记进指标（可画曲线）+ 反馈给 agent（闭环纠正）。
+        spread = candidate_spread(candidate_roots)
+        self._emit_iteration_metrics(
+            request=request,
+            iteration=request_count + 1,
+            summary=summary,
+            rows=rows,
+            candidate_roots=candidate_roots,
+            spread=spread,
+        )
         return self._deliver_feedback(
-            session, request, feedback, match_count, request_count
+            session,
+            request,
+            feedback,
+            match_count,
+            request_count,
+            summary,
+            prompt_next=prompt_next,
+            spread=spread,
         )
 
-    def start(self) -> GoalLedOutcome:
+    # -------------------------------------------------------------- lifecycle
+
+    def _harness_identity(self) -> dict[str, object]:
+        """harness 二进制身份（版本换了，曲线就不可直接横比）。"""
+
+        identity: dict[str, object] = {}
+        capabilities = getattr(self.runtime, "_capabilities", None) or {}
+        identity.update(
+            {
+                key: value
+                for key, value in capabilities.items()
+                if isinstance(value, (str, int, float, bool))
+            }
+        )
+        # cc 侧 binary 是字符串；codex 侧是 command 序列（codex app-server …）。
+        binary = getattr(self.runtime, "binary", None)
+        command = getattr(self.runtime, "command", None)
+        if isinstance(binary, str):
+            identity.setdefault("binary", binary)
+        elif isinstance(command, (list, tuple)) and command:
+            identity.setdefault("binary", str(command[0]))
+            identity.setdefault("command", [str(item) for item in command])
+        if "version" not in identity and identity.get("binary"):
+            try:
+                probe = subprocess.run(
+                    (str(identity["binary"]), "--version"),
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                line = (probe.stdout or probe.stderr or "").strip().splitlines()
+                if line:
+                    identity["version"] = line[0][:120]
+            except (OSError, subprocess.SubprocessError):
+                identity["version"] = None
+        return identity
+
+    def _append_reproducibility_manifest(self, session: AgentSession) -> None:
+        """落盘"这一次 run 的结果由哪些输入决定"。
+
+        LLM 采样本身不可逐 token 复现（中转站不暴露 seed/温度），所以我们能保证的是
+        **统计可复现**：除模型采样外的一切输入都被冻结并留下摘要，任何两次 run 的
+        差异都可以归因到"采样噪声"而不是"配置漂移"。这里记录：
+
+        - prompt 三段（objective / base_instructions / developer_instructions）的摘要；
+        - 冻结实验配置与 GamePack 摘要（run-manifest.json 已由 factory 写好）；
+        - harness 身份（版本/二进制）、模型、隔离描述；
+        - 框架级实验变量：seeds / roles / K / 对手策略 / 并行度 / ε / 迭代模式。
+        """
+
+        context = self._context("")
+
+        def digest(value: str | None) -> str | None:
+            if not value:
+                return None
+            return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+        manifest = self.root / "run-manifest.json"
+        gamepack_digests: object = None
+        if manifest.is_file():
+            try:
+                gamepack_digests = json.loads(manifest.read_text(encoding="utf-8")).get(
+                    "gamepack_digests"
+                )
+            except json.JSONDecodeError:
+                gamepack_digests = None
+        self._append(
+            "RunReproducibilityManifest",
+            {
+                "schema_version": "1.0",
+                "thread_id": session.thread_id,
+                "game": self.game,
+                "model": self.model,
+                "model_provider": self.model_provider,
+                "harness": getattr(self.runtime, "harness", "codex"),
+                "harness_identity": self._harness_identity(),
+                "prompt_digests": {
+                    "objective": digest(context.objective),
+                    "base_instructions": digest(context.base_instructions),
+                    "developer_instructions": digest(context.developer_instructions),
+                    "prompt_override": digest(self.prompt_override),
+                },
+                "gamepack_digests": gamepack_digests,
+                "experiment_variables": {
+                    "seeds": list(self.seeds),
+                    "roles": list(self.roles),
+                    "rollout_k": self.rollout_k,
+                    "opponent_policy": self.policy_name,
+                    "match_parallelism": self.match_parallelism,
+                    "code_constraint": self.code_constraint,
+                    "experience_skills": self.experience_skills,
+                    "rival_code_visible": self.rival_code_visible,
+                    "epsilon": self.epsilon,
+                    "information_gain": self.measure_information_gain,
+                    "iteration_mode": self.iteration_mode,
+                    "token_budget": self.token_budget,
+                    "wall_budget_s": self.wall_budget_s,
+                },
+                "runnable_opponents": len(self.runnable_opponent_ids),
+                "non_reproducible": [
+                    "LLM sampling (no seed/temperature control on the relay endpoint)",
+                    "wall-clock dependent match timeouts (mitigated by CPU leases)",
+                ],
+            },
+            "goal-led-repro-manifest",
+        )
+
+    def start(self, *, prompt_next: bool = True) -> GoalLedOutcome:
+        """起第一轮。``prompt_next=False`` 用于 ``iterations=1``：跑完就收，不白想一轮。"""
+
         if self._state_path.exists():
             raise ValueError("goal-led run already started")
         if not self.bootstrap_root.is_dir():
             raise ValueError("bootstrap root is unavailable")
         self.root.mkdir(parents=True, exist_ok=True)
         shutil.copytree(self.bootstrap_root, self.workspace)
-        (self.workspace / "research").mkdir(exist_ok=True)
+        research = self.workspace / "research"
+        research.mkdir(exist_ok=True)
+        if self.experience_skills and not (research / EXPERIENCE_FILE).exists():
+            (research / EXPERIENCE_FILE).write_text(
+                "# 迭代经验\n\n> 每轮追加：假设 / 证据（回放片段）/ 结论 / 下一步。\n",
+                encoding="utf-8",
+            )
         (self.workspace / "leaderboard.json").write_text(
             json.dumps(
                 {"schema_version": "1.0", "opponents": list(self.public_leaderboard)},
@@ -330,38 +2194,329 @@ class GoalLedService:
             + "\n",
             encoding="utf-8",
         )
+        # 容器边界：装配完成、agent 还没开始思考之前，把工作区真的扫一遍。
+        # 不通过就不开跑 —— 一次长跑几十小时，跑完才发现口径被污染的代价太大。
+        assert_sealed(self.workspace)
+        self._append(
+            "ContainerBoundaryVerified",
+            {
+                "workspace": str(self.workspace),
+                "violations": [],
+                "checked": "local_match_runners, training_scripts, ready_made_strategies",
+            },
+            "goal-led-container-sealed",
+        )
         session = self.runtime.start(self._context(""))
+        self._append_reproducibility_manifest(session)
         self._append(
             "GoalLedStarted",
-            {"thread_id": session.thread_id, "workspace": str(self.workspace)},
+            {
+                "thread_id": session.thread_id,
+                "workspace": str(self.workspace),
+                "opponent_policy": self.policy_name,
+                "rollout_k": self.rollout_k,
+                "seeds": list(self.seeds),
+                "roles": list(self.roles),
+                "match_parallelism": self.match_parallelism,
+            },
             "goal-led-started",
         )
         # Persist the single thread before the first long Goal turn.  A
         # client-side timeout must never orphan research that is still stored
         # by the run-local App Server.
         self._write_state(session.thread_id, 0)
+        first_opponent = self.policy.select(iteration=0, k=self.rollout_k, cleared=0)
+        target_hint = (
+            f"本轮对手已由框架指定：{'、'.join(first_opponent)}。"
+            if first_opponent
+            else f"第一个 Action 必须挑战榜首 {self._ladder()[0].opponent_id}。"
+        )
         session = self._turn(
             session,
             (
-                "从 rules、公开 SDK、decision_space 和 replay_skill 出发写出 v000。"
-                "完成后在 .agentbench/action.json 写第一个官方 Action；"
-                "对手必须是 rank01。不要等待框架替你选择对手。"
+                "第 0 轮：你手上只有规则，没有任何回放。任务是**从规则出发**写出 v000。\n"
+                "先读 gamepack/rules.md（规则）、gamepack/decision_space.yaml（你能做哪些动作）、"
+                "CANDIDATE_CONTRACT.md（提交格式）、leaderboard.json（你要打的人是谁）。\n"
+                "ai_example.py 只演示格式、强度为零；另存为 ai.py 后写你自己的策略，"
+                "**不要**把它当成起点抄。\n"
+                f"本轮要交 k={self.rollout_k} 个候选，它们必须是 {self.rollout_k} 个"
+                "**不同的开局哲学**（例如：先经济后成型 / 全程压制 / 围绕某条特定机制做文章），"
+                f"而不是同一份 v000 换 {self.rollout_k} 个阈值——"
+                "第 0 轮没有回放，唯一能获得信息的方式就是让这几个候选**互相远离**，"
+                "这样评测器回传的 k 份回放才能告诉你哪条路线在这个游戏里站得住。"
+                f"任意两个候选之间的代码差异不少于 {DIVERSITY_THRESHOLD_LINES} 行，"
+                "框架会度量并在反馈里告诉你结果。\n"
+                "每个候选的策略类请起**带版本号的名字**（如 V000EconomyAgent）并留在文件里："
+                "以后每轮都会在已有版本上继续演进，旧版本留着才能回退与按局面组合，"
+                "所以这一轮的类名就是整条演进链的根。\n"
+                "写完后跑 selfcheck.py（容器内自带）确认每个候选都能导入、接口正确、"
+                "能走完一帧；**不通过就不要提交** —— 格式错会让整轮反馈只告诉你「你崩了」。\n"
+                "本轮的第一优先级是协议格式绝对正确（格式错=0 回合判负，"
+                "整轮反馈只会告诉你「你崩了」，学不到任何策略信息），其次才是强度。\n"
+                f"完成后在 .agentbench/action.json 写第一个官方 Action；{target_hint}"
+                "不要等待框架替你选择对手。\n"
+                "提醒：容器里没有对手、没有游戏后端、没有本地对战工具，"
+                "所以本轮无法（也不需要）自我评测——写完就交，强度由评测器告诉你。"
+            ),
+            iteration=0,
+            cleared=0,
+        )
+        return self._run_request(session, 0, prompt_next=prompt_next)
+
+    def request_correction(self, problem: str) -> None:
+        """把协议/格式问题交回 Goal 让它自我纠正（不消耗一轮迭代）。
+
+        典型场景：没写 action.json、字段非法、候选目录里没有 main.py。研究上这属于
+        "harness 与 agent 的协议对齐"，不是策略强度问题，因此不能算作一次迭代，
+        更不该让整个 run 崩掉。
+        """
+
+        thread_id, _ = self._load_state()
+        session = self.runtime.resume(thread_id, self._context(""))
+        self._turn(
+            session,
+            (
+                f"你上一步的提交无法执行：{problem}\n"
+                "请修正后重新提交一份新的 .agentbench/action.json。要点：\n"
+                "1) 必填字段：action_id（本 run 内唯一）、rollouts[{candidate_id}]、"
+                "selected_rival（必须是 leaderboard.json 里的可运行 id）、"
+                "roles、seeds、rationale；\n"
+                "2) 每个候选的 main.py 必须放在 .agentbench/rollouts/<candidate_id>/ 下"
+                "（该目录会叠加到工作区之上），候选之间要有代码差异；\n"
+                "3) 不要复用已经用过的 action_id。"
             ),
         )
-        return self._run_request(session, 0)
+        self._append(
+            "GoalCorrectionDelivered",
+            {"problem": problem},
+            f"goal-led-correction-delivered:{hashlib.sha256(problem.encode()).hexdigest()[:12]}",
+        )
 
-    def advance(self) -> GoalLedOutcome:
+    def _apply_history_mode(self, *, iteration: int) -> None:
+        """实验 4 的消融执行点：把"不该被看见的历史"从工作区里真正拿掉。
+
+        只靠提示词说"别看历史"是无效的——历史就摆在工作区里。三档语义：
+
+        * ``full``       : 什么都不动（默认）。
+        * ``no_notes``   : 删掉经验文档（历史代码与会话保留）。
+        * ``memoryless`` : 再删掉历史候选目录、**历次 action 原文**、以及除最近一份
+          以外的反馈；配合 :meth:`_session_for_iteration` 每轮开新会话，
+          agent 只剩"当前父版本代码 + 上一轮反馈"，即"只站在当前这一步"。
+
+        当前策略文件（工作区根目录的 main.py 等）**永远保留**：消融的是"历史"，
+        不是"起点"，否则每轮都从零重写，测的就不是同一件事了。
+
+        ``memoryless`` 下**必须**删 ``.agentbench/processed-requests/``：那里存着历次
+        action 的原文（含 agent 自己写的 rationale 与选择的对手），是一份完整的
+        决策日记。漏掉它的话这一档名义上"无记忆"、实际上 agent 把上一轮的推理
+        原样读回去，两组的差别就被抹平了——消融失效且**看不出来**。
+
+        保留"最近一份反馈"是刻意的：不给任何对局结果，agent 连自己上一轮赢没赢
+        都不知道，那消融掉的是**学习信号**而不是历史记忆，实验就换了题目。
+        """
+
+        if self.history_mode == "full":
+            return
+        removed: list[str] = []
+        experience = self.workspace / "research" / EXPERIENCE_FILE
+        if experience.is_file():
+            experience.unlink()
+            removed.append(f"research/{EXPERIENCE_FILE}")
+        if self.history_mode == "memoryless":
+            for relative in (".agentbench/rollouts", ".agentbench/processed-requests"):
+                target = self.workspace / relative
+                if target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                    removed.append(relative)
+            feedback_root = self.workspace / "feedback"
+            if feedback_root.is_dir():
+                directories = sorted(
+                    (item for item in feedback_root.iterdir() if item.is_dir()),
+                    key=lambda item: item.stat().st_mtime,
+                )
+                for item in directories[:-1]:  # 只留最近一份
+                    shutil.rmtree(item, ignore_errors=True)
+                    removed.append(f"feedback/{item.name}")
+        if removed:
+            self._append(
+                "HistoryAblationApplied",
+                {
+                    "iteration": iteration,
+                    "history_mode": self.history_mode,
+                    "removed": removed,
+                },
+                f"goal-led-history-ablation:{iteration}",
+            )
+
+    def _thread_context_tokens(self) -> int | None:
+        """**当前 thread** 的上下文占用（不是全 run 累计）。
+
+        harness 报的 ``input_tokens`` 就是那一次请求的上下文大小，单调增长；
+        换 thread 后会归零，所以这里从最后一次"会话重置/轮转/开跑"事件之后开始数。
+        """
+
+        latest: int | None = None
+        for event in self.events.read_all():
+            if event.event_type in ("GoalLedStarted", "GoalSessionReset", "GoalSessionRotated"):
+                latest = None
+                continue
+            if event.event_type != "AgentTokenUsage":
+                continue
+            payload = event.payload if isinstance(event.payload, Mapping) else {}
+            value = payload.get("input_tokens")
+            if isinstance(value, int) and (latest is None or value > latest):
+                latest = value
+        return latest
+
+    def _rotate_if_needed(
+        self, session: AgentSession, *, iteration: int, force: bool = False
+    ) -> tuple[AgentSession, str]:
+        """上下文接近 codex 压缩阈值时换新 thread，返回 (会话, 接力说明)。
+
+        为什么不让 codex 自己压缩：它的压缩必定失败（见 config 里的详注），
+        失败会把整个 turn 打成 failed 并终止 run。所以框架宁可主动断掉对话记忆，
+        也不能让上下文走到那一步——**跑完一轮永远比"记得上一轮说过的话"重要**。
+
+        ``force``（由 ``thread_rotate_each_iteration`` 驱动）是必需的：阈值只能在
+        turn **之前**检查，而单个 turn 内部就能把上下文从 90k 推过压缩线
+        （实测 antwar2 死在 97k，当时阈值是 110k，根本没轮到检查）。每轮从零开始，
+        单轮增量才是上下文的上界。
+
+        接力说明不是可选的礼貌用语：新 thread 里 agent 没有任何对话记忆，
+        必须明确告诉它"你的历史都在文件里、先读你自己写的经验"，
+        否则它会当成第一次见到这个游戏，从零重写策略。
+        """
+
+        threshold = self.thread_rotate_context_tokens
+        used = self._thread_context_tokens()
+        if not force:
+            if threshold is None:
+                return session, ""
+            if used is None or used < threshold:
+                return session, ""
+        fresh = self.runtime.start(self._context(""))
+        self._append(
+            "GoalSessionRotated",
+            {
+                "iteration": iteration,
+                "previous_thread_id": session.thread_id,
+                "thread_id": fresh.thread_id,
+                "context_tokens": used,
+                "threshold_tokens": threshold,
+                "trigger": "each_iteration" if force else "context_threshold",
+                "reason": "avoid codex remote compaction (known-fatal with this model)",
+                "history_mode": self.history_mode,
+            },
+            f"goal-led-session-rotated:{iteration}:{session.thread_id}",
+        )
+        self._write_state(fresh.thread_id, iteration - 1)
+        return fresh, self._handoff_prompt(used)
+
+    def _handoff_prompt(self, used_tokens: int | None) -> str:
+        """换 thread 后的接力说明（自包含，且明确指出工作区里什么都没丢）。"""
+
+        experience = (
+            f"② research/{EXPERIENCE_FILE} 是你自己历轮写的经验——**先读它**，"
+            "尤其是你上一轮写下的「下一步该验证什么」；"
+            if self.experience_skills
+            else ""
+        )
+        size = f"上一个对话线程的上下文到了 {used_tokens // 1000}k，" if used_tokens else ""
+        return (
+            f"【会话已接力】{size}框架给你换了一个干净的线程。"
+            "你**没有**之前的对话记忆，但工作区一样东西都没丢：\n"
+            "① 工作区根目录是当前这一版策略代码，历史候选与历轮 action 都还在；\n"
+            f"{experience}"
+            "③ feedback/ 下是历轮官方对局反馈（每轮一份 all-replays.md 自然语言复盘"
+            "+ feedback.json 汇总数字）。\n"
+            "请把这些当作你的记忆来读，不要从零重写策略、也不要重复已经被证伪过的假设。\n"
+        )
+
+    def _session_for_iteration(self, thread_id: str, *, iteration: int) -> AgentSession:
+        """取得本轮要用的会话。
+
+        ``memoryless`` 每轮开一个**全新**会话（没有任何对话历史），并记事件；
+        其它模式沿用常驻会话（``resume``），保留跨轮上下文。
+        """
+
+        if self.history_mode != "memoryless":
+            return self.runtime.resume(thread_id, self._context(""))
+        session = self.runtime.start(self._context(""))
+        self._append(
+            "GoalSessionReset",
+            {
+                "iteration": iteration,
+                "history_mode": self.history_mode,
+                "previous_thread_id": thread_id,
+                "thread_id": session.thread_id,
+            },
+            f"goal-led-session-reset:{iteration}",
+        )
+        return session
+
+    def advance(self, *, prompt_next: bool = True) -> GoalLedOutcome:
+        """推进一轮。
+
+        ``prompt_next=False`` 表示"这是本 run 的最后一轮"：照常跑对局、出指标、
+        落反馈文件，但**不再让 agent 去想下一轮**。
+
+        为什么需要这个开关：``_deliver_feedback`` 里的 ``_turn`` 是**同步**的——它会一直等到
+        agent 写出下一份 ``action.json`` 才返回。所以每轮 ``advance()`` 返回时，agent 其实
+        已经把下一轮想完了。轮数用尽时 driver 直接退出循环，那次思考的产出被整份丢弃。
+        实测这一次白干烧掉 **1369s 墙钟 + 66k input tokens**（agent 思考占全程 84%，
+        这是里面最容易省的一块）。
+        """
+
         thread_id, request_count = self._load_state()
-        session = self.runtime.resume(thread_id, self._context(""))
+        self._apply_history_mode(iteration=request_count + 1)
+        session = self._session_for_iteration(thread_id, iteration=request_count + 1)
+        # 轮转必须发生在**任何 turn 之前**：turn 一旦开始，上下文越过 codex 的压缩
+        # 阈值就没救了（压缩失败 = 整轮 failed）。而阈值检查挡不住"单个 turn 内部"
+        # 的增长，所以 thread_rotate_each_iteration 下每轮无条件换。
+        session, handoff = self._rotate_if_needed(
+            session,
+            iteration=request_count + 1,
+            force=self.thread_rotate_each_iteration and request_count >= 1,
+        )
         pending = self._pending_feedback()
         if pending is not None:
             request, feedback, match_count = pending
+            summary_payload = None
+            try:
+                summary_payload = json.loads(feedback.read_text(encoding="utf-8")).get("summary")
+            except (OSError, json.JSONDecodeError):
+                summary_payload = None
             return self._deliver_feedback(
-                session, request, feedback, match_count, request_count
+                session,
+                request,
+                feedback,
+                match_count,
+                request_count,
+                summary_payload,
+                prompt_next=prompt_next,
+                handoff=handoff,
             )
         if self._request_path() is None:
             session = self._turn(
                 session,
-                "继续研究：基于已有 Experience 与公开反馈改进策略，然后写下一份 action.json。",
+                handoff + self._continue_prompt(request_count + 1),
+                iteration=request_count + 1,
+                cleared=self._cleared_count(),
             )
-        return self._run_request(session, request_count)
+        return self._run_request(session, request_count, prompt_next=prompt_next)
+
+    def _continue_prompt(self, iteration: int) -> str:
+        """推进下一轮的提示词。
+
+        ``memoryless`` 下会话是全新的，提示词必须**自包含**：明确告诉它工作区里
+        已有一份当前策略、最近一份官方反馈在哪，以及它没有任何历史记忆。
+        """
+
+        if self.history_mode != "memoryless":
+            return "继续研究：基于已有 Experience 与公开反馈改进策略，然后写下一份 action.json。"
+        return (
+            "这是一次**无记忆**迭代：你没有之前的对话历史、没有经验笔记、也看不到历史候选代码。"
+            "工作区根目录里是当前这一版策略；feedback/ 下只保留最近一份官方对局反馈"
+            "（含 replay 与 feedback.json）。请只依据这些材料改进策略，"
+            "然后写一份新的 .agentbench/action.json。"
+        )

@@ -26,11 +26,9 @@ from agentbench_hl.adapters.antwar2.runtime import (
     tree_sha256,
 )
 from agentbench_hl.adapters.antwar2.smoke import verify_smoke
-from agentbench_hl.adapters.codex_goal.read_isolation import (
-    write_candidate_isolation_profile,
-)
 from agentbench_hl.adapters.filesystem.artifact_store import FilesystemArtifactStore
 from agentbench_hl.adapters.filesystem.event_store import JsonlEventStore
+from agentbench_hl.adapters.isolation import select_candidate_isolation
 from agentbench_hl.application.live_run import (
     codex_goal_runtime,
     probe_codex_installation,
@@ -40,8 +38,31 @@ from agentbench_hl.application.live_run import (
 from agentbench_hl.application.run_service import RunService
 from agentbench_hl.config import EvaluatorConfig, ExperimentConfig
 from agentbench_hl.ports.arena import ProcessSpec
+from agentbench_hl.ports.isolation import IsolationRequest
 
 GAME = "antwar2"
+
+
+def _candidate_command_prefix(
+    config: ExperimentConfig,
+    *,
+    run_root: Path,
+    denied_read_roots: tuple[Path, ...],
+    profile_name: str,
+) -> tuple[str, ...]:
+    """按平台选择候选隔离后端（macOS Seatbelt / Linux bubblewrap / 容器）。
+
+    这里是原来把 ``/usr/bin/sandbox-exec`` 写死的位置 —— 写死导致本仓在 Linux 上
+    完全无法起 run。现在交给 `adapters/isolation` 选择，语义保持等价。
+    """
+
+    isolation = select_candidate_isolation(
+        IsolationRequest(denied_read_roots=denied_read_roots),
+        backend=config.isolation.backend,
+        profile_path=run_root / profile_name,
+        docker_image=config.isolation.docker_image,
+    )
+    return isolation.command_prefix()
 
 
 def official_human_ratings(opponents: tuple[Opponent, ...]) -> dict[str, float]:
@@ -124,8 +145,9 @@ def build_live_run(
         for item in runnable
         if item.entry_command is not None
     }
-    candidate_profile = write_candidate_isolation_profile(
-        run_root / "candidate-runtime.sb",
+    candidate_command_prefix = _candidate_command_prefix(
+        config,
+        run_root=run_root,
         denied_read_roots=(
             layout.human_manifest.parent,
             evaluator_root,
@@ -133,11 +155,7 @@ def build_live_run(
             run_root / "codex-home",
             run_root / "hidden-certification",
         ),
-    )
-    candidate_command_prefix = (
-        "/usr/bin/sandbox-exec",
-        "-f",
-        str(candidate_profile),
+        profile_name="candidate-runtime.sb",
     )
     arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),
@@ -293,8 +311,9 @@ def resume_live_run(
         for item in runnable
         if item.entry_command is not None
     }
-    candidate_profile = write_candidate_isolation_profile(
-        run_root / "candidate-runtime.sb",
+    candidate_command_prefix = _candidate_command_prefix(
+        config,
+        run_root=run_root,
         denied_read_roots=(
             layout.human_manifest.parent,
             evaluator_root,
@@ -302,11 +321,7 @@ def resume_live_run(
             run_root / "codex-home",
             run_root / "hidden-certification",
         ),
-    )
-    candidate_command_prefix = (
-        "/usr/bin/sandbox-exec",
-        "-f",
-        str(candidate_profile),
+        profile_name="candidate-runtime-resume.sb",
     )
     arena = AntWar2Arena(
         game=ProcessSpec((str(backend.executable),), backend.executable.parents[1]),

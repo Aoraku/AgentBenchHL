@@ -1,0 +1,38 @@
+# 引用式 GamePack（由 scripts/gen_gamepacks.py 生成/刷新）。
+# 规则 / 决策空间 / 回放字段说明的唯一权威源是 A 仓：值以 @agentbench: 开头即引用。
+# public_leaderboard = 图上的 Human Ranking，仅含 opponent_id/rank/Elo。
+# source_digests 记录 A 侧来源指纹，`--check` 可检测漂移。
+candidate_interface: AI.play
+candidate_support: candidate_support
+decision_space: '@agentbench:games/miracle/decision_space.yaml'
+game: miracle
+goal_charter: GOAL_CHARTER.md
+learning_isolation:
+  allowed:
+  - frozen_gamepack
+  - public_sdk
+  - public_leaderboard
+  - active_candidate
+  - run_local_public_replays
+  - run_local_experience
+  forbidden:
+  - internet
+  - human_source
+  - certification_matrix
+  - reference_policy_versions
+  - reference_policy_replays
+  - cross_run_codex_memory
+replay_format: '@agentbench:games/miracle/replay_format.md'
+replay_skill: '@agentbench:games/miracle/replay_skill.md'
+roles:
+- P0
+- P1
+rules: '@agentbench:games/miracle/rules.md'
+schema_version: '1.1'
+sdk_interface: sdk_interface.md
+source_digests:
+  decision_space.yaml: 63ca2e31385d3a2479de5074b426c3a41dc270908f6310d798405ea4256843f7
+  evaluator/arena.py: 1bab2199506a98d92c7ffb5358150a632ba0d8ddc29d4b0dedd5fd93090814f6
+  replay_format.md: 93980de898a99ff4ca9428179497bc576b5a77a0da3e792c7c8eef839cec4766
+  replay_skill.md: 0963788433436848f8be65d73e4d9dbbd386018f322be2904d98d64037b369a1
+  rules.md: 830552a015d910e6c4b9386026a4d0eb1cc83508db1e95c9697f45a825f04682
