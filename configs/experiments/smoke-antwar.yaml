@@ -1,0 +1,55 @@
+budget:
+  tokens: 3000000
+  wall_seconds: 10800
+curriculum:
+  advance_min_matches: 2
+  advance_streak: 1
+  advance_win_rate: 0.6
+  development_seeds:
+  - 1
+  ladder_scope: auto
+  opponent_policy: fixed_rank
+  opponent_rank: 30
+  opponent_start_rank: null
+  order: lowest_rank_first
+  seed_mode: fixed
+game: antwar
+goal:
+  code_constraint: any
+  experience_skills: true
+  history_mode: full
+  prompt_override: null
+  seed_policy_path: null
+isolation:
+  backend: auto
+  docker_image: null
+  rival_code_visible: false
+measurement:
+  behavioral_ig_cases: 1
+  behavioral_ig_timeout_s: 900
+  epsilon: 0.01
+  information_gain: true
+origin: from_scratch
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs
+provider:
+  api_key_env: ABHL_API_KEY
+  auto_compact_token_limit: 900000
+  base_url: https://api.teamorouter.com/v1
+  disable_response_storage: true
+  harness: codex
+  model: gpt-5.6-luna
+  reasoning_effort: high
+runtime:
+  agent_binary: null
+  branch_width: 1
+  codex_binary: codex
+  match_parallelism: 4
+  match_timeout_s: 1800
+  max_iterations: 4
+  network_access: disabled
+  rollout_k: 2
+  thread_rotate_context_tokens: 60000
+  thread_rotate_each_iteration: true
+schema_version: '1.1'

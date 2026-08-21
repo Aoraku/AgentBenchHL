@@ -216,7 +216,26 @@ def build_goal_led_service(
         if config.curriculum.seed_mode == "generalize"
         else config.curriculum.development_seeds[:1]
     )
-    roles = tuple(getattr(run.arena, "roles", ("P0", "P1")))
+    # 角色（座次）名必须以 A 的 game.yaml 为唯一权威源。
+    #
+    # 这里曾经写 `getattr(run.arena, "roles", ("P0", "P1"))`——arena 没有暴露
+    # roles 时就静默退回 P0/P1。对 antwar 这类对称游戏恰好是对的，但对
+    # **非对称分轨**游戏是错的：rollman 的角色叫 rollman/ghost，
+    # 拿 P0/P1 去跑会让每一局都以
+    # `role P0 is not one of ('rollman', 'ghost')` 失败——而这在指标上表现为
+    # "12/12 局 incomplete"，看起来像对局跑不起来，而不是座次名传错。
+    #
+    # 所以：优先问 game.yaml（唯一权威），arena 自己声明的 roles 只作校验；
+    # 两者都拿不到就直接报错，绝不猜一个默认值。
+    from agentbench_hl.adapters.contract.factory import game_roles
+
+    roles = game_roles(config.paths.agentbench_root, config.game)
+    arena_roles = getattr(run.arena, "roles", None)
+    if arena_roles and tuple(arena_roles) != roles:
+        raise ValueError(
+            f"{config.game} 的座次定义不一致：game.yaml 说 {roles}，"
+            f"arena 说 {tuple(arena_roles)}。请先对齐 A 侧定义再跑实验"
+        )
     return GoalLedService(
         run_root=run.root,
         bootstrap_root=run.bootstrap_root,

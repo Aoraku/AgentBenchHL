@@ -1,0 +1,54 @@
+schema_version: "1.1"
+game: antwar2
+origin: from_scratch
+
+provider:
+  harness: codex
+  model: gpt-5.5
+  reasoning_effort: xhigh
+  base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+  api_key_env: ABHL_API_KEY
+  disable_response_storage: true
+
+runtime:
+  codex_binary: /opt/codex/bin/codex
+  agent_binary: null
+  branch_width: 1
+  rollout_k: 2
+  match_parallelism: 4
+  max_iterations: null
+  network_access: disabled
+
+isolation:
+  backend: bubblewrap
+  rival_code_visible: false
+  docker_image: null
+
+budget:
+  tokens: null
+  wall_seconds: 5400
+
+curriculum:
+  order: lowest_rank_first
+  development_seeds: [1, 2]
+  opponent_policy: fixed_top
+  opponent_rank: null
+  seed_mode: fixed
+
+goal:
+  prompt_override: null
+  experience_skills: true
+  code_constraint: any
+  seed_policy_path: null
+
+evaluation:
+  background_pool: false
+  pool_sample: 8
+  pool_seeds: [7]
+
+measurement:
+  epsilon: 0.01
+
+paths:
+  agentbench_root: /home/qingle/agentbench/AgentBench
+  runs_root: /home/qingle/agentbench/runs

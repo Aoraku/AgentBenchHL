@@ -49,3 +49,12 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Web 侧为每次点击生成的一次性 run 配置（文件名带随机后缀）。
+# 权威模板是 configs/experiments/goal-led.template.yaml 与 smoke-*.yaml；
+# 这些实例化产物入库只会积累成百上千份近似重复的 yaml。
+configs/experiments/web-hl-*.yaml
+
+# 扁平包时代的备份，已被 src/agentbench_hl/ 取代，留在磁盘上仅供考古。
+_stale_flat_package.bak/
+_stale_flat_package.egg-info.bak/

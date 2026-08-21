@@ -302,7 +302,10 @@ class GoalLedService:
             "所以每个候选目录里必须放它自己的 main.py（以及被改动的模块）；"
             "只放 README 不算差异，会被判为无效候选并跳过。",
             self.policy.instruction(iteration=iteration, k=self.rollout_k, cleared=cleared),
-            f"本轮座次：{list(self.roles)}；seed：{list(self.seeds)}。",
+            f"本轮座次：{list(self.roles)}；seed：{list(self.seeds)}。"
+            "座次名由游戏定义、由框架固定，**照抄这两个值**即可——"
+            "写别的名字（例如把分轨游戏写成 P0/P1）不会改变实际对局，"
+            "但会让 action.json 与真实赛程不一致，增加你自己复盘的难度。",
         ]
         if self.code_constraint == "if_else":
             parts.append(
@@ -603,9 +606,34 @@ class GoalLedService:
         return self.seeds or request.seeds
 
     def _effective_roles(self, request: MatchRequest) -> tuple[str, ...]:
-        if self.policy_name == SELF_DECIDE:
-            return request.roles
-        return tuple(role for role in self.roles if role in set(request.roles)) or request.roles
+        """本轮实际使用的座次。
+
+        座次**名字**是框架级实验变量，由 A 仓 ``games/<game>/game.yaml`` 唯一定义；
+        但"本轮打哪几个座次"是 agent 可以决定的（例如只想验证先手表现）。
+        所以规则是：
+
+        * 取 ``request.roles`` 与 ``self.roles`` 的交集 —— 保留 agent 的选择权；
+        * 交集为空说明 agent 写的座次名**全都不合法**，此时退回 ``self.roles``
+          （游戏定义的全部座次），而不是采纳它写的名字。
+
+        为什么"交集为空时退回 self.roles"这件事很重要
+        --------------------------------------------
+        agent 会照抄 prompt 示例里的 ``P0`` / ``P1``。对 antwar 这类对称游戏恰好
+        一致，但 rollman 的座次叫 ``rollman`` / ``ghost``——原实现在交集为空时
+        回退到 ``request.roles``（即 agent 写的 P0/P1），于是每一局都以
+        ``role P0 is not one of ('rollman', 'ghost')`` 失败。
+
+        这个失败**极难排查**：指标上只显示"对局 0/N 完成"，看起来像对局跑不起来
+        或候选有问题，完全看不出是座次名被 agent 的笔误带跑了。实测 rollman
+        烟测连续两轮 8 局全灭，就栽在这里。
+
+        ``self_decide`` 策略也不例外：它让 agent 自主选**对手**，不包括
+        编造座次名。
+        """
+
+        allowed = set(self.roles)
+        chosen = tuple(role for role in request.roles if role in allowed)
+        return chosen or self.roles
 
     # ------------------------------------------------------------- snapshots
 
@@ -1743,6 +1771,25 @@ class GoalLedService:
             "candidate_spread_verdict": (spread or {}).get("verdict"),
             "matches": summary.get("played"),
             "win_rate": win_rate,
+            # 胜负平的**绝对计数**必须一起记：只有 win_rate 时，
+            # 0.5 分不清是"2 胜 2 负"还是"4 平"，而这两种情况对
+            # 下一轮该改什么的指示完全不同。
+            "wins": summary.get("wins"),
+            "draws": summary.get("draws"),
+            "losses": summary.get("losses"),
+            "infra_errors": summary.get("infra_errors"),
+            "zero_round_losses": summary.get("zero_round_losses"),
+            # 连续奖励：胜负是二值的，分差不是。全败的一轮里 win_rate 恒为 0，
+            # 唯一能说明"哪个方向对"的就是分差与撑住的回合数
+            # （见 docs/LESSONS_LEARNED.md G 条）。
+            #
+            # 这几个字段 _summarize() 一直在算，但从来没写进指标事件——
+            # 于是逐轮表里 margin_mean 永远是 null，离线分析和出图都拿不到，
+            # 等于那条修复只做了一半。
+            "margin_mean": summary.get("margin_mean"),
+            "margin_best": summary.get("margin_best"),
+            "margin_by_candidate": summary.get("margin_by_candidate"),
+            "best_candidate_win_rate": summary.get("best_candidate_win_rate"),
             "draw_rate": (
                 summary.get("draws") / summary["played"]  # type: ignore[operator]
                 if summary.get("played")

@@ -35,6 +35,7 @@ AI.choose_operations(
 | `_bootstrap.py` | 公共引导（生成物）：`sys.path`/工作目录与失败诊断 |
 | `ai_example.py` | **格式示例**（生成物）：只演示接口，策略是占位。另存为 `ai.py` 后再写你自己的策略 |
 | `CANDIDATE_CONTRACT.md` | **先读这个**：该游戏 `AI` 要实现哪些方法、参数是什么 |
+| `selfcheck.py` | **提交前跑它**（生成物）：`python3 selfcheck.py` 检查每个候选能否导入、接口是否正确、能否被判题器拉起来。不打对局，判定口径与框架侧完全一致 |
 | `SDK/__init__.py` | 官方 SDK |
 | `SDK/backend/__init__.py` | 官方 SDK |
 | `SDK/backend/core.py` | 官方 SDK |

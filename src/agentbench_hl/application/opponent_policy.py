@@ -186,6 +186,7 @@ class RandomOpponent(_Base):
 
 @dataclass(frozen=True)
 class KDiverse(_Base):
+    seed: int = 0
     name: str = "k_diverse"
 
     def select(self, *, iteration: int, k: int, cleared: int) -> tuple[str, ...]:
@@ -194,23 +195,97 @@ class KDiverse(_Base):
             return ()
         if k <= 1 or len(ordered) == 1:
             return (ordered[0].opponent_id,)
-        # 在榜单上分层取 k 个（覆盖强中弱），保证候选之间对手不同。
-        step = (len(ordered) - 1) / (k - 1)
-        picked: list[str] = []
-        for index in range(k):
-            entry = ordered[int(round(index * step))]
-            if entry.opponent_id not in picked:
-                picked.append(entry.opponent_id)
-        while len(picked) < k:  # 榜单过短时允许重复，保持长度 = k
-            picked.append(ordered[len(picked) % len(ordered)].opponent_id)
-        return tuple(picked)
+        rng = random.Random(f"{self.seed}:{iteration}")
+        pool = list(ordered)
+        if len(pool) <= k:
+            # 榜单不足 k 个时全选，不足部分循环填充
+            picked = [item.opponent_id for item in pool]
+            while len(picked) < k:
+                picked.append(pool[len(picked) % len(pool)].opponent_id)
+            return tuple(picked)
+        # 随机不重复抽取 k 个不同对手
+        sampled = rng.sample(pool, k)
+        return tuple(item.opponent_id for item in sampled)
 
     def instruction(self, *, iteration: int, k: int, cleared: int) -> str:
         targets = self.select(iteration=iteration, k=k, cleared=cleared)
         listing = "、".join(targets)
         return (
-            f"本轮 {len(targets)} 个候选**分别**打不同对手（按强弱分层）：{listing}。"
+            f"本轮 {len(targets)} 个候选**分别**打 k 个不同的随机对手：{listing}。"
             "第 i 个候选对应第 i 个对手，用于多样化探索。"
+        )
+
+
+@dataclass(frozen=True)
+class KRandom(_Base):
+    seed: int = 0
+    name: str = "k_random"
+
+    def select(self, *, iteration: int, k: int, cleared: int) -> tuple[str, ...]:
+        ordered = self._sorted()
+        if not ordered:
+            return ()
+        rng = random.Random(f"{self.seed}:{iteration}")
+        return tuple(rng.choice(ordered).opponent_id for _ in range(k))
+
+    def instruction(self, *, iteration: int, k: int, cleared: int) -> str:
+        targets = self.select(iteration=iteration, k=k, cleared=cleared)
+        listing = "、".join(targets)
+        return (
+            f"本轮 {k} 个候选**各自随机抽对手**（可重复）：{listing}。"
+            "第 i 个候选对应第 i 个对手。"
+        )
+
+
+@dataclass(frozen=True)
+class Adaptive(_Base):
+    """自适应滑窗：k 个 rollout 各打窗口内一个对手，打赢的往上提。
+
+    窗口从 ``start_rank`` 起（含），向榜首方向（名次递减）取 k 个对手。
+    随着对手被征服（``cleared`` 递增），窗口整体上移。
+    """
+
+    start_rank: int = 10
+    name: str = "adaptive"
+
+    def _window_sequence(self) -> tuple[LadderEntry, ...]:
+        """从 start_rank 起往榜首方向（弱→强）的完整序列。"""
+        ordered = self._sorted()
+        pool = [item for item in ordered if item.rank <= self.start_rank]
+        if not pool:
+            pool = list(ordered)
+        return tuple(sorted(pool, key=lambda item: -item.rank))
+
+    def target_sequence(self) -> tuple[str, ...]:
+        return tuple(item.opponent_id for item in self._window_sequence())
+
+    def select(self, *, iteration: int, k: int, cleared: int) -> tuple[str, ...]:
+        sequence = self._window_sequence()
+        if not sequence:
+            return ()
+        picked: list[str] = []
+        for i in range(k):
+            idx = min(cleared + i, len(sequence) - 1)
+            picked.append(sequence[idx].opponent_id)
+        return tuple(picked)
+
+    def instruction(self, *, iteration: int, k: int, cleared: int) -> str:
+        targets = self.select(iteration=iteration, k=k, cleared=cleared)
+        if not targets:
+            return "榜单为空，本轮对手由框架回落选择。"
+        listing = "、".join(targets)
+        sequence = self._window_sequence()
+        finished = cleared >= len(sequence)
+        if finished:
+            return (
+                f"目标序列已全部征服（{len(sequence)} 个），"
+                f"本轮继续巩固：{listing}。"
+            )
+        return (
+            f"本轮 {k} 个候选**分别**打窗口内对手：{listing}。"
+            f"自适应滑窗：从 rank {self.start_rank} 起，k 个 rollout 各打一个，"
+            f"打赢的往上提（窗口整体上移）。"
+            f"已征服 {cleared} 个，序列共 {len(sequence)} 个。"
         )
 
 
@@ -261,7 +336,11 @@ def build_policy(
     if name == "random":
         return RandomOpponent(entries, seed=seed)
     if name == "k_diverse":
-        return KDiverse(entries)
+        return KDiverse(entries, seed=seed)
+    if name == "k_random":
+        return KRandom(entries, seed=seed)
+    if name == "adaptive":
+        return Adaptive(entries, start_rank=start_rank or DEFAULT_LADDER_UP_START)
     if name == SELF_DECIDE:
         return SelfDecide(entries)
     raise ValueError(f"unknown opponent policy: {name}")

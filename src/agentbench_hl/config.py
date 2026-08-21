@@ -42,11 +42,13 @@ ORIGINS = ("from_scratch", "seeded")
 OPPONENT_POLICIES = (
     "self_decide",
     "fixed_top",
-    "ladder_up",
-    "ladder_down",
     "fixed_rank",
     "random",
+    "k_random",
+    "ladder_up",
+    "ladder_down",
     "k_diverse",
+    "adaptive",
 )
 SEED_MODES = ("fixed", "generalize")
 CODE_CONSTRAINTS = ("any", "if_else")
