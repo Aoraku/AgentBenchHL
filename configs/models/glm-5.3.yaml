@@ -1,0 +1,12 @@
+# GLM-5.3（清华中转）—— 能跑通，但高峰期 429 限流明显。
+#
+# 限流时的表现容易误导：中转站会返回 404 而不是 429，看起来像"模型不存在"。
+# 遇到就退回 glm-5.2，不要去改 catalog。
+model: glm-5.3
+base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+api_key_env: ABHL_API_KEY
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+model_catalog: zhipu
+auto_compact_token_limit: 90000

@@ -60,7 +60,9 @@ from agentbench_hl.application.info_gain import (
 from agentbench_hl.application.opponent_policy import (
     SELF_DECIDE,
     LadderEntry,
+    OpponentHistory,
     build_policy,
+    canonical_policy_name,
 )
 from agentbench_hl.application.replay_narration import NARRATION_FILENAME, narrate_case
 from agentbench_hl.application.support_probe import provider_for
@@ -107,12 +109,13 @@ class GoalLedService:
         game: str = "",
         roles: tuple[str, ...] = ("P0", "P1"),
         seeds: tuple[int, ...] = (1,),
-        rollout_k: int = 4,
-        opponent_policy: str = SELF_DECIDE,
+        rollout_k: int = 1,
+        opponent_policy: str = "progress",
+        batch: int = 4,
         opponent_rank: int | None = None,
         opponent_start_rank: int | None = None,
         advance_min_matches: int = 2,
-        advance_win_rate: float = 0.6,
+        advance_win_rate: float = 0.75,
         advance_streak: int = 1,
         match_parallelism: int = 1,
         prompt_override: str | None = None,
@@ -123,8 +126,8 @@ class GoalLedService:
         token_budget: int | None = None,
         wall_budget_s: int | None = None,
         epsilon: float = 0.02,
-        measure_information_gain: bool = True,
-        behavioral_ig_cases: int = 1,
+        measure_information_gain: bool = False,
+        behavioral_ig_cases: int = 0,
         behavioral_ig_timeout_s: float = 900.0,
         behavioral_ig_coupling: str = COUPLING_COMMON_RANDOM,
         behavioral_ig_probe: str = "transcript_replay",
@@ -148,15 +151,21 @@ class GoalLedService:
         self.roles = tuple(roles)
         self.seeds = tuple(seeds)
         self.rollout_k = max(1, int(rollout_k))
+        # 一轮打几个对手（b）。k=1 之后这是主要的探索宽度旋钮。
+        self.batch = max(1, int(batch))
         self.match_parallelism = max(1, int(match_parallelism))
         self.prompt_override = prompt_override
         self.experience_skills = experience_skills
         self.code_constraint = code_constraint
-        if history_mode not in ("full", "no_notes", "memoryless"):
-            raise ValueError("history_mode must be full, no_notes or memoryless")
+        # ``memoryless`` 是 ``last_only`` 的历史别名，统一归到新名字，
+        # 免得工作区清理逻辑与提示词各认一半。
+        if history_mode == "memoryless":
+            history_mode = "last_only"
+        if history_mode not in ("full", "last_only", "no_notes"):
+            raise ValueError("history_mode must be full, last_only or no_notes")
         self.history_mode = history_mode
-        # 实验 4：no_notes / memoryless 都不写经验文档；memoryless 还会每轮换新会话。
-        if history_mode in ("no_notes", "memoryless"):
+        # no_notes / last_only 都不写经验文档；last_only 还会每轮换新会话。
+        if history_mode in ("no_notes", "last_only"):
             self.experience_skills = False
         self.rival_code_visible = rival_code_visible
         self.token_budget = token_budget
@@ -190,7 +199,7 @@ class GoalLedService:
         self.thread_rotate_each_iteration = bool(thread_rotate_each_iteration)
         self.events = JsonlEventStore(self.root / "events.jsonl")
         self._usage_cursor = 0
-        self.policy_name = opponent_policy
+        self.policy_name = canonical_policy_name(opponent_policy)
         self.advance_rule = AdvanceRule(
             min_matches=max(1, int(advance_min_matches)),
             win_rate=float(advance_win_rate),
@@ -202,7 +211,31 @@ class GoalLedService:
             target_rank=opponent_rank,
             start_rank=opponent_start_rank,
             seed=abs(hash(str(self.root))) % 10_000,
+            advance_min_matches=self.advance_rule.min_matches,
+            advance_win_rate=self.advance_rule.win_rate,
         )
+
+    # -------------------------------------------------------- opponent history
+
+    def _opponent_history(self) -> OpponentHistory:
+        """迄今对每个对手的累计战绩（progress 晋级与 self 决策的依据）。
+
+        从事件流重算而不是内存累加：断点续跑、事后复盘、换机器都要得到同一份
+        进度。只算 ``status == complete`` 的局——一次沙箱故障不该被读成"打不赢"。
+        """
+
+        totals: dict[str, dict[str, float]] = {}
+        for row in self._match_rows_from_events():
+            if row.get("status") != "complete":
+                continue
+            opponent = row.get("opponent_id")
+            if not isinstance(opponent, str):
+                continue
+            entry = totals.setdefault(opponent, {"played": 0.0, "points": 0.0})
+            entry["played"] += 1.0
+            points = row.get("points")
+            entry["points"] += float(points) if isinstance(points, (int, float)) else 0.0
+        return OpponentHistory(totals)
 
     # ------------------------------------------------------------------ state
 
@@ -258,6 +291,49 @@ class GoalLedService:
 
     # ----------------------------------------------------------- instructions
 
+    def _rollout_instruction(self) -> str:
+        """本轮要交几个候选，以及为什么。
+
+        k=1（默认）与 k>1 是**两种不同的探索哲学**，提示词必须分开写：
+
+        * k=1：把全部推理预算投进一个版本，广度由 b 个对手提供。这时要求
+          "多个有差异的候选"是有害的——agent 会为了凑差异去改无关的阈值。
+        * k>1：一轮探 k 个不同假设，此时才需要讲多样性下限与反例。
+        """
+
+        if self.rollout_k == 1:
+            return (
+                "本轮只交 **1 个候选**（k=1）。不要交多个版本、也不要为了"
+                "凑差异去改无关的阈值——你的探索广度来自**对手**："
+                f"这一个策略会被拿去打 {self.batch} 个对手，你能从 "
+                f"{self.batch} 份不同的回放里拿到证据。"
+                "所以请把全部思考投在这一个版本上：先读完上一轮每个对手的回放，"
+                "找出**共性**的失败原因（对多个对手都吃亏的那条机制），"
+                "优先修它；只对某一个对手成立的特判要谨慎，它会在别的对手身上亏回去。"
+                "在 rationale 里写清：这一版改了什么、依据是哪个对手的哪段回放、"
+                "预期在哪几个对手身上体现出来。"
+                "候选目录规则：.agentbench/rollouts/<candidate_id>/ 会**叠加**到"
+                "工作区当前版本之上，所以目录里必须放你改动过的 main.py"
+                "（以及被改动的模块）；只放 README 会被判为无效候选并跳过。"
+            )
+        return (
+            f"本轮提交 k={self.rollout_k} 个候选。"
+            f"**k 个候选 = k 个不同的优化尝试，不是同一个尝试做 {self.rollout_k} 遍。**"
+            "每个候选必须承载一个**独立的、可被单独证伪的假设**（不同的取胜路径 / "
+            "不同的游戏机制 / 不同的资源分配哲学），并在 rationale 里写清"
+            "「这个候选赌的是哪条机制、如果它错了会在回放里看到什么」。"
+            "反例（会被判为伪多样性）：几个候选是同一份代码换了阈值、"
+            "换了造兵顺序里的一个数字、或只改了一个常量——那样一轮只探到 1 个点，"
+            f"却花掉了 {self.rollout_k} 倍的对局开销。"
+            f"量化下限：任意两个候选之间的代码差异不少于 "
+            f"{DIVERSITY_THRESHOLD_LINES} 行且落在不同的判断路径上；"
+            "框架会逐轮度量 pairwise 差异并把结果写进反馈。"
+            "候选目录规则："
+            ".agentbench/rollouts/<candidate_id>/ 会**叠加**到工作区当前版本之上，"
+            "所以每个候选目录里必须放它自己的 main.py（以及被改动的模块）；"
+            "只放 README 不算差异，会被判为无效候选并跳过。"
+        )
+
     def _developer_instructions(self, *, iteration: int, cleared: int) -> str:
         """每轮下发的操作契约。
 
@@ -285,23 +361,12 @@ class GoalLedService:
             "每轮你只需要做一件事：站在上面这些材料之上，把回放读透、想清楚，"
             "然后写出符合格式的新策略。",
             "通过 .agentbench/action.json 提交 Action（兼容 match_request.json）。"
-            "字段：action_id、rollouts[{candidate_id}]、selected_rival、roles、seeds、rationale。",
-            f"默认探索批次提交 k={self.rollout_k} 个候选。"
-            f"**k 个候选 = k 个不同的优化尝试，不是同一个尝试做 {self.rollout_k} 遍。**"
-            "每个候选必须承载一个**独立的、可被单独证伪的假设**（不同的取胜路径 / "
-            "不同的游戏机制 / 不同的资源分配哲学），并在 rationale 里写清"
-            "「这个候选赌的是哪条机制、如果它错了会在回放里看到什么」。"
-            "反例（会被判为伪多样性）：四个候选是同一份代码换了阈值、"
-            "换了造兵顺序里的一个数字、或只改了一个常量——那样一轮只探到 1 个点，"
-            f"却花掉了 {self.rollout_k} 倍的对局开销。"
-            f"量化下限：任意两个候选之间的代码差异不少于 "
-            f"{DIVERSITY_THRESHOLD_LINES} 行且落在不同的判断路径上；"
-            "框架会逐轮度量 pairwise 差异并把结果写进反馈。"
-            "候选目录规则："
-            ".agentbench/rollouts/<candidate_id>/ 会**叠加**到工作区当前版本之上，"
-            "所以每个候选目录里必须放它自己的 main.py（以及被改动的模块）；"
-            "只放 README 不算差异，会被判为无效候选并跳过。",
-            self.policy.instruction(iteration=iteration, k=self.rollout_k, cleared=cleared),
+            "字段：action_id、rollouts[{candidate_id}]、selected_rivals（对手 id 列表，"
+            "写单个 selected_rival 也兼容）、roles、seeds、rationale。",
+            self._rollout_instruction(),
+            self.policy.instruction(
+                iteration=iteration, batch=self.batch, history=self._opponent_history()
+            ),
             f"本轮座次：{list(self.roles)}；seed：{list(self.seeds)}。"
             "座次名由游戏定义、由框架固定，**照抄这两个值**即可——"
             "写别的名字（例如把分轨游戏写成 P0/P1）不会改变实际对局，"
@@ -343,15 +408,27 @@ class GoalLedService:
             "③ **经验是用来规划的，不是用来记账的**：research/ 里要写下"
             "「下一步该验证哪个假设、用什么证据判定它成立」，而不是罗列改了什么。"
             "每轮开始先读自己上轮写的下一步，先回答它。"
-            "④ **一轮 = k 个不同的尝试**："
-            f"这一轮的 {self.rollout_k} 个候选之间要走**不同的取胜路径**"
-            "（例如：压制对手产能 / 抢经济后期成型 / 利用某条被对手忽视的机制），"
-            "彼此可以完全不像。"
-            "把同一份代码复制 k 份、各改一个阈值，是这套方法最常见也最贵的失效方式。"
-            "每个候选**改多少由证据决定**：从 rules.md 的机制和回放里读出"
-            "「哪里出了问题、为什么」，该改一条规则就改一条，该换整条战略就换整条。"
-            "框架对改动幅度没有偏好，只要求你在 rationale 里说清三件事："
-            "这个候选依据的是哪条机制 / 哪段回放证据、它赌的核心假设是什么、"
+            "④ **一轮 = 一次有依据的改动**："
+            + (
+                (
+                    f"这一轮只有 1 个候选，但它要面对 {self.batch} 个对手。"
+                    "所以判断改对了没有的标准不是「赢了某一个」，而是"
+                    "**在这批对手上的整体表现是否变好**（胜率、以及输的那几局分差是否收窄）。"
+                    "改动幅度由证据决定：该改一条规则就改一条，该换整条战略就换整条；"
+                    "但要避免为某一个对手写死特判——那会在其它对手身上亏回去。"
+                )
+                if self.rollout_k == 1
+                else (
+                    f"这一轮的 {self.rollout_k} 个候选之间要走**不同的取胜路径**"
+                    "（例如：压制对手产能 / 抢经济后期成型 / 利用某条被对手忽视的机制），"
+                    "彼此可以完全不像。"
+                    "把同一份代码复制 k 份、各改一个阈值，是这套方法最常见也最贵的失效方式。"
+                    "每个候选**改多少由证据决定**：从 rules.md 的机制和回放里读出"
+                    "「哪里出了问题、为什么」，该改一条规则就改一条，该换整条战略就换整条。"
+                )
+            )
+            + "框架对改动幅度没有偏好，只要求你在 rationale 里说清三件事："
+            "依据的是哪条机制 / 哪段回放证据、赌的核心假设是什么、"
             "回放里出现什么现象就算它被证伪。"
             "⑤ **旧版本留得住**：把历史版本的策略留在文件里、保持可调用。"
             "这样 (a) 某条路线被证伪时，你能退回上一版的行为，而不必凭记忆重写；"
@@ -359,12 +436,30 @@ class GoalLedService:
             "（例如「若第 20 回合我方仍无建筑就走旧节奏，否则走新节奏」）——"
             "这类组合要求旧版本没被覆盖掉。"
             "怎么实现随你：继承、组合/委托、可替换部件、显式参数表都行。"
+            if self.history_mode == "full"
+            else "⑤ **本轮只能看到上一版**（历史可见性消融）：见下面单文件约束一条。"
+            "退回旧行为要靠你把它**写进当前这一个文件**（例如保留一个旧节奏的分支），"
+            "而不是去 import 一个历史版本——历史版本已经不在工作区里了。"
             "⑥ **座次可以不对称**：P0 与 P1 的地形、先后手、对手行为都不同，"
             "最优策略也不必相同。你的入口类拿得到 player 参数，"
             "完全可以让 P0 和 P1 走**两条不同的策略**（例如内部持有两个委托对象，"
             "按 player 分派）。如果回放显示你在某个座次一直输、另一个座次能赢，"
             "那就该只改输的那个座次，而不是改一份共用代码去迁就两边。"
         )
+        if self.history_mode == "last_only":
+            # 单文件约束是 last_only 能成立的**前提**，不是风格建议。
+            # 允许 v3.py import v2.py 的话，"只能看到上一版"就被 import 链绕过了：
+            # agent 读一下 v2.py 等于看到了历史，消融失效而且从曲线上完全看不出来。
+            parts.append(
+                "【单文件约束（本轮消融的硬要求）】你只能看到**上一版**策略，"
+                "所以策略代码必须全部写在一个文件里（main.py 加上游戏要求的入口即可），"
+                "**不要**新建 v2.py / v3.py 之类的版本文件、也不要 import 任何历史版本模块。"
+                "理由：如果新版本靠 import 旧版本来复用行为，那么『只能看到上一版』"
+                "就名不副实了。你需要的旧行为请**抄进当前这一个文件**"
+                "（可以留成一个分支或一个可切换的参数），这样它才随文件一起被继承下去。"
+                "框架每轮只保留工作区里的当前策略与最近一份反馈，"
+                "多写的版本文件会在下一轮被清掉，白费的是你自己的 token。"
+            )
         return "".join(parts)
 
     def _context(self, prompt: str, *, iteration: int = 0, cleared: int = 0) -> RunContext:
@@ -561,11 +656,14 @@ class GoalLedService:
         if path is None:
             raise ValueError("Goal did not submit a new action.json")
         request = MatchRequest.from_path(path)
-        if (
-            self.policy_name == SELF_DECIDE
-            and request.opponent_id not in self.runnable_opponent_ids
-        ):
-            raise ValueError(f"request names unknown or unrunnable opponent: {request.opponent_id}")
+        if self.policy_name == SELF_DECIDE:
+            unknown = [
+                item
+                for item in request.selected_opponents
+                if item not in self.runnable_opponent_ids
+            ]
+            if unknown:
+                raise ValueError(f"request names unknown or unrunnable opponent: {unknown}")
         archive = self.workspace / ".agentbench" / "processed-requests"
         archive.mkdir(parents=True, exist_ok=True)
         destination = archive / f"{request.request_id}.json"
@@ -576,27 +674,39 @@ class GoalLedService:
 
     def _assign_opponents(
         self, request: MatchRequest, *, iteration: int, cleared: int
-    ) -> tuple[dict[str, str], str | None]:
-        """返回 candidate_id -> opponent_id 映射与"被框架覆盖"的说明。"""
+    ) -> tuple[dict[str, tuple[str, ...]], str | None]:
+        """返回 candidate_id -> 本轮要打的对手元组，以及"被框架覆盖"的说明。
+
+        为什么值是**元组**而不是单个 id
+        ------------------------------
+        k=1 之后一轮的形状是"1 个策略 × b 个对手"：同一个候选要分别对 b 个对手
+        各打一遍（再乘座次与 seed）。原实现的值是单个 id，做法是"第 i 个候选打
+        第 i 个对手"，那在 k=1 时只会打到 b 个对手里的第一个 —— b 这个旋钮
+        直接失效，而胜率曲线看起来毫无异常（只是恒定不动）。
+        """
 
         if self.policy_name == SELF_DECIDE:
-            return {cid: request.opponent_id for cid in request.candidate_ids}, None
+            chosen = tuple(
+                item for item in request.selected_opponents if item in self.runnable_opponent_ids
+            ) or (request.opponent_id,)
+            return {cid: chosen for cid in request.candidate_ids}, None
         prescribed = self.policy.select(
-            iteration=iteration, k=len(request.candidate_ids) or self.rollout_k, cleared=cleared
+            iteration=iteration,
+            batch=self.batch,
+            history=self._opponent_history(),
         )
         prescribed = tuple(item for item in prescribed if item in self.runnable_opponent_ids)
         if not prescribed:
-            return {cid: request.opponent_id for cid in request.candidate_ids}, (
+            fallback = request.selected_opponents
+            return {cid: fallback for cid in request.candidate_ids}, (
                 f"policy {self.policy_name} produced no runnable opponent; kept Goal's choice"
             )
-        mapping: dict[str, str] = {}
-        for index, candidate_id in enumerate(request.candidate_ids):
-            mapping[candidate_id] = prescribed[index % len(prescribed)]
+        mapping = {cid: prescribed for cid in request.candidate_ids}
         note = None
-        if set(mapping.values()) != {request.opponent_id}:
+        if set(prescribed) != set(request.selected_opponents):
             note = (
                 f"framework opponent policy {self.policy_name} overrode the Goal's "
-                f"selected_rival {request.opponent_id!r}"
+                f"selection {list(request.selected_opponents)} with {list(prescribed)}"
             )
         return mapping, note
 
@@ -863,12 +973,15 @@ class GoalLedService:
                 "request_id": request.request_id,
                 "candidate_ids": list(request.candidate_ids),
                 "opponent_id": request.opponent_id,
-                "opponent_assignment": dict(assignment),
+                "opponent_assignment": {
+                    cid: list(values) for cid, values in assignment.items()
+                },
                 "opponent_policy": self.policy_name,
                 "policy_override": override_note,
                 "roles": list(roles),
                 "seeds": list(seeds),
                 "rollout_k": self.rollout_k,
+                "batch": self.batch,
                 "rationale": request.rationale,
                 # 轮次要写进事件：征服进度与曲线横坐标都靠它把逐局记录分组。
                 "iteration": iteration,
@@ -879,17 +992,20 @@ class GoalLedService:
         jobs: list[dict[str, object]] = []
         usable, protocol_notes = self._materialize_candidates(request)
         for candidate_id, candidate_root in usable.items():
-            for role in roles:
-                for seed in seeds:
-                    jobs.append(
-                        {
-                            "candidate_id": candidate_id,
-                            "candidate_root": candidate_root,
-                            "opponent_id": assignment[candidate_id],
-                            "role": role,
-                            "seed": seed,
-                        }
-                    )
+            # 一轮 = 候选 × 本轮 b 个对手 × 座次 × seed。
+            # 对手维度是 k=1 改造的核心：胜率的分辨率就来自这里。
+            for opponent_id in assignment.get(candidate_id, ()):
+                for role in roles:
+                    for seed in seeds:
+                        jobs.append(
+                            {
+                                "candidate_id": candidate_id,
+                                "candidate_root": candidate_root,
+                                "opponent_id": opponent_id,
+                                "role": role,
+                                "seed": seed,
+                            }
+                        )
         if not jobs:
             # 协议问题（例如每个候选都没放 main.py）：不跑对局，但**不终止 run**，
             # 把可执行的修正说明写成反馈交回 Goal，让它下一轮自己改对。
@@ -973,9 +1089,13 @@ class GoalLedService:
             self._append(
                 "GoalMatchCompleted",
                 {"request_id": request.request_id, **row},
-                "goal-led-match:{rid}:{cid}:{role}:{seed}".format(
+                # 幂等键必须带 opponent：k=1 之后同一个候选要在同一轮里打 b 个
+                # 不同对手，只用 (候选, 座次, seed) 会让第 2..b 个对手的结果
+                # 撞键，b>1 时对局悄悄丢掉 (b-1)/b。
+                "goal-led-match:{rid}:{cid}:{opp}:{role}:{seed}".format(
                     rid=request.request_id,
                     cid=row["candidate_id"],
+                    opp=row["opponent_id"],
                     role=row["role"],
                     seed=row["seed"],
                 ),
@@ -1123,12 +1243,49 @@ class GoalLedService:
         # 单对手 Elo 估计：以对手已知 Elo 为锚，按胜率做 logistic 反推。
         elo_estimate = None
         opponent_ids = sorted({str(row["opponent_id"]) for row in scored})
-        anchors = [self._opponent_score(item) for item in opponent_ids]
-        anchor_values = [value for value in anchors if value is not None]
-        if win_rate is not None and anchor_values:
-            probability = _clip(win_rate, 0.02, 0.98)
-            anchor = sum(anchor_values) / len(anchor_values)
-            elo_estimate = anchor + 400.0 * math.log10(probability / (1.0 - probability))
+
+        # 逐对手战绩。k=1 × b 个对手之后这是最有信息量的一块：
+        # 总胜率 0.5 可能是"打赢弱的两个、输给强的两个"（正常），
+        # 也可能是"对每个都五五开"（完全不同的局面），只看总胜率分不出来。
+        by_opponent: dict[str, dict[str, float]] = {}
+        for row in scored:
+            entry = by_opponent.setdefault(
+                str(row["opponent_id"]), {"played": 0.0, "points": 0.0}
+            )
+            entry["played"] += 1.0
+            entry["points"] += float(row.get("points") or 0.0)
+        win_rate_by_opponent = {
+            opponent: {
+                "played": int(entry["played"]),
+                "win_rate": round(entry["points"] / entry["played"], 4),
+                "opponent_elo": self._opponent_score(opponent),
+            }
+            for opponent, entry in sorted(by_opponent.items())
+            if entry["played"] > 0
+        }
+
+        # Elo 反解：b 个对手时用**逐对手**胜率各自反解再取均值，而不是拿总胜率
+        # 去配一个"平均锚点"。后者在对手强度差得远时会系统性偏掉：例如打赢
+        # Elo 500 的、打输 Elo 1500 的，总胜率 0.5 配上均值锚 1000 会报 1000，
+        # 而真实水平显然更接近 500~700 那一段。逐对手反解再平均没有这个问题。
+        per_opponent_elo: list[float] = []
+        for opponent, entry in by_opponent.items():
+            anchor = self._opponent_score(opponent)
+            if anchor is None or entry["played"] <= 0:
+                continue
+            probability = _clip(entry["points"] / entry["played"], 0.02, 0.98)
+            per_opponent_elo.append(
+                anchor + 400.0 * math.log10(probability / (1.0 - probability))
+            )
+        if per_opponent_elo:
+            elo_estimate = sum(per_opponent_elo) / len(per_opponent_elo)
+        elif win_rate is not None:
+            anchors = [self._opponent_score(item) for item in opponent_ids]
+            anchor_values = [value for value in anchors if value is not None]
+            if anchor_values:
+                probability = _clip(win_rate, 0.02, 0.98)
+                anchor = sum(anchor_values) / len(anchor_values)
+                elo_estimate = anchor + 400.0 * math.log10(probability / (1.0 - probability))
 
         # 连续奖励：胜负是二值的，但**分差**不是。
         #
@@ -1193,6 +1350,7 @@ class GoalLedService:
             "win_rate": win_rate,
             "elo_vs_opponent": elo_estimate,
             "opponent_ids": opponent_ids,
+            "win_rate_by_opponent": win_rate_by_opponent,
             "best_candidate_id": best_candidate,
             "best_candidate_win_rate": best_rate,
             "zero_round_losses": zero_round_losses,
@@ -1209,44 +1367,45 @@ class GoalLedService:
         }
 
     def _token_total(self) -> int | None:
-        """全 run 累计 token 用量。
+        """全 run 累计 token 用量 = 每次模型请求的用量之和（账单口径）。
 
-        harness 的用量事件是**会话累计值**语义（codex 的 ``tokenUsage/updated``
-        报的是当前 thread 的总量，单调增），所以在**单个 thread 内**要取最大值，
-        求和会把同一份累计量重复叠加。
+        为什么是"求和"而不是"取峰值"
+        ----------------------------
+        这里踩过一个把曲线彻底画错的坑，值得写清楚。``AgentTokenUsage`` 的
+        ``total_tokens`` 来自 codex 的 ``thread/tokenUsage/updated``，而
+        :mod:`agentbench_hl.adapters.codex_goal.event_mapper` 取的是
+        ``tokenUsage.last`` —— **那一次请求**的用量，不是 thread 的累计量。
 
-        但会话轮转把这件事变成了分段问题
-        --------------------------------
-        ``thread_rotate_each_iteration`` 之后每轮都换新 thread，计数**归零重来**。
-        此时对全 run 取全局 max，等于只记住"最贵的那一段"：实测 sota-antwar
-        跑了 44 段、各段峰值 69k~137k，全局 max 报 169k，而真实总消耗约 4.9M——
-        差了 29 倍。预算守卫因此永远不会触发，token 曲线也画成一条阶梯。
+        原实现按"会话累计值"语义处理：以会话事件切段、段内取 max、跨段相加。
+        语义反了，后果是实测的：
 
-        正确做法：**按 thread 分段取各段峰值，再把各段相加**。
-        分段边界用会话事件（``GoalLedStarted`` / ``GoalSessionReset`` /
-        ``GoalSessionRotated``）识别，与 ``_thread_context_tokens`` 同一套口径。
+        * ``sota-antwar`` 第 2~11 轮 token 全报 137631，**连续 10 轮一动不动**；
+        * 6 个新 run 逐轮精确翻倍（snakego4: 112526 → 260286 → 520572 →
+          1041144），因为新增一个 rotate 边界就把同一份用量再叠一遍。
+
+        真实口径很朴素：agent 每发一次模型请求就要重发整个上下文，那次请求的
+        ``input + output`` 就是那次的花费，全 run 花费 = 逐次求和。实测 r4b
+        4 轮 209 次请求合计 13.79M token，而原口径只报 0.99M（低估 14 倍）。
+
+        ⚠️ 修好之后 ``budget.tokens`` 才第一次真正生效。老配置里写的 3M 是在
+        低估 14 倍的口径下拍的，直接沿用会让 run 在第 1 轮就被预算掐死；
+        新模板因此不设 token 预算，改用 ``max_iterations`` 收敛。
         """
 
-        segments: list[int] = []
-        current: int | None = None
-        for event in self.events.read_all():
-            if event.event_type in ("GoalLedStarted", "GoalSessionReset", "GoalSessionRotated"):
-                if current is not None:
-                    segments.append(current)
-                current = None
-                continue
-            payload = event.payload if isinstance(event.payload, Mapping) else {}
-            value = payload.get("total_tokens")
-            if isinstance(value, int):
-                current = value if current is None else max(current, value)
-        if current is not None:
-            segments.append(current)
-        return sum(segments) if segments else None
+        return self._token_event_sum()
 
     def _token_event_sum(self) -> int | None:
+        """逐次请求用量求和。
+
+        只认 ``AgentTokenUsage``：其它事件（例如指标事件自己回写的
+        ``total_tokens``）也带同名字段，一起加进来会自我叠加。
+        """
+
         total = 0
         seen = False
         for event in self.events.read_all():
+            if event.event_type != "AgentTokenUsage":
+                continue
             payload = event.payload if isinstance(event.payload, Mapping) else {}
             value = payload.get("total_tokens")
             if isinstance(value, int):
@@ -1280,9 +1439,17 @@ class GoalLedService:
         return rows
 
     def _conquest_state(self) -> ConquestState | None:
-        """有序课程（ladder_up / ladder_down）的当前进度；其它策略返回 None。"""
+        """有序课程（ladder_up / ladder_down）的当前进度；其它策略返回 None。
 
-        sequence = self.policy.target_sequence()
+        只有单目标顺序课程才有"目标序列"这个概念。``progress`` 在 b>1 时是
+        **b 个并行槽位**，每个槽位有自己的进度，压不成一个标量游标——它的进度
+        由 ``win_rate_by_opponent`` 与策略自己的窗口计算表达。
+        """
+
+        sequence_of = getattr(self.policy, "target_sequence", None)
+        if not callable(sequence_of):
+            return None
+        sequence = sequence_of()
         if not sequence:
             return None
         rows = self._match_rows_from_events()
@@ -1537,9 +1704,15 @@ class GoalLedService:
             replay_timeout_s=self.behavioral_ig_timeout_s,
             max_cases=self.behavioral_ig_cases,
             coupling=self.behavioral_ig_coupling,
-            # 逐决策点的真实 |A(s)|。有状态探针的游戏（antwar/antwar2）走精确枚举，
+            # 逐决策点的真实 |A(s)|。有状态探针的游戏走精确枚举，
             # 其余游戏自动回落到字母表常量并在 support_mode 里如实标注。
-            support_provider=provider_for(self.game),
+            #
+            # agentbench_root 必须传下去：rollman 这类候选包不自带后端 core/ 的
+            # 游戏，探针要靠它去 A 仓定位合法动作枚举器。缺了它探针会直接失败，
+            # 而失败会被当成"没有探针"静默回落到近似口径。
+            support_provider=provider_for(
+                self.game, agentbench_root=self.agentbench_root
+            ),
         )
         trace_path = self.behavioral_ig_root / f"trace-{iteration:04d}.json"
         try:
@@ -1764,6 +1937,13 @@ class GoalLedService:
             "opponent_ids": summary.get("opponent_ids"),
             "candidate_ids": list(request.candidate_ids),
             "rollout_k": self.rollout_k,
+            # 本轮打了几个对手（b）。曲线要靠它解释胜率的分辨率：
+            # b=1 时胜率只能取 {0, 0.5, 1}，b=4 时才有 0/0.25/…/1 九档。
+            "batch": self.batch,
+            "opponents_played": len(summary.get("opponent_ids") or []),
+            # 逐对手战绩：k=1 × b 个对手之后，"对哪个对手赢了"比总胜率信息量大得多。
+            # 慢评测之外的零成本 Elo 反解也用它（b 个不同强度的锚点一起拟合）。
+            "win_rate_by_opponent": summary.get("win_rate_by_opponent"),
             # 探索多样性：pairwise 代码行差异（口径见 application/candidate_diversity.py）。
             # code_fingerprint 互异只能排除"逐字节相同"，排不掉"同一骨架换阈值"——
             # 后者让一轮 k 个候选退化成 1 个假设，是学习曲线走平最常见的原因。
@@ -2272,11 +2452,41 @@ class GoalLedService:
         # client-side timeout must never orphan research that is still stored
         # by the run-local App Server.
         self._write_state(session.thread_id, 0)
-        first_opponent = self.policy.select(iteration=0, k=self.rollout_k, cleared=0)
+        first_opponent = self.policy.select(
+            iteration=0, batch=self.batch, history=self._opponent_history()
+        )
         target_hint = (
             f"本轮对手已由框架指定：{'、'.join(first_opponent)}。"
             if first_opponent
             else f"第一个 Action 必须挑战榜首 {self._ladder()[0].opponent_id}。"
+        )
+        rollout_hint = (
+            (
+                "本轮只交 **1 个候选**（k=1）。第 0 轮没有回放，所以这一版是你对"
+                "这个游戏的**初始理解**：请从 rules.md 的机制出发，选定一条你认为"
+                "站得住的开局哲学（例如先经济后成型 / 全程压制 / 围绕某条特定机制），"
+                "把它写清楚、写对格式。"
+                f"这一版会被拿去打 {self.batch} 个对手，"
+                f"评测器回传的 {self.batch} 份回放就是你下一轮的全部信息来源。"
+            )
+            if self.rollout_k == 1
+            else (
+                f"本轮要交 k={self.rollout_k} 个候选，它们必须是 {self.rollout_k} 个"
+                "**不同的开局哲学**（例如：先经济后成型 / 全程压制 / 围绕某条特定机制做文章），"
+                f"而不是同一份 v000 换 {self.rollout_k} 个阈值——"
+                "第 0 轮没有回放，唯一能获得信息的方式就是让这几个候选**互相远离**，"
+                "这样评测器回传的 k 份回放才能告诉你哪条路线在这个游戏里站得住。"
+                f"任意两个候选之间的代码差异不少于 {DIVERSITY_THRESHOLD_LINES} 行，"
+                "框架会度量并在反馈里告诉你结果。"
+            )
+        )
+        version_hint = (
+            "每个候选的策略类请起**带版本号的名字**（如 V000EconomyAgent）并留在文件里："
+            "以后每轮都会在已有版本上继续演进，旧版本留着才能回退与按局面组合，"
+            "所以这一轮的类名就是整条演进链的根。\n"
+            if self.history_mode == "full"
+            else "策略请全部写在**一个文件**里（本轮消融只让你看到上一版，"
+            "所以不要建多版本文件、也不要 import 历史版本）。\n"
         )
         session = self._turn(
             session,
@@ -2286,17 +2496,10 @@ class GoalLedService:
                 "CANDIDATE_CONTRACT.md（提交格式）、leaderboard.json（你要打的人是谁）。\n"
                 "ai_example.py 只演示格式、强度为零；另存为 ai.py 后写你自己的策略，"
                 "**不要**把它当成起点抄。\n"
-                f"本轮要交 k={self.rollout_k} 个候选，它们必须是 {self.rollout_k} 个"
-                "**不同的开局哲学**（例如：先经济后成型 / 全程压制 / 围绕某条特定机制做文章），"
-                f"而不是同一份 v000 换 {self.rollout_k} 个阈值——"
-                "第 0 轮没有回放，唯一能获得信息的方式就是让这几个候选**互相远离**，"
-                "这样评测器回传的 k 份回放才能告诉你哪条路线在这个游戏里站得住。"
-                f"任意两个候选之间的代码差异不少于 {DIVERSITY_THRESHOLD_LINES} 行，"
-                "框架会度量并在反馈里告诉你结果。\n"
-                "每个候选的策略类请起**带版本号的名字**（如 V000EconomyAgent）并留在文件里："
-                "以后每轮都会在已有版本上继续演进，旧版本留着才能回退与按局面组合，"
-                "所以这一轮的类名就是整条演进链的根。\n"
-                "写完后跑 selfcheck.py（容器内自带）确认每个候选都能导入、接口正确、"
+                + rollout_hint
+                + "\n"
+                + version_hint
+                + "写完后跑 selfcheck.py（容器内自带）确认每个候选都能导入、接口正确、"
                 "能走完一帧；**不通过就不要提交** —— 格式错会让整轮反馈只告诉你「你崩了」。\n"
                 "本轮的第一优先级是协议格式绝对正确（格式错=0 回合判负，"
                 "整轮反馈只会告诉你「你崩了」，学不到任何策略信息），其次才是强度。\n"
@@ -2344,18 +2547,20 @@ class GoalLedService:
 
         只靠提示词说"别看历史"是无效的——历史就摆在工作区里。三档语义：
 
-        * ``full``       : 什么都不动（默认）。
+        * ``full``       : 什么都不动（默认，能看到所有历史迭代）。
         * ``no_notes``   : 删掉经验文档（历史代码与会话保留）。
-        * ``memoryless`` : 再删掉历史候选目录、**历次 action 原文**、以及除最近一份
+        * ``last_only``  : 再删掉历史候选目录、**历次 action 原文**、以及除最近一份
           以外的反馈；配合 :meth:`_session_for_iteration` 每轮开新会话，
-          agent 只剩"当前父版本代码 + 上一轮反馈"，即"只站在当前这一步"。
+          agent 只剩"上一版代码 + 上一轮反馈"。提示词里还会加**单文件约束**
+          （见 ``_developer_instructions``）：不许 import 历史版本，否则
+          "只能看到上一版"会被 import 链绕过。
 
         当前策略文件（工作区根目录的 main.py 等）**永远保留**：消融的是"历史"，
         不是"起点"，否则每轮都从零重写，测的就不是同一件事了。
 
-        ``memoryless`` 下**必须**删 ``.agentbench/processed-requests/``：那里存着历次
+        ``last_only`` 下**必须**删 ``.agentbench/processed-requests/``：那里存着历次
         action 的原文（含 agent 自己写的 rationale 与选择的对手），是一份完整的
-        决策日记。漏掉它的话这一档名义上"无记忆"、实际上 agent 把上一轮的推理
+        决策日记。漏掉它的话这一档名义上"只看上一版"、实际上 agent 把上一轮的推理
         原样读回去，两组的差别就被抹平了——消融失效且**看不出来**。
 
         保留"最近一份反馈"是刻意的：不给任何对局结果，agent 连自己上一轮赢没赢
@@ -2369,7 +2574,7 @@ class GoalLedService:
         if experience.is_file():
             experience.unlink()
             removed.append(f"research/{EXPERIENCE_FILE}")
-        if self.history_mode == "memoryless":
+        if self.history_mode == "last_only":
             for relative in (".agentbench/rollouts", ".agentbench/processed-requests"):
                 target = self.workspace / relative
                 if target.is_dir():
@@ -2482,11 +2687,11 @@ class GoalLedService:
     def _session_for_iteration(self, thread_id: str, *, iteration: int) -> AgentSession:
         """取得本轮要用的会话。
 
-        ``memoryless`` 每轮开一个**全新**会话（没有任何对话历史），并记事件；
+        ``last_only`` 每轮开一个**全新**会话（没有任何对话历史），并记事件；
         其它模式沿用常驻会话（``resume``），保留跨轮上下文。
         """
 
-        if self.history_mode != "memoryless":
+        if self.history_mode != "last_only":
             return self.runtime.resume(thread_id, self._context(""))
         session = self.runtime.start(self._context(""))
         self._append(
@@ -2555,15 +2760,17 @@ class GoalLedService:
     def _continue_prompt(self, iteration: int) -> str:
         """推进下一轮的提示词。
 
-        ``memoryless`` 下会话是全新的，提示词必须**自包含**：明确告诉它工作区里
-        已有一份当前策略、最近一份官方反馈在哪，以及它没有任何历史记忆。
+        ``last_only`` 下会话是全新的，提示词必须**自包含**：明确告诉它工作区里
+        已有一份当前策略、最近一份官方反馈在哪，以及它看不到更早的历史。
         """
 
-        if self.history_mode != "memoryless":
+        if self.history_mode != "last_only":
             return "继续研究：基于已有 Experience 与公开反馈改进策略，然后写下一份 action.json。"
         return (
-            "这是一次**无记忆**迭代：你没有之前的对话历史、没有经验笔记、也看不到历史候选代码。"
-            "工作区根目录里是当前这一版策略；feedback/ 下只保留最近一份官方对局反馈"
+            "这是一次**只看上一版**的迭代：你没有之前的对话历史、没有经验笔记、"
+            "也看不到更早的历史候选代码。"
+            "工作区根目录里是**上一版**策略；feedback/ 下只保留最近一份官方对局反馈"
             "（含 replay 与 feedback.json）。请只依据这些材料改进策略，"
+            "所有代码继续写在同一个文件里（不要建新版本文件、不要 import 历史版本），"
             "然后写一份新的 .agentbench/action.json。"
         )

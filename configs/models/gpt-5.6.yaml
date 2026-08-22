@@ -1,0 +1,12 @@
+# GPT-5.6 —— OpenAI 家模型，codex 自带元数据，不需要 model_catalog。
+#
+# ⚠️ base_url 与 key 待确认：teamorouter 曾被 SNI 阻断（TLS 握手就断，
+# 不是 401 也不是超时），所以这里先留原端点，实际可用性以连通性探测为准。
+# base_url 带 /v1：teamorouter 的端点是 /v1/responses。
+model: gpt-5.6
+base_url: https://api.teamorouter.com/v1
+api_key_env: ABHL_KEY_GPT56
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 600000

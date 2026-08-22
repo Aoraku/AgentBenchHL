@@ -9,6 +9,7 @@ factory can reuse.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import subprocess
@@ -173,6 +174,30 @@ def _game_of(config_path: str | Path) -> str:
     return ExperimentConfig.load(Path(config_path).resolve()).game
 
 
+def _load_player_tracks(agentbench_root: str | Path, game: str) -> dict[str, str]:
+    """读 ``players/tracks.tsv``：非对称游戏里每名选手扮演哪个角色。
+
+    只有分轨游戏才有这个文件（目前是 rollman：rollman / ghost 两轨）。
+    对称游戏返回空字典，调用方据此跳过过滤——不要把"没有 tracks.tsv"
+    当成错误，那会把 7 个对称游戏全挡掉。
+    """
+
+    path = Path(agentbench_root) / "games" / game / "players" / "tracks.tsv"
+    if not path.is_file():
+        return {}
+    tracks: dict[str, str] = {}
+    with path.open(encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            player = (row.get("player_id") or "").strip()
+            track = (row.get("track") or "").strip()
+            # unknown / unrunnable 不是角色轨，是分类失败的标记；
+            # 把它们当轨道会让对手池里混进不可用选手。
+            if player and track and track not in ("unknown", "unrunnable"):
+                tracks[player] = track
+    return tracks
+
+
 def build_live_run(config_path: str | Path, *, run_id: str):
     """Assemble a fresh run for ``config.game`` through the game registry."""
 
@@ -236,6 +261,38 @@ def build_goal_led_service(
             f"{config.game} 的座次定义不一致：game.yaml 说 {roles}，"
             f"arena 说 {tuple(arena_roles)}。请先对齐 A 侧定义再跑实验"
         )
+
+    # 分轨（非对称）游戏必须按轨道过滤对手，否则会安排**同轨互殴**。
+    #
+    # 这类失败极其隐蔽：rollman 轨的选手只实现吃豆人一侧的协议，让两个
+    # rollman 对打，双方都不响应对手协议，对局 0 回合结束、得分双 -1000，
+    # 但对战器仍然记 ``status: complete`` 并判出一个 winner。于是
+    #   * 胜率虚高（0 回合局也算赢），
+    #   * IG 只录到 1 个决策点（KL 退化成 0 / ln(|A|/ε) 二值常数），
+    #   * Elo 把无效局当有效局喂进 BT 拟合。
+    # 实测 r4 的 ``rollman-seed-1`` replay 只有 2 行，而对位的
+    # ``ghost-seed-1`` 有 1204 行——同一场对局差 600 倍。
+    opponents = [item for item in run.opponents if item.runnable]
+    tracks = _load_player_tracks(config.paths.agentbench_root, config.game)
+    if tracks:
+        # 候选扮演 roles[0]（game.yaml 的首个角色），对手只能来自对位轨。
+        challenger_track = roles[0]
+        opponent_track = next((item for item in roles[1:]), None)
+        if opponent_track is None:
+            raise ValueError(f"{config.game} 声明了分轨却只有一个角色：{roles}")
+        eligible = [
+            item
+            for item in opponents
+            if tracks.get(item.opponent_id) == opponent_track
+        ]
+        if not eligible:
+            raise ValueError(
+                f"{config.game} 的 {opponent_track} 轨没有可运行对手："
+                f"候选扮演 {challenger_track}，对手池里 "
+                f"{sorted({tracks.get(item.opponent_id) for item in opponents})} 都不对位"
+            )
+        opponents = eligible
+
     return GoalLedService(
         run_root=run.root,
         bootstrap_root=run.bootstrap_root,
@@ -244,7 +301,7 @@ def build_goal_led_service(
         arena=run.arena,
         model=run.model,
         model_provider=run.model_provider,
-        runnable_opponent_ids=tuple(item.opponent_id for item in run.opponents if item.runnable),
+        runnable_opponent_ids=tuple(item.opponent_id for item in opponents),
         public_leaderboard=tuple(
             {
                 "opponent_id": item.opponent_id,
@@ -254,14 +311,18 @@ def build_goal_led_service(
                 "score": (None if item.score is None else float(item.score)),
                 "score_source": getattr(item, "rank_source", "crawled"),
             }
-            for item in run.opponents
-            if item.runnable and item.rank is not None
+            # 与 runnable_opponent_ids 用同一份已过滤集合：课程策略
+            # （fixed_rank / ladder_up / …）是按榜单选对手的，只过滤前者
+            # 会让它们继续选到同轨对手。
+            for item in opponents
+            if item.rank is not None
         ),
         game=config.game,
         roles=roles,
         seeds=seeds,
         rollout_k=config.runtime.rollout_k,
         opponent_policy=config.curriculum.opponent_policy,
+        batch=config.curriculum.batch,
         opponent_rank=config.curriculum.opponent_rank,
         opponent_start_rank=config.curriculum.opponent_start_rank,
         advance_min_matches=config.curriculum.advance_min_matches,

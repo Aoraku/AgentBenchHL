@@ -44,6 +44,21 @@ class MatchRequest:
     roles: tuple[Role, ...]
     seeds: tuple[int, ...]
     rationale: str
+    #: agent 自选的**多个**对手（``self`` 策略下的 b 个）。
+    #:
+    #: 为什么要有复数字段：k=1 之后一轮是"一个策略打 b 个对手"，而 ``self``
+    #: 策略要求 agent 自己挑那 b 个。只有单数的 ``selected_rival`` 时，agent
+    #: 的自主权被压缩成"只能挑 1 个"，b>1 时框架只能替它补齐——那就不是
+    #: "自己决定"了，消融变量也不干净。
+    #:
+    #: 空元组 = agent 只写了单数字段，此时以 ``opponent_id`` 为唯一对手。
+    opponent_ids: tuple[str, ...] = ()
+
+    @property
+    def selected_opponents(self) -> tuple[str, ...]:
+        """agent 本轮点名的对手（至少一个）。"""
+
+        return self.opponent_ids or (self.opponent_id,)
 
     @classmethod
     def from_path(cls, path: str | Path) -> MatchRequest:
@@ -55,8 +70,16 @@ class MatchRequest:
         if not isinstance(value, dict):
             raise ValueError("match request must be a JSON object")
         request_id = value.get("action_id", value.get("request_id"))
-        opponent_id = value.get("selected_rival", value.get("opponent_id"))
         rationale = value.get("rationale")
+        # 复数优先：``selected_rivals`` / ``opponent_ids`` 都接受；
+        # 没写复数就回落单数，老配置与老 run 的 action.json 逐字兼容。
+        raw_many = value.get("selected_rivals", value.get("opponent_ids"))
+        many: tuple[str, ...] = ()
+        if raw_many is not None:
+            many = _non_empty_strings(raw_many, "selected_rivals")
+        opponent_id = value.get("selected_rival", value.get("opponent_id"))
+        if opponent_id is None and many:
+            opponent_id = many[0]
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("request_id must be a non-empty string")
         if not isinstance(opponent_id, str) or not opponent_id.strip():
@@ -83,4 +106,5 @@ class MatchRequest:
             roles=tuple(raw_roles),  # type: ignore[arg-type]
             seeds=_positive_integers(value.get("seeds"), "seeds"),
             rationale=rationale.strip(),
+            opponent_ids=many,
         )

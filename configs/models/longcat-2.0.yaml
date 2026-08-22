@@ -1,0 +1,10 @@
+# LongCat 2.0 —— 待接。
+#
+# ⚠️ base_url 与 key 待确认。非 OpenAI 家模型，同 deepseek 的 catalog 注意事项。
+model: longcat-2.0
+base_url: https://api.longcat.chat/openai/v1
+api_key_env: ABHL_KEY_LONGCAT
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 90000

@@ -1,26 +1,27 @@
-"""SOTA run 的学习曲线。
+"""HL run 的学习曲线 —— 三组纵坐标 × 两种横坐标 = 6 个子图。
 
-四组纵坐标 × 两种横坐标 = 8 个子图。
+三组纵坐标（IG 已从主线移除，不再画）
+------------------------------------
+1. **胜率**，两条线画在同一张图上：
+   * 虚线（快通道）：迭代过程里那 ``b`` 局实时对战的胜率。零成本，每轮都有，
+     但口径是"对本轮那几个对手"，会随对手变强而下降 —— 它衡量的是**难度**，
+     不是绝对强度。
+   * 实线（慢通道）：中间版本对**冻结人类池**的总胜率。每 3 轮取一版，另起
+     后台进程评测（不影响迭代），一版 188~458 局。这条才是绝对强度。
+2. **Elo**，同样两条：
+   * 橙色点（零成本反解）：拿"该候选在迭代中已经打过的那 b 局" + 冻结池锚点
+     做 logistic 反解。一分钱不多花，但样本只有 b 局，噪声大。
+   * 实线（慢通道）：全池实测的一维 BT-MLE，附池内插入名次。
+3. **token 消耗**：柱=每一轮的增量，线=累计。
 
-纵坐标
-------
-1. **静态池胜率**：候选版本对冻结人类池的总胜率（(胜+0.5×平)/局数）。
-2. **静态池 Elo**：以池选手 measured_elo 为固定锚点的一维 BT-MLE，
-   附池内插入名次。
-3. **IG**：behavioral information gain（nats），支撑集由状态探针逐点枚举。
-4. **token 消耗**：累计曲线 + 逐轮增量柱（两者都保留：累计看总成本，
-   增量看哪一轮特别贵）。
+为什么胜率与 Elo 都要"快 + 慢"两条
+--------------------------------
+只有快通道时，曲线会骗人：``progress`` 课程下 agent 变强了就换更强的对手，
+于是实时胜率长期贴在 0.5 附近 —— 看起来毫无进展，实际在稳步上升。
+只有慢通道时，每 3 轮才一个点，短 run 根本画不出线。两条一起画，
+快通道给密度，慢通道给标尺。
 
-横坐标
-------
-迭代轮数 / 看过的轨迹数。
-
-数据来源
---------
-胜率与 Elo 只取全池实测结果（``pool-elo/<candidate>/challenger-elo.json``）；
-迭代过程里对单个对手的 ``win_rate`` 与全 run 累计的 ``pool_elo`` 都不画。
-
-**未评测完的版本不画。**数据没到就是没到，宁可图上少几个点，
+**慢通道未评测完的版本不画。**数据没到就是没到，宁可少几个点，
 也不要用半份数据画出一条会被误读的曲线。
 """
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,13 +40,21 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from plot_fonts import sans_serif_stack  # noqa: E402
+
 METRICS_EVENT = "IterationMetricsFinalized"
 
-# 四组纵坐标各有固定配色，跨图一致，方便并排比较。
+# 三组纵坐标各有固定配色，跨图一致，方便并排比较。
+# 快通道统一用同色系的浅色 + 虚线，慢通道用深色实线。
 COLORS = {
-    "win_rate": "#1f77b4",  # 蓝
-    "elo": "#2ca02c",  # 绿
-    "ig": "#8c564b",  # 棕
+    "win_rate": "#1f77b4",  # 蓝（慢通道）
+    "win_rate_live": "#9ecae1",  # 浅蓝（快通道）
+    "elo": "#2ca02c",  # 绿（慢通道）
+    "elo_live": "#ff7f0e",  # 橙（零成本反解，沿用历史配色）
     "tokens": "#e377c2",  # 粉
 }
 TOKEN_BAR_COLOR = "#c5b0d5"
@@ -52,13 +62,7 @@ REFERENCE_COLOR = "#d62728"
 
 plt.rcParams.update(
     {
-        "font.sans-serif": [
-            "PingFang SC",
-            "Hiragino Sans GB",
-            "Noto Sans CJK SC",
-            "WenQuanYi Zen Hei",
-            "DejaVu Sans",
-        ],
+        "font.sans-serif": sans_serif_stack(),
         "axes.unicode_minus": False,
         "axes.titlesize": 11,
         "axes.labelsize": 10,
@@ -77,12 +81,18 @@ class Point:
     iteration: int
     trajectories_seen: int | None
     candidate_id: str | None
+    # 慢通道（冻结人类池实测）
     win_rate: float | None
     elo: float | None
     pool_rank: int | None
     matches: int
-    ig: float | None
+    # 快通道（迭代过程里的 b 局）
+    live_win_rate: float | None
+    live_elo: float | None
+    live_matches: int
+    opponents: int
     tokens: int | None
+    tokens_delta: int | None
 
 
 @dataclass
@@ -151,52 +161,40 @@ def _static_results(pool_elo_dir: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _exact_ig(run_dir: Path) -> dict[int, float]:
-    path = run_dir / "recomputed-behavioral-ig.json"
-    if not path.is_file():
-        return {}
-    document = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        int(row["research_iteration"]): float(row["behavioral_ig_exact"])
-        for row in document.get("rows") or []
-        if row.get("research_iteration") is not None
-        and row.get("behavioral_ig_exact") is not None
-    }
+def _token_series(events: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """request_id → (累计 token, 该轮增量)。
 
+    口径：每条 ``AgentTokenUsage`` 是**一次模型请求**的花费
+    （codex 的 ``tokenUsage.last``），所以逐次相加。
 
-def _tokens(events: list[dict[str, Any]]) -> dict[str, int]:
-    """全 run 累计 token：thread 段内取峰值、跨段求和。
-
-    事件里缓存的 ``total_tokens`` 曾按全 run 取全局 max，而每轮换 thread 后
-    计数归零，于是只记住最贵那一段（实测低估 29 倍），所以这里从原始用量事件重算。
+    历史 bug（这段注释存在的理由）：原实现把它当"会话累计值"，按会话事件切段、
+    段内取 max、跨段相加。语义反了，实测两种错法同时出现 ——
+    ``sota-antwar`` 连续 10 轮报同一个数 137631 一动不动；
+    6 个 4 轮 run 逐轮精确翻倍（snakego4: 112526 → 260286 → 520572 → 1041144）。
     """
 
-    totals: dict[str, int] = {}
-    segments: list[int] = []
-    current: int | None = None
+    out: dict[str, tuple[int, int]] = {}
+    running = 0
+    last_checkpoint = 0
     for event in events:
         event_type = event.get("event_type")
         payload = event.get("payload") or {}
-        if event_type in ("GoalLedStarted", "GoalSessionReset", "GoalSessionRotated"):
-            if current is not None:
-                segments.append(current)
-            current = None
-        elif event_type == "AgentTokenUsage":
+        if event_type == "AgentTokenUsage":
             value = payload.get("total_tokens")
             if isinstance(value, int):
-                current = value if current is None else max(current, value)
+                running += value
         elif event_type == METRICS_EVENT:
             request = payload.get("request_id")
             if isinstance(request, str):
-                totals[request] = sum(segments) + (current or 0)
-    return totals
+                out[request] = (running, running - last_checkpoint)
+                last_checkpoint = running
+    return out
 
 
 def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
     events = _read_events(run_dir)
     static = _static_results(pool_elo_dir or (run_dir / "pool-elo"))
-    exact = _exact_ig(run_dir)
-    tokens = _tokens(events)
+    tokens = _token_series(events)
     pool_size, pool_top, pool_median = _pool_meta(run_dir)
 
     game = ""
@@ -211,6 +209,8 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
         game = str(payload.get("game") or game)
         champion = payload.get("best_candidate_id")
         result = static.get(str(champion)) if champion else None
+        cumulative, delta = tokens.get(str(payload.get("request_id")), (None, None))
+        live_rate = payload.get("win_rate")
         points.append(
             Point(
                 iteration=iteration,
@@ -220,8 +220,18 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
                 elo=None if result is None else float(result["elo"]),
                 pool_rank=None if result is None else int(result["pool_rank"]),
                 matches=0 if result is None else int(result["complete_matches"]),
-                ig=exact.get(iteration),
-                tokens=tokens.get(str(payload.get("request_id"))),
+                live_win_rate=(
+                    float(live_rate) if isinstance(live_rate, (int, float)) else None
+                ),
+                live_elo=(
+                    float(payload["elo_vs_opponent"])
+                    if isinstance(payload.get("elo_vs_opponent"), (int, float))
+                    else None
+                ),
+                live_matches=int(payload.get("matches") or 0),
+                opponents=len(payload.get("opponent_ids") or []),
+                tokens=cumulative,
+                tokens_delta=delta,
             )
         )
     points.sort(key=lambda item: item.iteration)
@@ -249,30 +259,59 @@ def _xy(
 
 
 def _draw_win_rate(axis, run: Run, x_key: str, x_label: str) -> None:
+    live_x, live_y, live_items = _xy(run, x_key, "live_win_rate")
+    if live_x:
+        batch = max((point.opponents for point in live_items), default=0)
+        axis.plot(
+            live_x,
+            live_y,
+            marker="s",
+            markersize=3.5,
+            linewidth=1.2,
+            linestyle="--",
+            color=COLORS["win_rate_live"],
+            label=f"迭代中实时胜率（每轮 {batch} 个对手，零成本）" if batch else "迭代中实时胜率",
+        )
     xs, ys, _ = _xy(run, x_key, "win_rate")
     axis.plot(
         xs,
         ys,
         marker="o",
         markersize=4,
-        linewidth=1.6,
+        linewidth=1.8,
         color=COLORS["win_rate"],
-        label="对全池总胜率",
+        label="慢评测：对冻结人类池总胜率",
     )
-    axis.axhline(0.5, color=REFERENCE_COLOR, linestyle="--", linewidth=1.0, label="0.5 基准线")
+    axis.axhline(0.5, color=REFERENCE_COLOR, linestyle=":", linewidth=1.0, label="0.5 基准线")
     axis.set_ylim(-0.05, 1.05)
     axis.set_xlabel(x_label)
-    axis.set_ylabel("静态池胜率")
-    axis.set_title("静态池胜率")
+    axis.set_ylabel("胜率")
+    # 标题必须写明两条线口径不同：实时胜率会随对手变强而下降，
+    # 不写清楚的话"上升的静态胜率 + 下降的实时胜率"会被读成数据自相矛盾。
+    axis.set_title("胜率（虚线=对本轮对手，实线=对全池；口径不同，别直接比高低）")
     axis.legend(loc="lower right")
 
 
 def _draw_elo(axis, run: Run, x_key: str, x_label: str) -> None:
+    live_x, live_y, live_items = _xy(run, x_key, "live_elo")
+    if live_x:
+        sizes = [12 + 2.5 * point.live_matches for point in live_items]
+        axis.scatter(
+            live_x,
+            live_y,
+            s=sizes,
+            color=COLORS["elo_live"],
+            alpha=0.75,
+            zorder=2,
+            edgecolor="white",
+            linewidth=0.5,
+            label="零成本反解（本轮那几局 + 冻结池锚点）",
+        )
     xs, ys, items = _xy(run, x_key, "elo")
-    axis.plot(xs, ys, linewidth=1.6, color=COLORS["elo"], zorder=2, label="静态池 Elo")
+    axis.plot(xs, ys, linewidth=1.8, color=COLORS["elo"], zorder=3, label="慢评测：全池实测 Elo")
     if items:
         sizes = [18 + 0.35 * point.matches for point in items]
-        axis.scatter(xs, ys, s=sizes, color=COLORS["elo"], zorder=3, edgecolor="white")
+        axis.scatter(xs, ys, s=sizes, color=COLORS["elo"], zorder=4, edgecolor="white")
         for x, y, point in zip(xs, ys, items, strict=True):
             if point.pool_rank is not None:
                 axis.annotate(
@@ -296,40 +335,22 @@ def _draw_elo(axis, run: Run, x_key: str, x_label: str) -> None:
         handles.append(Line2D([], [], color="0.55", linestyle=":", linewidth=1.0))
         labels.append(f"池内中位 {run.pool_median_elo:.0f}")
     axis.set_xlabel(x_label)
-    axis.set_ylabel("静态池 Elo")
-    axis.set_title("静态池 Elo（标注为池内名次，点面积∝对局数）")
+    axis.set_ylabel("Elo")
+    axis.set_title("Elo（橙点=零成本反解，绿线=全池实测；标注为池内名次，点面积∝对局数）")
     axis.legend(handles, labels, loc="lower right")
 
 
-def _draw_ig(axis, run: Run, x_key: str, x_label: str) -> None:
-    xs, ys, _ = _xy(run, x_key, "ig")
-    axis.plot(
-        xs,
-        ys,
-        marker="o",
-        markersize=4,
-        linewidth=1.6,
-        color=COLORS["ig"],
-        label="behavioral IG",
-    )
-    if ys:
-        mean = sum(ys) / len(ys)
-        axis.axhline(mean, color="0.55", linestyle=":", linewidth=1.0, label=f"均值 {mean:.3f}")
-    axis.set_xlabel(x_label)
-    axis.set_ylabel("IG (nats)")
-    axis.set_title("行为信息增益")
-    axis.legend(loc="upper right")
-
-
 def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
-    xs, ys, _ = _xy(run, x_key, "tokens")
+    xs, ys, items = _xy(run, x_key, "tokens")
     if not xs:
         axis.set_xlabel(x_label)
         axis.set_ylabel("累计 token (百万)")
         axis.set_title("token 消耗")
         return
 
-    deltas = [ys[0]] + [max(0.0, ys[i] - ys[i - 1]) for i in range(1, len(ys))]
+    # 增量直接取记账里的逐轮值，而不是对累计曲线做差。
+    # 做差在 x 轴是"看过的轨迹数"时会算错（相邻两点未必是相邻两轮）。
+    deltas = [float(point.tokens_delta or 0) for point in items]
     bars = axis.twinx()
     bars.set_zorder(1)
     axis.set_zorder(2)
@@ -341,9 +362,9 @@ def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
         width=width,
         color=TOKEN_BAR_COLOR,
         alpha=0.75,
-        label="逐轮增量",
+        label="每一轮的增量",
     )
-    bars.set_ylabel("逐轮增量 token (千)")
+    bars.set_ylabel("逐轮 token (千)")
     bars.grid(False)
     axis.plot(
         xs,
@@ -356,7 +377,7 @@ def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
     )
     axis.set_xlabel(x_label)
     axis.set_ylabel("累计 token (百万)")
-    axis.set_title("token 消耗（线=累计，柱=逐轮增量）")
+    axis.set_title("token 消耗（线=累计，柱=每一轮）")
     line_handles, line_labels = axis.get_legend_handles_labels()
     bar_handles, bar_labels = bars.get_legend_handles_labels()
     axis.legend(line_handles + bar_handles, line_labels + bar_labels, loc="upper left")
@@ -365,13 +386,12 @@ def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
 PANELS = (
     ("win_rate", _draw_win_rate),
     ("elo", _draw_elo),
-    ("ig", _draw_ig),
     ("tokens", _draw_tokens),
 )
 
 
 def render(run: Run, output: Path) -> Path:
-    figure, axes = plt.subplots(4, 2, figsize=(15, 18))
+    figure, axes = plt.subplots(3, 2, figsize=(15, 14))
     for row, (_key, draw) in enumerate(PANELS):
         for column, (x_key, x_label) in enumerate(X_AXES):
             draw(axes[row][column], run, x_key, x_label)
@@ -380,7 +400,7 @@ def render(run: Run, output: Path) -> Path:
         f"人类池 {run.pool_size} 人（冻结）　已全池评测 {run.evaluated} 版",
         fontsize=14,
     )
-    figure.tight_layout(rect=(0, 0, 1, 0.982))
+    figure.tight_layout(rect=(0, 0, 1, 0.978))
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=150)
     plt.close(figure)
@@ -388,15 +408,25 @@ def render(run: Run, output: Path) -> Path:
 
 
 def render_comparison(runs: list[Run], output: Path) -> Path:
-    figure, axes = plt.subplots(4, 2, figsize=(15, 18))
-    styles = [("#1f77b4", "-", "o"), ("#d62728", "--", "s")]
+    figure, axes = plt.subplots(3, 2, figsize=(15, 14))
+    # 每个游戏一套独立配色：原先只有两组样式循环复用，5 个 run 会让
+    # generals / miracle / rollman 和 antwar 同色同线型，图例根本分不出谁是谁。
+    styles = [
+        ("#1f77b4", "-", "o"),
+        ("#d62728", "--", "s"),
+        ("#2ca02c", "-.", "^"),
+        ("#9467bd", ":", "D"),
+        ("#ff7f0e", "-", "v"),
+        ("#17becf", "--", "P"),
+        ("#8c564b", "-.", "X"),
+        ("#e377c2", ":", "*"),
+    ]
     rows = (
-        ("win_rate", "静态池胜率", 1.0),
-        ("elo", "静态池 Elo", None),
-        ("ig", "IG (nats)", None),
-        ("tokens", "累计 token (百万)", None),
+        ("win_rate", "静态池胜率"),
+        ("elo", "静态池 Elo"),
+        ("tokens", "累计 token (百万)"),
     )
-    for row_index, (y_key, y_label, _) in enumerate(rows):
+    for row_index, (y_key, y_label) in enumerate(rows):
         for column, (x_key, x_label) in enumerate(X_AXES):
             axis = axes[row_index][column]
             for index, run in enumerate(runs):
@@ -416,12 +446,19 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
                 )
             axis.set_xlabel(x_label)
             axis.set_ylabel(y_label)
-            axis.set_title(y_label + ("（两游戏 Elo 刻度不同）" if y_key == "elo" else ""))
+            # Elo 必须写明不可比：每个游戏的人类池是各自独立拟合的，
+            # 锚点不同、量纲不同，放同一根轴上只能看趋势不能比高低。
+            axis.set_title(
+                y_label + ("（各游戏池刻度独立，纵向不可比）" if y_key == "elo" else "")
+            )
             if y_key == "win_rate":
                 axis.set_ylim(-0.05, 1.05)
             axis.legend(loc="best")
-    figure.suptitle("antwar 与 antwar2 对比", fontsize=14)
-    figure.tight_layout(rect=(0, 0, 1, 0.982))
+    figure.suptitle(
+        "各游戏 HL 迭代对比（" + "、".join(run.game for run in runs) + "）",
+        fontsize=14,
+    )
+    figure.tight_layout(rect=(0, 0, 1, 0.978))
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=150)
     plt.close(figure)
@@ -438,8 +475,14 @@ def table(run: Run) -> list[dict[str, Any]]:
             "elo": None if point.elo is None else round(point.elo, 2),
             "pool_rank": point.pool_rank,
             "matches": point.matches,
-            "ig": point.ig,
+            "live_win_rate": (
+                None if point.live_win_rate is None else round(point.live_win_rate, 4)
+            ),
+            "live_elo": None if point.live_elo is None else round(point.live_elo, 2),
+            "live_matches": point.live_matches,
+            "opponents": point.opponents,
             "tokens": point.tokens,
+            "tokens_delta": point.tokens_delta,
         }
         for point in run.points
     ]

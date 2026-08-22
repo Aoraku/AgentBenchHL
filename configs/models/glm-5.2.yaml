@@ -1,0 +1,17 @@
+# GLM-5.2（清华中转）—— 当前 8 个游戏烟测的实际用模，最稳。
+#
+# base_url 不带 /v1：sub2api 自身就是根，加 /v1 会 404。
+model: glm-5.2
+base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
+api_key_env: ABHL_API_KEY
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+# 非 OpenAI 家模型：必须给 catalog，否则 codex 用兜底元数据、
+# 压缩在一个我们没设过的点触发并打死整个 run。
+model_catalog: zhipu
+# 上下文 204800。压缩阈值取不到窗口的一半：这个模型的 remote compaction
+# 必定失败（返回 [reasoning, message] 两个 item，codex 只接受一个），
+# 所以框架靠 thread_rotate_each_iteration 保证压缩**永不触发**，
+# 这个阈值只是最后一道保险。
+auto_compact_token_limit: 90000

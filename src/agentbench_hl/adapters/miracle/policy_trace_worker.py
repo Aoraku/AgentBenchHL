@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import struct
 import sys
+import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -413,6 +415,141 @@ def _load_ai_class(entry_root: Path):
     raise RuntimeError("miracle candidate exposes no AI class")
 
 
+def _new_instance(ai_class: type) -> object:
+    """造一个候选 AI 实例，尽量让它的 ``__init__`` 真正跑一遍。
+
+    为什么不能简单用 ``__new__``
+    ----------------------------
+    ``__new__`` 绕过构造函数，于是候选在 ``__init__`` 里给自己设的**自定义属性**
+    全都不存在。实测 v003_ranged_probe 第一行就是：
+
+        if not self.initialized:      # ai.py:28
+
+    → ``AttributeError: 'AI' object has no attribute 'initialized'``，
+    每回合都崩，整局只产出一个 ``END``。
+
+    这不是某个候选的特例：agent 每一轮都在重写 ``ai.py``，随时可能引入新的
+    实例属性。逐个补字段是补不完的，正确做法是**让候选自己的 __init__ 跑起来**。
+
+    ``__init__`` 唯一的障碍是它会读 stdin。miracle 的线协议是
+    **6 位十进制长度（ASCII）+ JSON 体**，而且 ``read_opt()`` 读的是
+    ``sys.stdin.buffer``（二进制流），所以假 stdin 必须同时提供 ``.buffer``。
+    早先用 ``io.StringIO`` 替身失败过：它没有 ``.buffer`` 属性，
+    构造照样抛异常并退回 ``__new__``，自定义属性依旧缺失。
+    """
+
+    # 后端握手的第一条消息只需要 camp。这里按线协议编好帧，重复若干份，
+    # 避免候选在构造期间连读多次时耗尽。
+    payload = json.dumps({"camp": 0}).encode("utf-8")
+    frame = f"{len(payload):06d}".encode("ascii") + payload
+    stream = io.BytesIO(frame * 64)
+
+    class _FakeStdin(io.TextIOWrapper):
+        """带 .buffer 的 stdin 替身。
+
+        ``read_opt()`` 走 ``sys.stdin.buffer``，但候选也可能直接 ``input()``，
+        所以这里用 TextIOWrapper 包一层，两条路径都能工作。
+        """
+
+    original_stdin = sys.stdin
+    try:
+        sys.stdin = _FakeStdin(stream, encoding="utf-8", errors="replace")
+        try:
+            return ai_class()  # type: ignore[call-arg]
+        except BaseException:  # noqa: BLE001 - 构造失败一律退回 __new__
+            # 候选构造函数可能抛任何东西（含 SystemExit）。这里不报错：
+            # __new__ 路径 + 手工补字段仍然可用，只是少了自定义属性。
+            return ai_class.__new__(ai_class)  # type: ignore[misc]
+    finally:
+        sys.stdin = original_stdin
+
+
+def _make_player(camp: int, state: ProbeState) -> object:
+    """构造一个候选能正常读的 Player 对象。
+
+    为什么不能用 ``type("P", (), {...})`` 伪造
+    ------------------------------------------
+    伪造对象只在"候选恰好只读它填了的那几个字段"时才成立。实测候选写的是：
+
+        next((x for x in self._player().creature_capacity if x.type == name), None)
+
+    它把 ``creature_capacity`` 当成**可迭代的容量表**逐项看 ``.type``，而伪造
+    对象里填的是整数 99，于是 ``TypeError: 'int' object is not iterable``，
+    候选每回合都在这里崩掉，只产出一个 ``END``。探针因此只重建出 1 个决策，
+    对不上线协议的 80 个，整局 IG 静默退回 opcode_alphabet 近似。
+
+    正确做法是**用候选自己的 SDK 类型**来构造：候选包里就有 ``gameunit.py``，
+    里面的 ``Player`` / ``CreatureCapacity`` 定义了真实字段语义
+    （``creature_capacity`` 是 ``[CreatureCapacity(x) for x in player_list[3]]``，
+    每项有 ``type`` / ``available_count`` / ``cool_down_list``）。
+    直接实例化它们，字段语义就自动对齐，不用逐个猜。
+
+    拿不到 gameunit 时退回伪造对象，但把 ``creature_capacity`` 填成**列表**
+    而不是整数——宁可给一个空的可迭代对象，也不要给一个会让候选崩溃的标量。
+    """
+
+    # 候选目录已在 sys.path 首位（run() 里插入），所以这里 import 到的是
+    # 候选自己那份 gameunit，而不是框架的。
+    try:
+        import gameunit  # type: ignore[import-not-found]
+    except ImportError:
+        gameunit = None  # type: ignore[assignment]
+
+    creature_types = list(state.creatures.get(camp, ()))
+    artifact_names = list(state.artifacts.get(camp, ()) or [])
+
+    if gameunit is not None and hasattr(gameunit, "Player"):
+        try:
+            unit_types = list(getattr(gameunit, "UNIT_TYPE", []))
+            # Player(camp, player_list)，player_list 的布局见 gameunit.Player.__init__：
+            #   [0]=神器编号表 [1]=当前法力 [2]=最大法力 [3]=生物容量表 [4]=新召唤id表
+            # 生物容量表的每一项是 [种类下标, 可用数量, 冷却表]。
+            capacity_rows = []
+            for type_name in creature_types:
+                index = unit_types.index(type_name) if type_name in unit_types else 0
+                capacity_rows.append([index, 1, []])
+            if not capacity_rows:
+                # 没有已知生物时给一个空表：候选遍历到空表会正常走 next(..., None)
+                # 分支，而不是崩溃。
+                capacity_rows = []
+            player = gameunit.Player(camp, [[], 99, 99, capacity_rows, []])
+            # 神器：state 里存的是名字，SDK 里 Artifact 由编号构造，
+            # 名字对不上时留空表比塞错编号安全（候选只会认为"没有神器可用"）。
+            if artifact_names and hasattr(gameunit, "ARTIFACT_TYPE"):
+                artifact_types = list(gameunit.ARTIFACT_TYPE)
+                indices = [
+                    artifact_types.index(name)
+                    for name in artifact_names
+                    if name in artifact_types
+                ]
+                if indices:
+                    player.artifact = [gameunit.Artifact(i) for i in indices]
+            return player
+        except (AttributeError, TypeError, ValueError, IndexError):
+            # 候选改过 SDK 结构时不硬撑，退回下面的兜底对象。
+            pass
+
+    class _FallbackCapacity:
+        def __init__(self, type_name: str) -> None:
+            self.type = type_name
+            self.available_count = 1
+            self.cool_down_list: list[int] = []
+
+    return type(
+        "P",
+        (),
+        {
+            "camp": camp,
+            "mana": 99,
+            "max_mana": 99,
+            "artifact": [],
+            # 关键：必须是可迭代对象。填标量会让候选在遍历处崩溃。
+            "creature_capacity": [_FallbackCapacity(name) for name in creature_types],
+            "new_summoned_id_list": [],
+        },
+    )()
+
+
 def _probe_actions(ai_class: type, state: ProbeState, camp: int, sdk_map: object) -> list[str]:
     """让候选面对这个局面做决策，返回它发出的操作序列。
 
@@ -435,19 +572,17 @@ def _probe_actions(ai_class: type, state: ProbeState, camp: int, sdk_map: object
 
     recorded: list[str] = []
 
-    instance = ai_class.__new__(ai_class)  # type: ignore[misc]
-    # 绕过 __init__（它会 read_opt() 读 stdin）。手工补齐 play() 依赖的字段：
-    # 字段名取自 ai_client.AiClient —— 阵营叫 my_camp，不是 camp。
+    instance = _new_instance(ai_class)
+    # 手工补齐 play() 依赖的框架字段：字段名取自 ai_client.AiClient
+    # —— 阵营叫 my_camp，不是 camp。这些一律**覆盖**候选 __init__ 里的值，
+    # 因为它们描述的是"当前局面"，必须来自回放重建的状态。
     instance.map = sdk_map  # type: ignore[attr-defined]
     instance.round = state.round  # type: ignore[attr-defined]
     instance.my_camp = camp  # type: ignore[attr-defined]
     instance.camp = camp  # type: ignore[attr-defined]
     instance.artifacts = list(state.artifacts.get(camp, ()) or ["HolyLight"])  # type: ignore[attr-defined]
     instance.creatures = list(state.creatures.get(camp, ()))  # type: ignore[attr-defined]
-    instance.players = [  # type: ignore[attr-defined]
-        type("P", (), {"camp": 0, "mana": 99, "artifact": None, "creature_capacity": 99})(),
-        type("P", (), {"camp": 1, "mana": 99, "artifact": None, "creature_capacity": 99})(),
-    ]
+    instance.players = [_make_player(0, state), _make_player(1, state)]  # type: ignore[attr-defined]
     instance.player = instance.players[camp]  # type: ignore[attr-defined]
     instance.operations = []  # type: ignore[attr-defined]
 
@@ -503,9 +638,24 @@ def _probe_actions(ai_class: type, state: ProbeState, camp: int, sdk_map: object
             # 但**完全吞掉**会让"探针环境没搭全"伪装成"候选很消极"：
             # 实测漏填 map.miracles 时候选每回合都在几何计算处抛异常，
             # 表现为空动作占比 100%，极难归因。
+            #
+            # 只打异常类型和消息是不够的：``TypeError: 'int' object is not
+            # iterable`` 这种消息完全看不出是**哪个字段**类型不对。所以把
+            # traceback 里落在候选代码内的最后一帧也带上（文件名 + 行号 + 源码），
+            # 那一行几乎总是直接指向探针少填或填错的字段。
+            frames = traceback.extract_tb(error.__traceback__)
+            location = ""
+            for frame in reversed(frames):
+                # 跳过探针自身的帧，只报候选代码里的位置。
+                if Path(frame.filename).name != Path(__file__).name:
+                    location = (
+                        f" at {Path(frame.filename).name}:{frame.lineno} "
+                        f"in {frame.name}(): {(frame.line or '').strip()[:120]}"
+                    )
+                    break
             print(
                 f"[miracle-probe] candidate play() raised "
-                f"{type(error).__name__}: {error}",
+                f"{type(error).__name__}: {error}{location}",
                 file=sys.stderr,
             )
     return recorded or ["END"]

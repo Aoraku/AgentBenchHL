@@ -1,0 +1,11 @@
+# Claude Opus 5 —— 待接。
+#
+# ⚠️ base_url 与 key 待确认。走 codex harness 时它仍然要一个 /responses
+# 兼容端点；如果中转站只提供 Anthropic 原生协议，就得改用 harness: cc。
+model: opus-5
+base_url: https://api.teamorouter.com/v1
+api_key_env: ABHL_KEY_OPUS5
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 400000

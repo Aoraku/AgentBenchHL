@@ -82,6 +82,65 @@ ZHIPU_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "experimental_supported_tools": [],
         "input_modalities": ["text"],
     },
+    # glm-5.2 / glm-5：中转站上同样在售，实测 /responses 与 /chat/completions
+    # 都返回 200。必须一并声明——只要 catalog 里没有，codex 就会打印
+    # "Unknown model … will use fallback model metadata" 并改用兜底元数据，
+    # 于是压缩会在一个我们没设过、也看不到的上下文点上触发。
+    # 上下文窗口按官方文档给 200k（低于 5.3 的 1M）。
+    {
+        "slug": "glm-5.2",
+        "display_name": "glm-5.2",
+        "description": "Z.ai GLM-5.2",
+        "default_reasoning_level": "max",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Light reasoning"},
+            {"effort": "high", "description": "Enhanced reasoning"},
+            {"effort": "max", "description": "Deep reasoning"},
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 2,
+        "base_instructions": "",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "context_window": 204800,
+        "max_context_window": 204800,
+        "effective_context_window_percent": 95,
+        "supports_parallel_tool_calls": True,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+    },
+    {
+        "slug": "glm-5",
+        "display_name": "glm-5",
+        "description": "Z.ai GLM-5",
+        "default_reasoning_level": "max",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Light reasoning"},
+            {"effort": "high", "description": "Enhanced reasoning"},
+            {"effort": "max", "description": "Deep reasoning"},
+        ],
+        "shell_type": "shell_command",
+        "visibility": "list",
+        "supported_in_api": True,
+        "priority": 3,
+        "base_instructions": "",
+        "supports_reasoning_summaries": True,
+        "default_reasoning_summary": "none",
+        "support_verbosity": False,
+        "apply_patch_tool_type": "freeform",
+        "truncation_policy": {"mode": "bytes", "limit": 10000},
+        "context_window": 204800,
+        "max_context_window": 204800,
+        "effective_context_window_percent": 95,
+        "supports_parallel_tool_calls": True,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+    },
 )
 
 MODEL_CATALOGS: dict[str, tuple[dict[str, object], ...]] = {"zhipu": ZHIPU_MODEL_CATALOG}

@@ -120,6 +120,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="离线重算 behavioral IG（精确 |A(s)|）")
     parser.add_argument("run_root")
     parser.add_argument("--write", action="store_true", help="把结果写进 run 目录")
+    parser.add_argument(
+        "--agentbench-root",
+        default=None,
+        help="A 仓路径；省略时从 run-config.json 的 paths.agentbench_root 读。"
+        "rollman 这类候选包不自带后端 core/ 的游戏必须有它，否则探针失败并静默退回近似口径",
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root).expanduser().resolve()
@@ -128,8 +134,19 @@ def main() -> int:
     if not game:
         print("无法从 run-config.json 判断游戏名")
         return 1
+
+    # 探针定位后端要用它。之前这里完全没传，导致 rollman 的重算全轮失败
+    # （"cannot locate rollman backend core/ package"），而失败在汇总里
+    # 只表现为"没有可重算的轮次"，很容易被当成数据缺失而不是配置缺失。
+    agentbench_root = args.agentbench_root or (
+        (config.get("paths") or {}).get("agentbench_root")
+    )
+    agentbench_root = Path(agentbench_root).expanduser().resolve() if agentbench_root else None
+    if agentbench_root is not None and not agentbench_root.is_dir():
+        print(f"⚠ agentbench_root 不存在：{agentbench_root}（探针可能因此失败）")
+
     epsilon = _epsilon(run_root)
-    print(f"run={run_root.name} game={game} epsilon={epsilon}\n")
+    print(f"run={run_root.name} game={game} epsilon={epsilon} agentbench_root={agentbench_root}\n")
 
     header = (
         f"{'it':>3} {'candidate':<26} {'ig_近似':>9} {'ig_精确':>9} {'Δ':>8} "
@@ -167,7 +184,11 @@ def main() -> int:
                 continue
             try:
                 sizes = [int(item) for item in probe_support_sizes(
-                    str(game), baseline_root, replay, str(case["role"])
+                    str(game),
+                    baseline_root,
+                    replay,
+                    str(case["role"]),
+                    agentbench_root=agentbench_root,
                 )]
             except Exception as error:  # noqa: BLE001 - 探针失败要如实跳过并说明
                 print(f"  it{iteration} {case['role']}: 探针失败 {type(error).__name__}: {error}")

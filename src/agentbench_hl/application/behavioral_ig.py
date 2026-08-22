@@ -68,10 +68,22 @@ SupportProvider = Callable[[Path, Path, str], Sequence[int]]
 #:
 #: 两者的计数口径天然差一点：探针按回放记录数走，线协议按选手实际回复的帧数走，
 #: 尾帧（终局通知）常常只出现在后者。实测 antwar 是 246 vs 247。
-#: 缺口在这个容差内就用探针给出的精确值、尾部按位置退回字母表；
+#: 缺口在容差内就用探针给出的精确值、尾部按位置退回字母表；
 #: 超过它才认为"决策点定义没对上"并整体回落——那种情况下把错位的 |A(s)| 套上去，
 #: 会得到一个看似精确的错数，比诚实回落更糟。
 SUPPORT_ALIGN_ABS_TOLERANCE = 2
+
+#: 相对容差。缺口不超过线协议决策数的这个比例也算对齐。
+#:
+#: 为什么需要它：不同游戏的回放省略的帧数不同，绝对容差没法一刀切。
+#: 实测 generals 是 142 vs 155（缺 13，约 8.4%）——回放里 P0 的部分回合被系统行
+#: 和终局帧吃掉了，而这 142 个决策点本身是**逐个用官方判定枚举出来的精确值**。
+#: 用 1% 的容差会把它们全部丢掉、退回常量 |A|=8，白扔掉真实信息。
+#:
+#: 上限定在 10%：再宽就不能排除"决策点定义真的没对上"了。而且这一层是安全的——
+#: 缺口部分由 ``wire_decision_samples`` 按位置自动退回字母表常量，
+#: 不会把错位的 |A(s)| 套到没探到的决策点上。
+SUPPORT_ALIGN_REL_TOLERANCE = 0.10
 
 
 @dataclass(frozen=True)
@@ -474,7 +486,10 @@ def _measure_case_inner(
             # ``wire_decision_samples`` 自动退回字母表常量（它本来就按位置降级）；
             # 缺口过大才说明两者的决策点定义没对上，那时仍然整体回落。
             gap = len(episode.decisions) - len(probed)
-            tolerance = max(SUPPORT_ALIGN_ABS_TOLERANCE, int(len(episode.decisions) * 0.01))
+            tolerance = max(
+                SUPPORT_ALIGN_ABS_TOLERANCE,
+                int(len(episode.decisions) * SUPPORT_ALIGN_REL_TOLERANCE),
+            )
             if gap <= 0:
                 support_sizes = tuple(int(value) for value in probed[: len(episode.decisions)])
                 support_mode = "exact_enumeration"

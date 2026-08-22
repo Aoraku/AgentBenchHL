@@ -21,6 +21,7 @@ antwar 的官方 SDK 经济结算与后端不一致（见 ``AgentBench/games/ant
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -37,13 +38,30 @@ def _worker_path(game: str) -> Path | None:
     return root if root.is_file() else None
 
 
-def _run_worker(worker: Path, candidate: Path, replay: Path, role: str) -> list[dict]:
+def _run_worker(
+    worker: Path,
+    candidate: Path,
+    replay: Path,
+    role: str,
+    *,
+    agentbench_root: Path | None = None,
+) -> list[dict]:
     """在**子进程**里跑探针。
 
     必须是子进程：探针要 ``import ai``（候选自己写的模块）并把候选目录塞进
     ``sys.path``。在框架进程里做这件事会污染框架自身的模块表，
     而且连续两轮的候选同名模块会互相覆盖 —— 那种 bug 极难查。
+
+    ``AGENTBENCH_ROOT`` 必须显式传给子进程：部分游戏（rollman）的候选包
+    **不自带**后端 ``core/``（棋盘与合法动作枚举都在里面），探针要靠这个
+    环境变量去 A 仓定位。候选快照在 ``runs/<run>/snapshots/`` 下，
+    从那里向上找不到 AgentBench，所以没有这个变量探针就只能失败——
+    而失败会被上层当作"没有探针"静默回落到字母表近似。
     """
+
+    environment = dict(os.environ)
+    if agentbench_root is not None:
+        environment["AGENTBENCH_ROOT"] = str(Path(agentbench_root).resolve())
 
     completed = subprocess.run(
         [
@@ -63,6 +81,7 @@ def _run_worker(worker: Path, candidate: Path, replay: Path, role: str) -> list[
         timeout=WORKER_TIMEOUT_S,
         check=False,
         cwd=str(candidate),
+        env=environment,
     )
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip().splitlines()
@@ -77,7 +96,14 @@ def _run_worker(worker: Path, candidate: Path, replay: Path, role: str) -> list[
     raise RuntimeError("policy trace worker produced no AGENTBENCH_POLICY_TRACE line")
 
 
-def support_sizes(game: str, candidate: Path, replay: Path, role: str) -> Sequence[int]:
+def support_sizes(
+    game: str,
+    candidate: Path,
+    replay: Path,
+    role: str,
+    *,
+    agentbench_root: Path | None = None,
+) -> Sequence[int]:
     """该局每个决策点的真实 |A(s)|；拿不到就返回空序列（上层回落到字母表）。
 
     一个决策点可能提交多个原子动作，``legal_supports`` 因此是个列表。
@@ -89,7 +115,9 @@ def support_sizes(game: str, candidate: Path, replay: Path, role: str) -> Sequen
     if worker is None:
         return ()
     sizes: list[int] = []
-    for decision in _run_worker(worker, candidate, replay, role):
+    for decision in _run_worker(
+        worker, candidate, replay, role, agentbench_root=agentbench_root
+    ):
         supports = decision.get("legal_supports")
         if not isinstance(supports, list) or not supports:
             return ()
@@ -100,13 +128,19 @@ def support_sizes(game: str, candidate: Path, replay: Path, role: str) -> Sequen
     return sizes
 
 
-def provider_for(game: str):
-    """按游戏拿一个 ``SupportProvider``；该游戏没有探针就返回 None。"""
+def provider_for(game: str, *, agentbench_root: Path | None = None):
+    """按游戏拿一个 ``SupportProvider``；该游戏没有探针就返回 None。
+
+    ``agentbench_root`` 会透传给探针子进程（见 ``_run_worker``）：
+    不自带后端 ``core/`` 的游戏靠它定位 A 仓，缺了就只能静默回落到近似口径。
+    """
 
     if _worker_path(game) is None:
         return None
 
     def provide(candidate: Path, replay: Path, role: str) -> Sequence[int]:
-        return support_sizes(game, candidate, replay, role)
+        return support_sizes(
+            game, candidate, replay, role, agentbench_root=agentbench_root
+        )
 
     return provide

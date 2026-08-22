@@ -1,0 +1,12 @@
+# DeepSeek V4 Pro —— 待接。
+#
+# ⚠️ base_url 与 key 待确认。非 OpenAI 家模型，接通后要确认 codex 是否
+# 认识它的元数据；不认识就得像 glm 那样补一个 catalog，
+# 否则上下文窗口与压缩阈值全走兜底值。
+model: deepseek-v4-pro
+base_url: https://api.deepseek.com/v1
+api_key_env: ABHL_KEY_DEEPSEEK
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 90000

@@ -1,0 +1,10 @@
+# Qwen3.8 —— 待接。
+#
+# ⚠️ base_url 与 key 待确认。非 OpenAI 家模型，同 deepseek 的 catalog 注意事项。
+model: qwen3.8
+base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key_env: ABHL_KEY_QWEN
+harness: codex
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 90000

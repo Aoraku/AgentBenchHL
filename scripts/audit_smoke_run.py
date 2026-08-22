@@ -19,6 +19,8 @@
 4. 读回放：agent 是否真的读过本轮下发的回放叙述
 5. 真实策略：候选代码是否有实质差异（不只是注释/空白）
 6. 精确 IG：support_mode 是否为精确枚举而非字母表近似
+7. IG 样本量：每轮实际比较的决策点数是否够多——"口径精确"和"有分辨力"是两件事，
+   只有 1 个决策点时 KL 只能取 0 或 ln(|A|/ε)，数值正常但没有信息
 
 另外报告"是否有提升"，但**不作为合格判据**——4 轮烟测的目的是验证链路，
 样本量根本不足以证明学习效果，把它当门槛会得出错误结论。
@@ -159,6 +161,41 @@ def _strip_cosmetics(source: str) -> str:
     return "\n".join(lines)
 
 
+def _ig_decision_counts(run_root: Path) -> dict[int, int]:
+    """每轮 IG 实际比较了多少个决策点。
+
+    决策点数量是 KL 的分母，也是这个指标有没有分辨力的唯一依据。
+    从 ``behavioral-ig/trace-NNNN.json`` 直接读，而不是信任汇总字段——
+    汇总里只有 IG 数值，看不出它是几个点算出来的。
+    """
+
+    counts: dict[int, int] = {}
+    ig_dir = run_root / "behavioral-ig"
+    if not ig_dir.is_dir():
+        return counts
+    for path in sorted(ig_dir.glob("trace-*.json")):
+        match = re.search(r"trace-(\d+)", path.name)
+        if match is None:
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        total = document.get("compared_decisions")
+        if not isinstance(total, int):
+            # 退回到逐 case 求和：不同 schema 版本里汇总字段的位置变过。
+            total = 0
+            for case in document.get("cases") or []:
+                if isinstance(case, dict) and isinstance(
+                    case.get("compared_decisions"), int
+                ):
+                    total += int(case["compared_decisions"])
+        counts[int(match.group(1))] = total
+    return counts
+
+
 def audit(run_root: Path, *, expected_iterations: int) -> dict[str, Any]:
     events = _events(run_root)
     by_type = Counter(str(event.get("event_type")) for event in events)
@@ -277,6 +314,36 @@ def audit(run_root: Path, *, expected_iterations: int) -> dict[str, Any]:
         exact >= 1,
         f"support_mode {dict(modes)}" if modes else "没有任何 support_mode 记录",
     )
+
+    # --------------------------------------------------- 7 IG 的决策点样本量
+    #
+    # "口径是精确枚举"和"这个 IG 有分辨力"是两件事。KL 的分母是决策点数量：
+    # 只有 1 个决策点时，disagreement_rate 只能取 0 或 1，KL 只能取 0 或
+    # ln(|A|/ε) 那个上限常数——数值看着正常，实际没有任何信息。
+    #
+    # 实测 rollman 的 r4 就栽在这里：连续两轮 IG 都是 6.14451（常数），
+    # 第 4 轮变 0.0，而 support_mode 一直写着 exact_enumeration，
+    # 原先的第 6 项检查全部通过。根因是同轨互殴让影子局 0 回合结束。
+    #
+    # 阈值 20 的来由：健康的 run 实测在 71~119 个决策点（generals）、
+    # 80~88 个（miracle），量级差异明显，20 足以区分"跑起来了"和"没跑起来"。
+    decision_counts = _ig_decision_counts(run_root)
+    if decision_counts:
+        smallest = min(decision_counts.values())
+        median_decisions = sorted(decision_counts.values())[len(decision_counts) // 2]
+        check(
+            "IG 决策点样本量足够",
+            smallest >= 20,
+            f"逐轮决策点 {decision_counts}（最少 {smallest}，中位 {median_decisions}）"
+            + (
+                "；⚠ 决策点过少说明影子局没真正打起来（例如分轨游戏的同轨互殴），"
+                "此时 KL 退化成二值常数"
+                if smallest < 20
+                else ""
+            ),
+        )
+    else:
+        check("IG 决策点样本量足够", False, "读不到任何 trace 的决策点数")
 
     # ------------------------------------------------- 提升（只报告，不作门槛）
     trend = [

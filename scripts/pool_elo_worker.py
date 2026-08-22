@@ -149,8 +149,26 @@ def _read_events(run_root: Path) -> list[dict[str, object]]:
     return events
 
 
-def discover_jobs(run_root: Path) -> list[Job]:
-    """从 run 的事件流找出所有可评测版本，按优先级排好序。"""
+def discover_jobs(
+    run_root: Path,
+    *,
+    best_only: bool = False,
+    iteration_stride: int = 1,
+) -> list[Job]:
+    """从 run 的事件流找出所有可评测版本，按优先级排好序。
+
+    ``best_only`` / ``iteration_stride`` 是**成本闸门**。全量评测的代价是
+    版本数 × 池规模 × 2 座次：一个 40 轮 run（172 个候选）打 94 人的 antwar 池
+    要 32k 局，按实测单局 1.9~16.6s 折算需要几十小时机时。
+
+    学习曲线真正需要的是"演进主线"——每轮**被选中**的那个候选，因为落选候选
+    是探索性分支，不构成后续迭代的基础。再按 ``iteration_stride`` 每 N 轮取一点，
+    曲线形状不变（相邻轮次的静态池 Elo 差异远小于 ±50 的标准误），
+    成本降一个数量级。
+
+    注意：这里**不做插值**。跳过的轮次在图上就是没有点，
+    而不是画一条假装测过的连线。
+    """
 
     events = _read_events(run_root)
     snapshots: dict[str, Path] = {}
@@ -192,6 +210,17 @@ def discover_jobs(run_root: Path) -> list[Job]:
         for candidate, path in snapshots.items()
         if (path / "main.py").is_file()
     ]
+    if best_only:
+        jobs = [job for job in jobs if job.is_best]
+    if iteration_stride > 1:
+        # 第 1 轮总是保留：它是曲线的起点（"从零开始有多强"），不能被步长跳掉。
+        jobs = [
+            job
+            for job in jobs
+            if job.iteration is None
+            or job.iteration == 1
+            or job.iteration % iteration_stride == 0
+        ]
     jobs.sort(key=lambda job: (job.priority, job.candidate_id))
     return jobs
 
@@ -293,6 +322,9 @@ def run_worker(
     timeout_s: float,
     poll_s: float,
     once: bool,
+    best_only: bool = False,
+    iteration_stride: int = 1,
+    challenger_track: str | None = None,
     log=print,
 ) -> int:
     queue_root = run_root / QUEUE_DIRNAME
@@ -304,10 +336,17 @@ def run_worker(
         f"指纹 {pool.fingerprint}"
     )
     log(f"[pool-elo] CPU {cpu_count()} 核，给主迭代预留 {headroom} 核")
+    if best_only or iteration_stride > 1:
+        log(
+            f"[pool-elo] 采样口径：{'仅各轮最佳候选' if best_only else '全部候选'}"
+            f"，每 {iteration_stride} 轮取一点（第 1 轮总是保留）"
+        )
 
     evaluated = 0
     while True:
-        jobs = discover_jobs(run_root)
+        jobs = discover_jobs(
+            run_root, best_only=best_only, iteration_stride=iteration_stride
+        )
         pending = [job for job in jobs if not is_done(queue_root / job.candidate_id, pool)]
         _write_status(
             queue_root,
@@ -355,6 +394,34 @@ def run_worker(
             if finished % 50 == 0 or finished == total:
                 log(f"[pool-elo]   进度 {finished}/{total} 局（最近 {challenger_id}）")
 
+        iteration_of = {job.candidate_id: job for job in pending}
+
+        def version_done(document: dict[str, object]) -> None:
+            """一个版本刚跑完就补迭代序号并刷新索引。
+
+            为什么不等整批：一批 172 个版本 × 188 局 ≈ 32k 局要跑二十几小时。
+            若只在整批结束时才落盘，中途看不到任何完成版本、也无法出图，
+            worker 一旦重启还得从头再来。逐版本落盘让"跑完的立刻可用"。
+            """
+
+            challenger_id = str(document.get("challenger_id"))
+            job = iteration_of.get(challenger_id)
+            if job is not None:
+                document["iteration"] = job.iteration
+                document["is_best_of_iteration"] = job.is_best
+                (queue_root / challenger_id / SUMMARY_FILENAME).write_text(
+                    json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
+            log(
+                f"[pool-elo] ✓ {challenger_id} (iter {document.get('iteration')}): "
+                f"elo={document.get('elo')} 名次=#{document.get('pool_rank')} "
+                f"胜率={document.get('win_rate')} "
+                f"局数={document.get('complete_matches')}"
+            )
+            write_index(queue_root, pool)
+
         try:
             documents = evaluate_many(
                 game,
@@ -367,7 +434,9 @@ def run_worker(
                 parallel=parallel,
                 cpus_per_match=cpus_per_match,
                 timeout_s=timeout_s,
+                challenger_track=challenger_track,
                 on_match=progress,
+                on_version_done=version_done,
                 before_match=lambda: wait_for_idle_cpu(
                     headroom=headroom, poll_s=poll_s, log=log
                 ),
@@ -382,28 +451,24 @@ def run_worker(
             time.sleep(poll_s)
             continue
 
-        # 迭代序号是队列侧的知识（来自 run 的事件流），补写进结果里，
-        # 这样 index.json 能直接按轮次画曲线。
-        iteration_of = {job.candidate_id: job for job in pending}
+        # 逐版本的落盘与日志已经由 version_done 回调在"该版本刚跑完"时做过了。
+        # 这里只补最终统计与索引（回调里若因中断没跑到，这里兜底）。
         for document in documents:
             challenger_id = str(document.get("challenger_id"))
             job = iteration_of.get(challenger_id)
             if job is None:
                 continue
-            document["iteration"] = job.iteration
-            document["is_best_of_iteration"] = job.is_best
-            (queue_root / challenger_id / SUMMARY_FILENAME).write_text(
-                json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            if document.get("iteration") is None:
+                document["iteration"] = job.iteration
+                document["is_best_of_iteration"] = job.is_best
+                (queue_root / challenger_id / SUMMARY_FILENAME).write_text(
+                    json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True)
+                    + "\n",
+                    encoding="utf-8",
+                )
             if not document.get("partial"):
                 evaluated += 1
-            log(
-                f"[pool-elo] 完成 {challenger_id} (iter {job.iteration}): "
-                f"elo={document.get('elo')} 名次=#{document.get('pool_rank')} "
-                f"胜率={document.get('win_rate')} "
-                f"W-D-L={document.get('wins')}-{document.get('draws')}-{document.get('losses')}"
-            )
+        log(f"[pool-elo] 本批结束：{evaluated} 版完整跑完")
         write_index(queue_root, pool)
         if once:
             return 0
@@ -433,6 +498,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll-s", type=float, default=30.0)
     parser.add_argument("--once", action="store_true", help="只评测一个版本就退出（便于验证）")
     parser.add_argument("--index-only", action="store_true", help="只重建 index.json 后退出")
+    parser.add_argument(
+        "--best-only",
+        action="store_true",
+        help="只测各轮被选中的最佳候选（演进主线）；落选候选是探索分支，不构成后续迭代基础",
+    )
+    parser.add_argument(
+        "--iteration-stride",
+        type=int,
+        default=1,
+        help="每 N 轮取一个版本评测（第 1 轮总是保留）。相邻轮次的静态池 Elo "
+        "差异远小于 ±50 标准误，抽样不改变曲线形状但成本降一个数量级",
+    )
+    parser.add_argument(
+        "--challenger-track",
+        default=None,
+        help="非对称（分轨）游戏必填，例如 rollman 可选 rollman / ghost。"
+        "指挑战者**自己扮演**的角色，它会去打对位轨的选手",
+    )
     arguments = parser.parse_args(argv)
 
     run_root = arguments.run_root.resolve()
@@ -457,6 +540,9 @@ def main(argv: list[str] | None = None) -> int:
         timeout_s=arguments.timeout_s,
         poll_s=arguments.poll_s,
         once=arguments.once,
+        best_only=arguments.best_only,
+        iteration_stride=max(1, arguments.iteration_stride),
+        challenger_track=arguments.challenger_track,
     )
 
 

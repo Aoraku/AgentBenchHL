@@ -1,31 +1,34 @@
-"""烟测曲线：4 轮迭代能画出什么、不能画出什么。
+"""烟测曲线：短 run 能画出什么、不能画出什么。
 
 与 ``plot_learning_curves.py`` 的关系
 ------------------------------------
-那个脚本画的是**主线实验**的学习曲线，胜率与 Elo 都取自"每个版本独立打完
-冻结人类池"的实测结果（``pool-elo/index.json``）。那需要每版 188~458 局，
-不是 4 轮烟测该做的事。
+那个脚本画的是**主线实验**的曲线，胜率与 Elo 都以"每个版本独立打完冻结人类池"
+的实测结果为标尺（``pool-elo/index.json``）。那需要每版 188~458 局，
+不是几轮烟测该做的事。
 
-烟测只有 4 轮 × k 个候选 × 少量对局，能诚实支撑的只有这几条：
+烟测只有几轮 × b 个对手，能诚实支撑的只有这几条：
 
-* **对当轮对手的胜率**：注意它的口径是"对固定的那一个对手"，
-  不是"在人类池里的位置"。烟测固定打同一个名次，所以跨轮可比；
-* **分差**：连续量，比胜率灵敏得多——4 轮里胜率可能一直是 0，
-  但分差在收窄就说明方向对了；
-* **behavioral IG**：精确支撑集下的决策分布 KL；
-* **token 消耗**：累计 + 逐轮增量。
+* **对当轮对手的胜率**：口径是"对本轮那 b 个对手"。b>1 时它有
+  0 / 1/b / … / 1 的分辨率；b=1 时只有 {0, 0.5, 1} 三档，几乎必然画成直线
+  （实测 4 个游戏四轮胜率恒 0、rollman 恒 1）。
+* **分差**：连续量，比胜率灵敏得多——几轮里胜率可能一直是 0，
+  但分差在收窄就说明方向对了。
+* **零成本 Elo 反解**：拿本轮那 b 局 + 冻结池锚点反解。b 个不同强度的对手
+  一起约束时比单个对手稳，但样本仍然只有 b 局，只看趋势。
+* **token 消耗**：每轮增量 + 累计。
 
-**不画静态池 Elo**：4 轮里每个候选只打 4 局，反解出的 Elo 会被正则先验顶到
+**不画全池实测 Elo**：几轮里每个候选只打 b 局，反解出的 Elo 会被正则先验顶到
 固定值，没有分辨力（实测 2 局估计与 188 局实测最大差 15 个名次）。
 硬画一条只会被误读。
 
-所以这张图的标题里必须写明"烟测口径"，避免和主线曲线混看。
+**不画 IG**：信息增益已从主线指标移除。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,12 +38,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from plot_fonts import sans_serif_stack  # noqa: E402
+
 METRICS_EVENT = "IterationMetricsFinalized"
 
 COLORS = {
     "win_rate": "#1f77b4",
     "margin": "#2ca02c",
-    "ig": "#8c564b",
+    "elo": "#ff7f0e",
     "tokens": "#e377c2",
 }
 TOKEN_BAR_COLOR = "#c5b0d5"
@@ -48,13 +57,7 @@ REFERENCE_COLOR = "#d62728"
 
 plt.rcParams.update(
     {
-        "font.sans-serif": [
-            "PingFang SC",
-            "Hiragino Sans GB",
-            "Noto Sans CJK SC",
-            "WenQuanYi Zen Hei",
-            "DejaVu Sans",
-        ],
+        "font.sans-serif": sans_serif_stack(),
         "axes.unicode_minus": False,
         "axes.titlesize": 11,
         "axes.labelsize": 10,
@@ -73,9 +76,11 @@ class Point:
     win_rate: float | None
     margin_mean: float | None
     margin_best: float | None
-    ig: float | None
-    support_mode: str | None
+    elo: float | None
     tokens: int | None
+    tokens_delta: int | None
+    matches: int
+    opponents: int
     opponent_rank: int | None
     candidate_id: str | None
 
@@ -105,31 +110,33 @@ def _read_events(run_dir: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _tokens(events: list[dict[str, Any]]) -> dict[str, int]:
-    """全 run 累计 token：thread 段内取峰值、跨段求和。
+def _tokens(events: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """request_id → (累计 token, 该轮增量)。
 
-    事件里缓存的 ``total_tokens`` 在会话每轮轮转时只记住最贵那一段
-    （实测低估 29 倍），所以从原始用量事件重算。
+    口径：每条 ``AgentTokenUsage`` 是**一次模型请求**的花费
+    （codex 的 ``tokenUsage.last``），所以逐次相加。
+
+    历史 bug：原实现把它当"会话累计值"，按会话事件切段、段内取 max、跨段相加。
+    语义反了，实测两种错法同时出现 —— ``sota-antwar`` 连续 10 轮报同一个数
+    137631 一动不动；6 个 4 轮 run 逐轮精确翻倍
+    （snakego4: 112526 → 260286 → 520572 → 1041144）。
     """
 
-    totals: dict[str, int] = {}
-    segments: list[int] = []
-    current: int | None = None
+    totals: dict[str, tuple[int, int]] = {}
+    running = 0
+    checkpoint = 0
     for event in events:
         event_type = event.get("event_type")
         payload = event.get("payload") or {}
-        if event_type in ("GoalLedStarted", "GoalSessionReset", "GoalSessionRotated"):
-            if current is not None:
-                segments.append(current)
-            current = None
-        elif event_type == "AgentTokenUsage":
+        if event_type == "AgentTokenUsage":
             value = payload.get("total_tokens")
             if isinstance(value, int):
-                current = value if current is None else max(current, value)
+                running += value
         elif event_type == METRICS_EVENT:
             request = payload.get("request_id")
             if isinstance(request, str):
-                totals[request] = sum(segments) + (current or 0)
+                totals[request] = (running, running - checkpoint)
+                checkpoint = running
     return totals
 
 
@@ -201,6 +208,7 @@ def load_run(run_dir: Path, label: str) -> Run:
             (ranks[str(item)] for item in opponents if str(item) in ranks), default=None
         )
         recomputed = margins.get(request)
+        cumulative, delta = tokens.get(request, (None, None))
         points.append(
             Point(
                 iteration=iteration,
@@ -216,9 +224,11 @@ def load_run(run_dir: Path, label: str) -> Run:
                     if payload.get("margin_best") is not None
                     else (recomputed or {}).get("best")
                 ),
-                ig=payload.get("behavioral_ig"),
-                support_mode=payload.get("behavioral_ig_support_mode"),
-                tokens=tokens.get(request),
+                elo=payload.get("elo_vs_opponent"),
+                tokens=cumulative,
+                tokens_delta=delta,
+                matches=int(payload.get("matches") or 0),
+                opponents=len(opponents),
                 opponent_rank=opponent_rank,
                 candidate_id=payload.get("best_candidate_id"),
             )
@@ -246,13 +256,21 @@ def _xy(run: Run, x_key: str, y_key: str) -> tuple[list[float], list[float]]:
 
 def _draw_win_rate(axis, run: Run, x_key: str, x_label: str) -> None:
     xs, ys = _xy(run, x_key, "win_rate")
+    batch = max((point.opponents for point in run.points), default=0)
     axis.plot(xs, ys, marker="o", markersize=5, linewidth=1.8, color=COLORS["win_rate"],
-              label="对当轮对手胜率")
+              label=f"对当轮 {batch} 个对手的胜率" if batch else "对当轮对手胜率")
     axis.axhline(0.5, color=REFERENCE_COLOR, linestyle="--", linewidth=1.0, label="0.5 基准")
     axis.set_ylim(-0.05, 1.05)
     axis.set_xlabel(x_label)
     axis.set_ylabel("胜率")
-    suffix = f"（固定打 #{run.opponent_rank}）" if run.opponent_rank else ""
+    if run.opponent_rank and batch <= 1:
+        # b=1 时胜率只有 {0, 0.5, 1} 三档，几乎必然是直线。标题要写清楚，
+        # 否则"四轮恒 0"会被读成"这个模型完全不会玩"，而实际是分辨率不够。
+        suffix = f"（固定打 #{run.opponent_rank}，b=1 时只有 3 档取值）"
+    elif batch > 1:
+        suffix = f"（b={batch}，分辨率 1/{batch}）"
+    else:
+        suffix = ""
     axis.set_title(f"胜率{suffix}")
     axis.legend(loc="best")
 
@@ -269,22 +287,36 @@ def _draw_margin(axis, run: Run, x_key: str, x_label: str) -> None:
     axis.axhline(0.0, color=REFERENCE_COLOR, linestyle="--", linewidth=1.0, label="0（胜负分界）")
     axis.set_xlabel(x_label)
     axis.set_ylabel("终局分差")
-    axis.set_title("分差（连续奖励，比胜率灵敏）")
+    axis.set_title("分差（连续量，比胜率灵敏）")
     if xs or bx:
         axis.legend(loc="best")
 
 
-def _draw_ig(axis, run: Run, x_key: str, x_label: str) -> None:
-    xs, ys = _xy(run, x_key, "ig")
-    axis.plot(xs, ys, marker="o", markersize=5, linewidth=1.8, color=COLORS["ig"],
-              label="behavioral IG")
-    modes = {p.support_mode for p in run.points if p.support_mode}
+def _draw_elo(axis, run: Run, x_key: str, x_label: str) -> None:
+    """零成本 Elo 反解：本轮那 b 局 + 冻结池锚点。
+
+    b>1 时是**逐对手反解再平均**，比拿总胜率去配一个"平均锚点"稳得多：
+    后者在对手强度差得远时会系统性偏掉（打赢 Elo 500 的、打输 1500 的，
+    总胜率 0.5 配均值锚 1000 会报 1000，而真实水平明显更接近 500~700 那段）。
+    """
+
+    xs, ys = _xy(run, x_key, "elo")
     axis.set_xlabel(x_label)
-    axis.set_ylabel("IG (nats)")
-    label = "、".join(sorted(modes)) if modes else "无记录"
-    axis.set_title(f"行为信息增益（支撑集：{label}）")
-    if xs:
-        axis.legend(loc="best")
+    axis.set_ylabel("Elo（反解）")
+    if not xs:
+        axis.set_title("零成本 Elo 反解（本轮无锚点，未记录）")
+        return
+    sizes = [
+        14 + 3.0 * point.matches
+        for point in run.points
+        if point.elo is not None
+        and (point.iteration if x_key == "iteration" else point.trajectories_seen) is not None
+    ]
+    axis.plot(xs, ys, linewidth=1.4, color=COLORS["elo"], alpha=0.8)
+    axis.scatter(xs, ys, s=sizes, color=COLORS["elo"], edgecolor="white", linewidth=0.5,
+                 zorder=3, label="反解 Elo（点面积∝对局数）")
+    axis.set_title("零成本 Elo 反解（样本仅本轮 b 局，只看趋势）")
+    axis.legend(loc="best")
 
 
 def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
@@ -294,25 +326,32 @@ def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
     if not xs:
         axis.set_title("token 消耗")
         return
-    deltas = [ys[0]] + [max(0.0, ys[i] - ys[i - 1]) for i in range(1, len(ys))]
+    # 增量取记账里的逐轮值，不对累计曲线做差：x 轴是"看过的轨迹数"时，
+    # 相邻两点未必是相邻两轮，做差会算错。
+    deltas = [
+        float(point.tokens_delta or 0)
+        for point in run.points
+        if point.tokens is not None
+        and (point.iteration if x_key == "iteration" else point.trajectories_seen) is not None
+    ]
     bars = axis.twinx()
     bars.set_zorder(1)
     axis.set_zorder(2)
     axis.patch.set_visible(False)
     width = (max(xs) - min(xs)) / max(len(xs) * 1.5, 1) if len(xs) > 1 else 0.6
     bars.bar(xs, [v / 1000.0 for v in deltas], width=width, color=TOKEN_BAR_COLOR,
-             alpha=0.75, label="逐轮增量")
-    bars.set_ylabel("逐轮增量 token (千)")
+             alpha=0.75, label="每一轮")
+    bars.set_ylabel("逐轮 token (千)")
     bars.grid(False)
     axis.plot(xs, [v / 1_000_000.0 for v in ys], marker="o", markersize=5,
               linewidth=1.8, color=COLORS["tokens"], label="累计")
-    axis.set_title("token 消耗（线=累计，柱=逐轮增量）")
+    axis.set_title("token 消耗（线=累计，柱=每一轮）")
     lh, ll = axis.get_legend_handles_labels()
     bh, bl = bars.get_legend_handles_labels()
     axis.legend(lh + bh, ll + bl, loc="upper left")
 
 
-PANELS = (_draw_win_rate, _draw_margin, _draw_ig, _draw_tokens)
+PANELS = (_draw_win_rate, _draw_margin, _draw_elo, _draw_tokens)
 
 
 def render(run: Run, output: Path) -> Path:
@@ -320,11 +359,13 @@ def render(run: Run, output: Path) -> Path:
     for row, draw in enumerate(PANELS):
         for column, (x_key, x_label) in enumerate(X_AXES):
             draw(axes[row][column], run, x_key, x_label)
+    batch = max((point.opponents for point in run.points), default=0)
     figure.suptitle(
-        f"{run.game}　烟测口径：{len(run.points)} 轮 × 固定对手"
-        + (f" #{run.opponent_rank}" if run.opponent_rank else "")
+        f"{run.game}　烟测口径：{len(run.points)} 轮"
+        + (f" × 每轮 {batch} 个对手" if batch else "")
         + f"　人类池 {run.pool_size} 人\n"
-        "（胜率是对该固定对手的，不是人类池排名；静态池 Elo 需主线全池评测，此处不画）",
+        "（胜率与 Elo 都是对当轮对手的口径，不是人类池排名；"
+        "全池实测需主线慢评测，此处不画）",
         fontsize=12.5,
     )
     figure.tight_layout(rect=(0, 0, 1, 0.975))
@@ -336,11 +377,21 @@ def render(run: Run, output: Path) -> Path:
 
 def render_comparison(runs: list[Run], output: Path) -> Path:
     figure, axes = plt.subplots(4, 2, figsize=(14, 17))
-    styles = [("#1f77b4", "-", "o"), ("#d62728", "--", "s"), ("#2ca02c", "-.", "^")]
+    # 一游戏一色：原先只有 3 套样式循环，8 个游戏会撞色撞线型，图例分不出谁是谁。
+    styles = [
+        ("#1f77b4", "-", "o"),
+        ("#d62728", "--", "s"),
+        ("#2ca02c", "-.", "^"),
+        ("#9467bd", ":", "D"),
+        ("#ff7f0e", "-", "v"),
+        ("#17becf", "--", "P"),
+        ("#8c564b", "-.", "X"),
+        ("#e377c2", ":", "*"),
+    ]
     rows = (
         ("win_rate", "对当轮对手胜率"),
         ("margin_mean", "平均分差"),
-        ("ig", "behavioral IG (nats)"),
+        ("elo", "零成本反解 Elo"),
         ("tokens", "累计 token (百万)"),
     )
     for row_index, (y_key, y_label) in enumerate(rows):
@@ -355,7 +406,10 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
                           linestyle=linestyle, color=color, label=run.game)
             axis.set_xlabel(x_label)
             axis.set_ylabel(y_label)
-            axis.set_title(y_label)
+            # Elo 跨游戏不可比：每个游戏的人类池各自独立拟合，锚点与量纲都不同。
+            axis.set_title(
+                y_label + ("（各游戏池刻度独立，纵向不可比）" if y_key == "elo" else "")
+            )
             if y_key == "win_rate":
                 axis.set_ylim(-0.05, 1.05)
                 axis.axhline(0.5, color="0.6", linestyle=":", linewidth=1.0)
@@ -381,9 +435,11 @@ def table(run: Run) -> list[dict[str, Any]]:
             "win_rate": p.win_rate,
             "margin_mean": None if p.margin_mean is None else round(p.margin_mean, 2),
             "margin_best": None if p.margin_best is None else round(p.margin_best, 2),
-            "ig": p.ig,
-            "support_mode": p.support_mode,
+            "elo": None if p.elo is None else round(p.elo, 2),
+            "matches": p.matches,
+            "opponents": p.opponents,
             "tokens": p.tokens,
+            "tokens_delta": p.tokens_delta,
             "best_candidate_id": p.candidate_id,
         }
         for p in run.points
@@ -412,8 +468,19 @@ def main(argv: list[str] | None = None) -> int:
         for row in rows:
             print(
                 f"    iter {row['iteration']}: win={row['win_rate']} "
-                f"margin={row['margin_mean']} ig={row['ig']} "
-                f"mode={row['support_mode']}"
+                f"({row['matches']} 局 / {row['opponents']} 个对手) "
+                f"margin={row['margin_mean']} elo={row['elo']} "
+                f"tok+{row['tokens_delta']}"
+            )
+        # 胜率恒定是短 run 最常见的"看起来坏了其实是分辨率不够"，
+        # 直接在命令行点出来，省得看图的人误判。
+        rates = {row["win_rate"] for row in rows if row["win_rate"] is not None}
+        if len(rates) == 1 and rows:
+            only = next(iter(rates))
+            print(
+                f"    ⚠️ {len(rows)} 轮胜率恒为 {only}："
+                f"本轮只打了 {rows[-1]['opponents']} 个对手，分辨率不足。"
+                "看分差列是否在改善；要提高分辨率就加大 curriculum.batch。"
             )
     if len(runs) > 1:
         print(f"[compare] {render_comparison(runs, arguments.out_dir / 'smoke-compare.png')}")

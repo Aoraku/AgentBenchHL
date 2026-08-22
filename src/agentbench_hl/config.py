@@ -39,28 +39,46 @@ _ENV_SCALAR = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 SCHEMA_VERSIONS = ("1.0", "1.1")
 HARNESSES = ("codex", "cc")
 ORIGINS = ("from_scratch", "seeded")
+# 四个主设置（都可消融）+ 三个历史别名（老配置与已完成 run 要能复现）。
 OPPONENT_POLICIES = (
+    "random",
+    "self",
+    "progress",
+    "fix",
+    # ---- 历史别名 ----
     "self_decide",
     "fixed_top",
-    "fixed_rank",
-    "random",
-    "k_random",
     "ladder_up",
     "ladder_down",
+    "fixed_rank",
     "k_diverse",
-    "adaptive",
 )
 SEED_MODES = ("fixed", "generalize")
 CODE_CONSTRAINTS = ("any", "if_else")
 ITERATION_MODES = ("lockstep", "goal_autonomous")
-# 实验 4 的消融：agent 能看到多少自己的历史。
-#   full        : 常驻会话 + 经验文档 + 历次版本（默认）
-#   no_notes    : 只关掉经验文档（保留会话与历史代码）
-#   memoryless  : 每轮全新会话，只给当前父版本代码 + 上一轮反馈（无经验、无对话历史）
-HISTORY_MODES = ("full", "no_notes", "memoryless")
+# 历史可见性（超参数 2）。两个主设置：
+#   full        : 能看到所有历史迭代（常驻会话 + 经验文档 + 历次版本代码）
+#   last_only   : 只能看到上一版（每轮全新会话，工作区只留当前策略 + 最近一份反馈）
+#
+# ``last_only`` 下框架还会**要求策略写在单文件里**。这不是洁癖：
+# 如果允许 ``v3.py import v2``，那"只能看到上一版"就被 import 链绕过了——
+# agent 读一下 v2.py 就等于看到了历史，消融失效且从曲线上看不出来。
+# 单文件约束让"上一版"这四个字有唯一含义：工作区里那一个 main.py 就是全部历史。
+#
+# ``no_notes`` / ``memoryless`` 是历史别名：前者只关经验文档，后者等价 last_only。
+HISTORY_MODES = ("full", "last_only", "no_notes", "memoryless")
 # 与 adapters/contract/pool.py 保持一致：crawled 是正名，official 是弃用别名。
 LADDER_SCOPES = ("auto", "crawled", "official", "reference", "measured")
 ISOLATION_BACKENDS = ("auto", "seatbelt", "bubblewrap", "docker", "disabled")
+
+# 最大迭代轮数的默认值与"不设上限"的固定含义。
+#
+# 为什么"不设上限"要落成一个具体数字：``max_iterations: null`` 曾经表示"无限跑，
+# 靠预算停"。但 token 预算在记账修好之前是失效的（见 goal_led_service._token_total
+# 的详注），于是"不设上限"实际等于"跑到人手动杀掉"，不同 run 的轮数不可比。
+# 现在固定：不写 = 32 轮；显式要"不设上限" = 128 轮。两者都是可复现的数字。
+DEFAULT_MAX_ITERATIONS = 32
+UNBOUNDED_MAX_ITERATIONS = 128
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -200,13 +218,57 @@ class ProviderConfig:
     model_catalog: str | None = None
 
 
+# 模型档案库：``configs/models/<name>.yaml``。
+#
+# 为什么模型要独立成文件
+# --------------------
+# 主表要横向比 7 个模型（gpt5.6 / opus5 / deepseek-v4-pro / qwen3.8 /
+# longcat-2.0 / glm-5.3 / kimi-k3），而它们的**中转站、api key 环境变量、
+# 上下文窗口、model_catalog 全都不一样**。如果这些散在每个实验配置里，
+# 换一个模型就要改 5 个字段，而且很容易漏掉一个 —— 漏掉 context_window
+# 的后果是 codex 用兜底元数据、压缩在看不见的点触发并打死整个 run。
+#
+# 独立成档案之后，实验配置里只写 ``provider.model_profile: glm-5.3``，
+# 剩下的从档案取。同一个模型换中转站只改一处，所有实验自动跟上。
+MODEL_PROFILES_DIRNAME = "models"
+
+
+def _model_profiles_root(config_path: Path) -> Path:
+    """``configs/experiments/x.yaml`` → ``configs/models/``。"""
+
+    return config_path.resolve().parents[1] / MODEL_PROFILES_DIRNAME
+
+
+def _load_model_profile(name: str, root: Path) -> Mapping[str, object]:
+    path = root / f"{name}.yaml"
+    if not path.is_file():
+        available = sorted(item.stem for item in root.glob("*.yaml")) if root.is_dir() else []
+        raise ValueError(
+            f"unknown provider.model_profile {name!r}: {path} not found"
+            + (f"; available: {available}" if available else "")
+        )
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    profile = _mapping(document, f"model profile {name}")
+    for required in ("model", "base_url", "api_key_env"):
+        if not profile.get(required):
+            raise ValueError(f"model profile {name} must define {required}")
+    return profile
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     codex_binary: str
     branch_width: int
     max_iterations: int | None
     network_access: str
-    rollout_k: int = 4
+    # 每轮候选数。默认 1：一轮只写一个策略，拿它去打 ``curriculum.batch`` 个对手。
+    #
+    # 为什么默认从 4 改成 1：见 application/opponent_policy.py 顶部的详注。
+    # 简版是 k=4 的"多样性"在硬约束下退化成同一份代码改几个阈值，一轮花 4 倍
+    # 对局开销只探到 1 个点；而固定打同一个对手让胜率曲线变成一条直线
+    # （实测 4 个游戏四轮胜率恒 0、一个恒 1）。k=1 × b 个对手把探索预算
+    # 从"写 4 个相似版本"移到"拿 1 个版本收 4 份不同证据"。
+    rollout_k: int = 1
     match_parallelism: int = 1
     # 单局墙钟上限。默认 1800s，而不是原来硬编码的 420s——
     # 各游戏单局长度差一个数量级：miracle 一局 7s，snakego 一局实测 246s，
@@ -296,13 +358,18 @@ class PathConfig:
 class CurriculumConfig:
     order: str
     development_seeds: tuple[int, ...]
-    opponent_policy: str = "self_decide"
+    opponent_policy: str = "progress"
+    # 一轮打几个对手（超参数 3 的 b）。默认 4，可消融。
+    #
+    # 这是 k=1 之后新的探索宽度旋钮：一轮只出一个策略，但让它面对 b 个不同的
+    # 对手。b=1 时各策略退化成原来的单目标形态（progress 就是 ladder_up）。
+    batch: int = 4
     opponent_rank: int | None = None
     seed_mode: str = "fixed"
-    # 有序征服课程（ladder_up / ladder_down）的起点名次与"打赢了才换人"的判据。
+    # 有序征服课程（progress / ladder_*）的起点名次与"打赢了才换人"的判据。
     opponent_start_rank: int | None = None
     advance_min_matches: int = 2
-    advance_win_rate: float = 0.6
+    advance_win_rate: float = 0.75
     advance_streak: int = 1
     # 对手榜单口径：auto = measured → reference → official 逐选手回落。
     # 默认 auto（measured → reference → crawled 逐选手回落）。
@@ -313,20 +380,28 @@ class CurriculumConfig:
 
 @dataclass(frozen=True)
 class MeasurementConfig:
-    epsilon: float
-    # 逐轮信息增益（配对影子对局）。关掉可省每轮 N 局基线对局，但曲线会变 null。
-    information_gain: bool = True
-    # 决策级行为信息增益：每轮拿几个配对 case 做线协议录制 + 冻结重放。
-    # 每个 case 的成本 = 2 局录制对局 + 2 次本地重放；0 = 关闭（曲线记 null + 原因）。
-    behavioral_ig_cases: int = 1
+    """测量口径。
+
+    ⚠️ 信息增益（IG）已从主线指标中移除
+    -----------------------------------
+    ``information_gain`` 与 ``behavioral_ig_*`` 现在**默认全关**，曲线也不再画
+    IG 面板（只剩胜率 / Elo / token 三组）。字段保留是为了让已完成的 run
+    （antwar / antwar2 等带 IG 数据的）仍能被原样加载与复现，不是为了继续测。
+
+    关掉之后每轮省下的成本是实打实的：``information_gain`` 每轮要跑一批配对
+    影子对局，``behavioral_ig_cases`` 每个 case 还要 2 局录制 + 2 次本地重放，
+    而这些对局对"策略变强了没有"这个问题不提供任何证据。
+    """
+
+    epsilon: float = 0.01
+    # 逐轮结果分布信息增益（配对影子对局）。默认关闭。
+    information_gain: bool = False
+    # 决策级行为信息增益（线协议录制 + 冻结重放）。默认 0 = 关闭。
+    behavioral_ig_cases: int = 0
     # 单次本地重放的墙钟上限。重放要走完整局的观测流，所以不能比单局超时小太多。
     behavioral_ig_timeout_s: float = 900.0
-    # 随机流耦合口径：``common_random_seed``（默认）让父/子版本在同一条随机流下比较，
-    # 否则任何调 random 的选手都会被判"非确定"而记 null。口径会随数写进事件。
+    # 随机流耦合口径（仅在显式开启 IG 时有意义）。
     behavioral_ig_coupling: str = COUPLING_COMMON_RANDOM
-    # 行为 IG 用哪种探针。默认 transcript_replay（8 游戏 / 9 轨都做过零点校准与灵敏度
-    # 验收）。**一个 run 只用一种**：两种探针的 |A| 与动作口径不同，逐轮自动回落会让
-    # 同一条曲线的相邻两点口径不同，斜率失去意义。
     behavioral_ig_probe: str = "transcript_replay"
 
 
@@ -391,6 +466,7 @@ class ExperimentConfig:
         env: Mapping[str, str] | None = None,
         *,
         gamepacks_root: Path | None = None,
+        model_profiles_root: Path | None = None,
     ) -> ExperimentConfig:
         environment = dict(os.environ if env is None else env)
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -406,35 +482,65 @@ class ExperimentConfig:
         if not (packs_root / game).is_dir():
             raise ValueError(f"no GamePack registered for game {game!r} under {packs_root}")
 
-        provider = _mapping(root.get("provider"), "provider")
+        provider = dict(_mapping(root.get("provider"), "provider"))
+        # 模型档案：configs/models/<name>.yaml 提供 model / base_url / api_key_env /
+        # context_window / model_catalog 等；实验配置里同名字段可以覆盖它
+        # （便于临时试一个 reasoning_effort，而不必新建档案）。
+        profile_name = _optional_text(provider.get("model_profile"), "provider.model_profile")
+        if profile_name is not None:
+            profiles_root = (
+                model_profiles_root
+                if model_profiles_root is not None
+                else _model_profiles_root(path)
+            )
+            profile = _load_model_profile(profile_name, profiles_root)
+            merged = dict(profile)
+            merged.update({k: v for k, v in provider.items() if v is not None})
+            provider = merged
         runtime = _mapping(root.get("runtime"), "runtime")
         paths = _mapping(root.get("paths"), "paths")
         curriculum = _mapping(root.get("curriculum"), "curriculum")
-        measurement = _mapping(root.get("measurement"), "measurement")
+        measurement = _optional_mapping(root.get("measurement"), "measurement")
         isolation = _optional_mapping(root.get("isolation"), "isolation")
         budget = _optional_mapping(root.get("budget"), "budget")
         goal = _optional_mapping(root.get("goal"), "goal")
         evaluation = _optional_mapping(root.get("evaluation"), "evaluation")
 
-        branch_width = _positive_int(runtime.get("branch_width"), "runtime.branch_width")
-        max_iterations = _optional_positive_int(
-            runtime.get("max_iterations"), "runtime.max_iterations"
-        )
-        if runtime.get("network_access") != "disabled":
+        branch_width = _positive_int(runtime.get("branch_width"), "runtime.branch_width", 1)
+        # 轮数上限（超参数 1）。三种写法：
+        #   不写 / null      -> DEFAULT_MAX_ITERATIONS（32）
+        #   "unbounded"      -> UNBOUNDED_MAX_ITERATIONS（128），"不设上限"的固定含义
+        #   具体整数          -> 照用
+        raw_iterations = runtime.get("max_iterations")
+        if isinstance(raw_iterations, str):
+            if raw_iterations.strip().lower() not in ("unbounded", "unlimited", "none"):
+                raise ValueError(
+                    "runtime.max_iterations must be an integer, null, or 'unbounded'"
+                )
+            max_iterations: int | None = UNBOUNDED_MAX_ITERATIONS
+        elif raw_iterations is None:
+            max_iterations = DEFAULT_MAX_ITERATIONS
+        else:
+            max_iterations = _positive_int(raw_iterations, "runtime.max_iterations")
+        if runtime.get("network_access") not in (None, "disabled"):
             raise ValueError("runtime.network_access must be disabled")
-        if curriculum.get("order") != "lowest_rank_first":
+        if curriculum.get("order") not in (None, "lowest_rank_first"):
             raise ValueError("curriculum.order must be lowest_rank_first")
-        epsilon = measurement.get("epsilon")
-        if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
+        raw_epsilon = measurement.get("epsilon")
+        if raw_epsilon is None:
+            epsilon: float = 0.01
+        elif isinstance(raw_epsilon, bool) or not isinstance(raw_epsilon, (int, float)):
             raise ValueError("measurement.epsilon must be numeric")
-        if not 0 < float(epsilon) < 1:
-            raise ValueError("measurement.epsilon must be between zero and one")
+        else:
+            epsilon = float(raw_epsilon)
+            if not 0 < epsilon < 1:
+                raise ValueError("measurement.epsilon must be between zero and one")
 
         opponent_policy = _choice(
             curriculum.get("opponent_policy"),
             "curriculum.opponent_policy",
             OPPONENT_POLICIES,
-            "self_decide",
+            "progress",
         )
         opponent_rank = _optional_positive_int(
             curriculum.get("opponent_rank"), "curriculum.opponent_rank"
@@ -443,7 +549,7 @@ class ExperimentConfig:
             raise ValueError("curriculum.opponent_rank is required when opponent_policy=fixed_rank")
         advance_rate = curriculum.get("advance_win_rate")
         if advance_rate is None:
-            advance_win_rate = 0.6
+            advance_win_rate = 0.75
         elif isinstance(advance_rate, bool) or not isinstance(advance_rate, (int, float)):
             raise ValueError("curriculum.advance_win_rate must be numeric")
         else:
@@ -487,7 +593,7 @@ class ExperimentConfig:
                 branch_width=branch_width,
                 max_iterations=max_iterations,
                 network_access="disabled",
-                rollout_k=_positive_int(runtime.get("rollout_k"), "runtime.rollout_k", 4),
+                rollout_k=_positive_int(runtime.get("rollout_k"), "runtime.rollout_k", 1),
                 match_parallelism=_positive_int(
                     runtime.get("match_parallelism"), "runtime.match_parallelism", 1
                 ),
@@ -532,6 +638,7 @@ class ExperimentConfig:
                     "curriculum.development_seeds",
                 ),
                 opponent_policy=opponent_policy,
+                batch=_positive_int(curriculum.get("batch"), "curriculum.batch", 4),
                 opponent_rank=opponent_rank,
                 seed_mode=_choice(
                     curriculum.get("seed_mode"), "curriculum.seed_mode", SEED_MODES, "fixed"
@@ -554,12 +661,13 @@ class ExperimentConfig:
                 ),
             ),
             measurement=MeasurementConfig(
-                epsilon=float(epsilon),
+                epsilon=epsilon,
+                # IG 已从主线移除：默认关闭，只有配置里显式写 true 才测。
                 information_gain=_optional_bool(
-                    measurement.get("information_gain"), "measurement.information_gain", True
+                    measurement.get("information_gain"), "measurement.information_gain", False
                 ),
                 behavioral_ig_cases=_non_negative_int(
-                    measurement.get("behavioral_ig_cases"), "measurement.behavioral_ig_cases", 1
+                    measurement.get("behavioral_ig_cases"), "measurement.behavioral_ig_cases", 0
                 ),
                 behavioral_ig_timeout_s=_positive_float(
                     measurement.get("behavioral_ig_timeout_s"),
@@ -662,6 +770,7 @@ class ExperimentConfig:
                 "order": self.curriculum.order,
                 "development_seeds": list(self.curriculum.development_seeds),
                 "opponent_policy": self.curriculum.opponent_policy,
+                "batch": self.curriculum.batch,
                 "opponent_rank": self.curriculum.opponent_rank,
                 "seed_mode": self.curriculum.seed_mode,
                 "opponent_start_rank": self.curriculum.opponent_start_rank,

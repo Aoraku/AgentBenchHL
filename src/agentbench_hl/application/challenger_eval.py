@@ -149,6 +149,7 @@ def evaluate_challenger(
     cpus_per_match: int = 3,
     timeout_s: float = 1800.0,
     isolation_backend: str = "auto",
+    challenger_track: str | None = None,
     on_match: Callable[[dict[str, object], int, int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     before_match: Callable[[], None] | None = None,
@@ -172,10 +173,24 @@ def evaluate_challenger(
     roles = tuple(game_roles(root, game))
     players = load_pool(root, game, supports_compiled=_supports_compiled_players(root, game))
     by_id = {item.player_id: item for item in players}
-    if len({item.track for item in players if item.track}) == 2:
-        # 非对称游戏的比较关系是二分图，挑战者只能打对位轨；那需要知道它实现的是哪个
-        # 角色，本函数拿不到这个信息，所以拒绝而不是算出一个错的 Elo。
-        raise ValueError(f"{game} 是非对称（分轨）游戏，挑战者评测需要显式指定角色轨")
+    tracks = {item.track for item in players if item.track}
+    if len(tracks) == 2:
+        # 非对称游戏的比较关系是二分图，挑战者只能打对位轨；见 evaluate_many 里的
+        # 同名处理。拿不到角色轨时拒绝，而不是算出一个错的 Elo。
+        if challenger_track is None:
+            raise ValueError(
+                f"{game} 是非对称（分轨）游戏，挑战者评测需要显式指定角色轨"
+                f"（challenger_track，可选 {sorted(tracks)}）"
+            )
+        if challenger_track not in tracks:
+            raise ValueError(
+                f"{game} 的角色轨只有 {sorted(tracks)}，收到 {challenger_track!r}"
+            )
+        opponent_track = next(item for item in tracks if item != challenger_track)
+        players = [item for item in players if item.track == opponent_track]
+        by_id = {item.player_id: item for item in players}
+        if not players:
+            raise ValueError(f"{game} 的 {opponent_track} 轨没有可用选手")
 
     eligible, scope_note = _select_players(root, game, players, scope)
     # 没有锚点的对手会被 estimate_pool_elo 跳过，这里就不要浪费机时去打。
@@ -311,6 +326,7 @@ def evaluate_challenger(
         "challenger_root": str(candidate_root),
         "pool": frozen.summary(),
         "pool_fingerprint": frozen.fingerprint,
+        "challenger_track": challenger_track,
         "scope": scope,
         "scope_note": scope_note,
         "seeds": [int(item) for item in seeds],
@@ -361,7 +377,9 @@ def evaluate_many(
     cpus_per_match: int = 3,
     timeout_s: float = 1800.0,
     isolation_backend: str = "auto",
+    challenger_track: str | None = None,
     on_match: Callable[[str, int, int], None] | None = None,
+    on_version_done: Callable[[dict[str, object]], None] | None = None,
     before_match: Callable[[], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> list[dict[str, object]]:
@@ -394,8 +412,28 @@ def evaluate_many(
     roles = tuple(game_roles(root, game))
     players = load_pool(root, game, supports_compiled=_supports_compiled_players(root, game))
     by_id = {item.player_id: item for item in players}
-    if len({item.track for item in players if item.track}) == 2:
-        raise ValueError(f"{game} 是非对称（分轨）游戏，挑战者评测需要显式指定角色轨")
+    tracks = {item.track for item in players if item.track}
+    if len(tracks) == 2:
+        # 非对称游戏的比较关系是二分图：rollman 只和 ghost 交手，同轨之间没有对局，
+        # 所以"挑战者打全池"这句话必须先说清它坐哪一边。
+        #
+        # ``challenger_track`` 说的是**挑战者自己扮演的角色**，它要打的是
+        # **对位轨**的选手。传错方向会让挑战者和同轨选手互殴——那种对局在
+        # 人类池里从未发生过，锚点 Elo 不适用，算出来的分数是无意义的。
+        if challenger_track is None:
+            raise ValueError(
+                f"{game} 是非对称（分轨）游戏，挑战者评测需要显式指定角色轨"
+                f"（--challenger-track，可选 {sorted(tracks)}）"
+            )
+        if challenger_track not in tracks:
+            raise ValueError(
+                f"{game} 的角色轨只有 {sorted(tracks)}，收到 {challenger_track!r}"
+            )
+        opponent_track = next(item for item in tracks if item != challenger_track)
+        players = [item for item in players if item.track == opponent_track]
+        by_id = {item.player_id: item for item in players}
+        if not players:
+            raise ValueError(f"{game} 的 {opponent_track} 轨没有可用选手")
 
     eligible, scope_note = _select_players(root, game, players, scope)
     opponents = tuple(pid for pid in eligible if pid in frozen.anchors and pid in by_id)
@@ -470,6 +508,40 @@ def evaluate_many(
     finished = 0
     stopped = False
 
+    # 每个版本还剩多少局没跑。归零时立刻落盘它的 challenger-elo.json，
+    # 不等整批结束。
+    #
+    # 为什么必须这样：一批 172 个版本 × 188 局 = 32k 局要跑二十几小时，
+    # 若只在整批结束时落盘，中途看不到**任何**完成版本，也无法出图；
+    # worker 被重启还得从头再来。逐版本落盘让"跑完的就能用"。
+    remaining: dict[str, int] = {}
+    for case in queue_items:
+        remaining[case[0]] = remaining.get(case[0], 0) + 1
+
+    def flush(slot: _Slot) -> None:
+        document = _summarise(
+            game=game,
+            challenger_id=slot.challenger_id,
+            candidate_root=slot.candidate_root,
+            frozen=frozen,
+            scope=scope,
+            scope_note=scope_note,
+            seeds=seeds,
+            roles=roles,
+            opponents=opponents,
+            done=slot.done,
+            planned=slot.planned,
+            stopped=False,
+            elapsed=time.time() - started,
+            challenger_track=challenger_track,
+        )
+        (slot.work_root / SUMMARY_FILENAME).write_text(
+            json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if on_version_done is not None:
+            on_version_done(document)
+
     def record(slot: _Slot, row: dict[str, object]) -> None:
         nonlocal finished
         with slot.lock:
@@ -481,6 +553,10 @@ def evaluate_many(
         with cursor_lock:
             finished += 1
             current = finished
+            remaining[slot.challenger_id] -= 1
+            completed_now = remaining[slot.challenger_id] == 0
+        if completed_now:
+            flush(slot)
         if on_match is not None:
             on_match(slot.challenger_id, current, len(queue_items))
 
@@ -512,6 +588,10 @@ def evaluate_many(
 
     documents: list[dict[str, object]] = []
     for slot in slots.values():
+        # ``stopped`` 是**整批**被中断的标志，但不能让它连坐已经跑满的版本：
+        # 一个版本的 188 局全部完成，它的结论就是完整的，与"队列里别的版本
+        # 还没跑"无关。只有该版本自己还缺局时才标 partial。
+        slot_incomplete = len(slot.done) < slot.planned
         document = _summarise(
             game=game,
             challenger_id=slot.challenger_id,
@@ -524,8 +604,9 @@ def evaluate_many(
             opponents=opponents,
             done=slot.done,
             planned=slot.planned,
-            stopped=stopped,
+            stopped=stopped and slot_incomplete,
             elapsed=time.time() - started,
+            challenger_track=challenger_track,
         )
         (slot.work_root / SUMMARY_FILENAME).write_text(
             json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -581,6 +662,7 @@ def _summarise(
     planned: int,
     stopped: bool,
     elapsed: float,
+    challenger_track: str | None = None,
 ) -> dict[str, object]:
     rows = [
         {"opponent_id": str(row["opponent"]), "points": POINTS[str(row["result"])]}
@@ -605,6 +687,7 @@ def _summarise(
         "challenger_root": str(candidate_root),
         "pool": frozen.summary(),
         "pool_fingerprint": frozen.fingerprint,
+        "challenger_track": challenger_track,
         "scope": scope,
         "scope_note": scope_note,
         "seeds": [int(item) for item in seeds],

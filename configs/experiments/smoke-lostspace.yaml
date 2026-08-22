@@ -9,11 +9,11 @@ curriculum:
   - 1
   ladder_scope: auto
   opponent_policy: fixed_rank
-  opponent_rank: 30
+  opponent_rank: 40
   opponent_start_rank: null
   order: lowest_rank_first
   seed_mode: fixed
-game: PLACEHOLDER
+game: lostspace
 goal:
   code_constraint: any
   experience_skills: true

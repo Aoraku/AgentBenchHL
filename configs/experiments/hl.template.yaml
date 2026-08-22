@@ -1,0 +1,140 @@
+# HL 实验配置模板 —— 你只需要动下面标了【超参数 N】的 5 个地方。
+#
+# 设计原则：**能调的旋钮就是实验变量，其余全是可复现性所需的固定值。**
+# 以前这份模板有 30 多个字段可填，实际只有 5 个会被改，剩下的每一个都是
+# "填错了会静默出错"的雷（漏 context_window → 压缩打死 run；
+# 座次名写错 → 全局判负而指标只显示"对局没完成"）。所以现在把它们钉死。
+#
+# ─────────────────────────── 五个超参数 ───────────────────────────
+#
+# 【0】game + provider.model_profile
+#      游戏：任何 gamepacks/<game>/ 存在的（当前 8 个）。
+#      模型：configs/models/<name>.yaml 的档案名。为什么模型要独立成文件——
+#            见 configs/models/README.md（简版：7 个模型的中转站与 key 全不同，
+#            散在实验配置里必然漏字段，漏 context_window 会打死整个 run）。
+#
+# 【1】runtime.max_iterations
+#      默认 32。要"不设上限"就写 `unbounded`，它固定等于 128 轮。
+#      为什么不能真的不限：token 预算守卫在记账修好之前是失效的
+#      （见 application/goal_led_service._token_total 的详注），
+#      "不设上限"实际等于"跑到人手动杀掉"，不同 run 的轮数不可比。
+#
+# 【2】goal.history_mode
+#      full      = 能看到所有历史迭代（常驻会话 + 经验文档 + 历次代码）
+#      last_only = 只能看到上一版（每轮全新会话，工作区只留当前策略 + 最近反馈）
+#      ⚠️ last_only 下框架会**强制单文件**：不许建 v2.py/v3.py、不许 import
+#         历史版本。否则"只能看到上一版"会被 import 链绕过（读一下 v2.py 就
+#         等于看到了历史），消融失效而且从曲线上完全看不出来。
+#
+# 【3】curriculum.opponent_policy + curriculum.batch
+#      一轮出 1 个策略，打 batch（b）个对手。四种选法：
+#        random   随机选 b 个（抗过拟合，每轮换人）
+#        self     agent 自己读榜 + 读战绩决定 b 个（框架只校验可运行性）
+#        progress 从第 start 名起铺 b 个槽位，稳定打赢（得分率 > 阈值）的
+#                 槽位往前进一名，且跳过已打过的名次；b=1 时就是逐个上升
+#        fix      固定打榜单前 b 名
+#      b 默认 4，可消融（b=1 时各策略退化成单目标形态）。
+#
+# ──────────────────────── 为什么默认 k=1 ────────────────────────
+# 原设计是一轮 rollout k=4 个"有多样性"的候选各打同一个对手。两个实测问题：
+#   1. 胜率没有分辨力：固定打同一个对手时，4 轮胜率要么恒 0（g4/m4/snakego4/
+#      lostspace4）要么恒 1（r4b）—— 曲线是直线，看不出任何学习；
+#   2. 多样性是伪的：硬约束"代码差异 ≥ N 行"下，agent 的实际应对是复制一份
+#      改几个阈值，一轮花 4 倍对局开销只探到 1 个点。
+# k=1 × b 个对手把探索预算从"写 4 个相似版本"移到"拿 1 个版本收 b 份不同证据"：
+# 胜率立刻有 0/1/b/…/1 的分辨率，Elo 反解也从单点约束变成跨强度约束。
+#
+# ──────────────────────────── 关于 IG ────────────────────────────
+# 信息增益已从主线指标移除，`measurement` 段整体可以不写（默认全关）。
+# 曲线只剩三组：胜率、Elo、token。
+
+schema_version: '1.1'
+
+# 【超参数 0】游戏
+game: antwar2
+origin: from_scratch
+
+provider:
+  # 【超参数 0】模型（configs/models/ 下的档案名）
+  model_profile: glm-5.2
+
+runtime:
+  # 【超参数 1】最大迭代轮数：整数 / 不写(=32) / unbounded(=128)
+  max_iterations: 32
+
+  # ↓ 以下是固定值，别改 ↓
+  codex_binary: codex
+  agent_binary: null
+  branch_width: 1
+  # 一轮只出一个策略（改动理由见文件头）。
+  rollout_k: 1
+  # 一轮内对局并行度。一轮的对局数 = 1 × b × 座次数 × seed 数，
+  # b=4 双座次单 seed 就是 8 局；32 核服务器上给 8。
+  match_parallelism: 8
+  # 单局墙钟上限。各游戏单局长度差一个数量级（miracle 7s，snakego 实测 246s），
+  # 420s 会误杀长局，而那在主表上看起来像"这个模型不会玩 snakego"。
+  match_timeout_s: 1800
+  network_access: disabled
+  # 每轮换 thread：躲开 codex 的 remote compaction（对 glm 系必死：
+  # 它返回 [reasoning, message] 两个 item，codex 只接受一个，
+  # 一触发就把整个 turn 打成 failed）。这不是消融变量——
+  # 工作区侧的历史一份不动，断掉的只有 harness 的对话记忆。
+  thread_rotate_each_iteration: true
+  thread_rotate_context_tokens: 60000
+  iteration_mode: lockstep
+
+curriculum:
+  # 【超参数 3】对手选择方式：random | self | progress | fix
+  opponent_policy: progress
+  # 【超参数 3】一轮打几个对手（b）
+  batch: 4
+  # progress 的起点名次（从第几名开始往上爬）。
+  opponent_start_rank: 20
+  # progress 的晋级判据：对某个对手至少打 2 局、得分率 > 0.75 才算稳定击败。
+  advance_min_matches: 2
+  advance_win_rate: 0.75
+  advance_streak: 1
+
+  # ↓ 固定值 ↓
+  order: lowest_rank_first
+  development_seeds: [1]
+  seed_mode: fixed
+  # 榜单口径：auto = measured → reference → crawled 逐选手回落。
+  # 绝不能写 crawled：那只有第一批爬取的几十人有名次，
+  # 榜单会从 229 人缩到 20 人，对手课程直接缺斤少两。
+  ladder_scope: auto
+
+goal:
+  # 【超参数 2】历史可见性：full | last_only
+  history_mode: full
+
+  # ↓ 固定值 ↓
+  prompt_override: null
+  # 维护迭代经验文档。last_only 下框架会自动关掉它（那一档本来就不给历史）。
+  experience_skills: true
+  code_constraint: any
+  seed_policy_path: null
+
+evaluation:
+  # 慢通道：中间版本对冻结人类池做后台评测，算真实 Elo 与池内名次。
+  # 它**不影响**迭代（另起进程、另建对局），只是把"这一版插进人类榜第几名"
+  # 这个问题回答清楚。曲线上的实线就来自这里。
+  background_pool: true
+  pool_sample: 16
+  pool_seeds: [7]
+
+isolation:
+  backend: auto
+  rival_code_visible: false
+  docker_image: null
+
+budget:
+  # 不设 token 预算：轮数由 max_iterations 收敛。
+  # ⚠️ 为什么不再写 3000000：那个数是在 token 记账**低估 14 倍**的口径下
+  # 拍的（见 _token_total 详注）。记账修好后沿用它，run 会在第 1 轮就被掐死。
+  tokens: null
+  wall_seconds: null
+
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs

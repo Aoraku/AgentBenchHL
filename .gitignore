@@ -58,3 +58,23 @@ configs/experiments/web-hl-*.yaml
 # 扁平包时代的备份，已被 src/agentbench_hl/ 取代，留在磁盘上仅供考古。
 _stale_flat_package.bak/
 _stale_flat_package.egg-info.bak/
+
+# macOS 通过 tar/scp 带过来的 AppleDouble 元数据。内容是二进制 xattr，
+# 与代码无关，进库只会让 diff 变噪声。
+._*
+
+# 一次性诊断脚本。它们是为定位某个具体故障临时写的（读某个 run 的某类事件、
+# 探某个中转站的模型列表…），故障修掉之后就没有复用价值，
+# 而留在库里会让 scripts/ 从可运行的工具退化成考古现场。
+# 需要保留的分析工具请起正式名字并配文档，别用 diag_/probe_/inspect_ 前缀。
+scripts/diag_*.py
+scripts/probe_*.py
+scripts/inspect_*.py
+scripts/verify_*.py
+scripts/run_probe_directly.py
+scripts/lookup_runnable.py
+scripts/plan_pool_elo.py
+scripts/audit_zero_round_*.py
+scripts/audit_timeout_hypothesis.py
+scripts/audit_match_ledger.py
+scripts/audit_pool_shortfall.py
