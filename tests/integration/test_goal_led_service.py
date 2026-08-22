@@ -182,6 +182,100 @@ def test_goal_led_bridge_keeps_one_thread_and_returns_public_rank01_feedback(
     assert "replay.md" in runtime.prompts[-1]
 
 
+class OverlayOnlyRuntime(RequestingRuntime):
+    """模拟 agent 的真实行为：overlay 里**只放它改动的文件**。
+
+    实测 gpt-5.6-sol 交的 rollout 目录就只有 main.py + ai.py 两个文件 ——
+    agent 没有理由把框架给的 _bootstrap.py / SDK 再抄一遍。
+    """
+
+    def run_until_checkpoint(
+        self,
+        session: AgentSession,
+        run_context: RunContext,
+        _checkpoint_predicate: object,
+    ) -> AgentSession:
+        self.prompts.append(run_context.initial_prompt)
+        if len(self.prompts) != 1:
+            return session
+        overlay = run_context.cwd / ".agentbench" / "rollouts" / "v000"
+        overlay.mkdir(parents=True, exist_ok=True)
+        # 只放改动过的入口，不带任何支撑文件。
+        (overlay / "main.py").write_text(
+            "import _bootstrap\nprint('candidate v000')\n", encoding="utf-8"
+        )
+        action = run_context.cwd / ".agentbench" / "action.json"
+        action.write_text(
+            json.dumps(
+                {
+                    "action_id": "k1-overlay",
+                    "rollouts": [{"candidate_id": "v000"}],
+                    "selected_rivals": ["rank01"],
+                    "roles": ["P0"],
+                    "seeds": [1],
+                    "rationale": "k=1 single candidate, overlay carries only main.py.",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return session
+
+
+def test_k1_candidate_snapshot_keeps_the_runtime_support_files(tmp_path: Path) -> None:
+    """k=1 的候选快照必须仍然**叠加**在工作区之上，而不是只拷 overlay。
+
+    这条锁的是一个已经在线上咬过的回归：k=1 改造时加过一个捷径
+    "只有 1 个候选且 overlay 里有 main.py，就直接拿 overlay 当快照"。
+    看上去合理（k=1 时 overlay 就是那一版），实际是错的 —— agent 的 overlay
+    只放它改动的文件，于是 ``_bootstrap.py`` 这类**框架提供的运行时支撑**
+    被落在外面，候选一启动就
+    ``ModuleNotFoundError: No module named '_bootstrap'``。
+
+    而 ``import _bootstrap`` 是框架 main.py 模板自己写的，候选完全无辜：
+    预检把它判成 startup_crash，整轮 0 局对局，事件流里只留一条"候选被拒"。
+    实测 gpt-5.6-sol 的第 1 轮就是这样报废的。
+    """
+
+    bootstrap = tmp_path / "bootstrap"
+    bootstrap.mkdir()
+    (bootstrap / "main.py").write_text("import _bootstrap\n", encoding="utf-8")
+    # candidate_support 平铺进工作区的运行时支撑（真实 run 里由 factory 铺）。
+    (bootstrap / "_bootstrap.py").write_text("def install_path():\n    pass\n", encoding="utf-8")
+    (bootstrap / "common.py").write_text("class BaseAgent:\n    pass\n", encoding="utf-8")
+    gamepack = tmp_path / "gamepack"
+    gamepack.mkdir()
+
+    service = GoalLedService(
+        run_root=tmp_path / "run",
+        bootstrap_root=bootstrap,
+        gamepack_root=gamepack,
+        runtime=OverlayOnlyRuntime(),
+        arena=PublicReplayArena(),
+        model="gpt-5.6-sol",
+        model_provider="OpenAI",
+        game="antwar2",
+        agentbench_root=AGENTBENCH_ROOT,
+        runnable_opponent_ids=("rank01",),
+        public_leaderboard=({"opponent_id": "rank01", "rank": 1, "score": 2000.0},),
+        rollout_k=1,
+    )
+
+    service.start()
+
+    snapshot = tmp_path / "run" / "snapshots" / "v000"
+    assert (snapshot / "main.py").is_file(), "overlay 的入口必须生效"
+    assert "candidate v000" in (snapshot / "main.py").read_text(encoding="utf-8")
+    # ★ 核心断言：支撑文件必须还在。
+    assert (snapshot / "_bootstrap.py").is_file(), (
+        "k=1 快照丢了 _bootstrap.py —— overlay 应当叠加在工作区之上，而不是取代它"
+    )
+    assert (snapshot / "common.py").is_file()
+
+    events = (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8")
+    assert "CandidatePreflightRejected" not in events, "健康候选不应被预检拒绝"
+    assert "GoalMatchCompleted" in events, "候选应当真的进了对局"
+
+
 def test_goal_led_persists_thread_before_the_first_long_turn(tmp_path: Path) -> None:
     bootstrap = tmp_path / "bootstrap"
     bootstrap.mkdir()

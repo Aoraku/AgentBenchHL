@@ -1,0 +1,75 @@
+# 对手选择方式 ablation —— progress
+#
+# 这四份配置**只有 curriculum.opponent_policy 一个字段不同**，其余逐字节相同。
+# 那是 ablation 成立的前提：任何别的差异（模型档位、轮数、b、历史可见性、
+# seed）都会让"胜率差异来自对手策略"这个结论失去依据。
+#
+# 共同设置：antwar2 / gpt-5.6-sol / k=1 / b=4 / 32 轮 / history=full
+#
+# 关于轮数：现在只跑 32。跑完若要续到 64，**用同一个 run-id 再执行一次
+# --iterations 32**（driver 的 completed 每个进程从 0 数，started 由磁盘状态
+# 判断，所以第二次是接着 33 跑到 64，不是重跑）。详见 docs/ABLATION_OPS.md。
+#
+# progress：从第 20 名起铺 4 个槽位，稳定打赢（得分率 > 0.75，至少 2 局）
+# 的槽位往前进一名，且跳过已打过的名次。这是我们此前长 run 的路线。
+schema_version: "1.1"
+game: antwar2
+origin: from_scratch
+
+provider:
+  model_profile: gpt-5.6-sol
+
+runtime:
+  max_iterations: 32
+  codex_binary: codex
+  agent_binary: null
+  branch_width: 1
+  rollout_k: 1
+  # 一轮 = 1 候选 × 4 对手 × 2 座次 × 1 seed = 8 局。四个 run 并行 = 32 局并发，
+  # 服务器 32 核，每个 run 给 8。
+  match_parallelism: 8
+  match_timeout_s: 1800
+  network_access: disabled
+  # 每轮换 thread：躲开 codex 的 remote compaction。工作区侧历史一份不动，
+  # 断掉的只有 harness 对话记忆，所以不影响 history_mode=full 的语义。
+  thread_rotate_each_iteration: true
+  thread_rotate_context_tokens: 60000
+
+curriculum:
+  opponent_policy: progress
+  batch: 4
+  opponent_start_rank: 20
+  advance_min_matches: 2
+  advance_win_rate: 0.75
+  advance_streak: 1
+  order: lowest_rank_first
+  development_seeds: [1]
+  seed_mode: fixed
+  ladder_scope: auto
+
+goal:
+  history_mode: full
+  prompt_override: null
+  experience_skills: true
+  code_constraint: any
+  seed_policy_path: null
+
+evaluation:
+  background_pool: false
+  pool_sample: 16
+  pool_seeds: [7]
+
+isolation:
+  backend: auto
+  rival_code_visible: false
+  docker_image: null
+
+budget:
+  # 不设预算：停止条件是 max_iterations。token 记账修好后旧的 3000000
+  # 会在第 1 轮就掐死 run（实测单轮 1~5M）。
+  tokens: null
+  wall_seconds: null
+
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs

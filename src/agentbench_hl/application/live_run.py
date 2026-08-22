@@ -151,6 +151,12 @@ def codex_goal_runtime(
         context_window=config.provider.context_window,
         auto_compact_token_limit=config.provider.auto_compact_token_limit,
         model_catalog=config.provider.model_catalog,
+        # None 时让运行时用它自己的默认值，不要在这里替它决定。
+        **(
+            {"client_name": config.provider.client_name}
+            if config.provider.client_name
+            else {}
+        ),
     )
 
 

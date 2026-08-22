@@ -32,7 +32,7 @@ from agentbench_hl.adapters.contract.pool import (
 )
 from agentbench_hl.adapters.isolation import select_candidate_isolation
 from agentbench_hl.adapters.transcript import transcript_root
-from agentbench_hl.config import ExperimentConfig
+from agentbench_hl.config import ExperimentConfig, repository_root_for
 from agentbench_hl.gamepack import GamePack
 from agentbench_hl.ports.isolation import CandidateIsolation, IsolationRequest
 
@@ -164,7 +164,7 @@ def build_goal_run(
 
     source = Path(config_path).resolve()
     config = ExperimentConfig.load(source)
-    repository_root = source.parents[2]
+    repository_root = repository_root_for(source)
     gamepack_root = repository_root / "gamepacks" / config.game
     agentbench_root = config.paths.agentbench_root
     run_root = config.paths.runs_root / run_id

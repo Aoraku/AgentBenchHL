@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from agentbench_hl.adapters.filesystem.event_store import JsonlEventStore
+from agentbench_hl.config import repository_root_for
 from agentbench_hl.domain.events import FinalizedEvent
 from agentbench_hl.domain.lineage import LineageState
 
@@ -262,7 +263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from agentbench_hl.application.live_run import build_goal_led_service
             from agentbench_hl.application.run_lease import RunLease
 
-            repository_root = arguments.config.resolve().parents[2]
+            repository_root = repository_root_for(arguments.config)
             _load_env_file(repository_root / ".env")
             resume = arguments.command != "start"
             if arguments.command == "run":
@@ -507,7 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             from agentbench_hl.application.run_lease import RunLease
 
-            repository_root = arguments.config.resolve().parents[2]
+            repository_root = repository_root_for(arguments.config)
             _load_env_file(repository_root / ".env")
             try:
                 run = build_live_run(arguments.config.resolve(), run_id=arguments.run_id)
@@ -540,7 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             if arguments.acts < 1:
                 raise ValueError("--acts must be a positive integer")
-            repository_root = arguments.config.resolve().parents[2]
+            repository_root = repository_root_for(arguments.config)
             _load_env_file(repository_root / ".env")
             resumed = resume_live_run(arguments.config.resolve(), run_id=arguments.run_id)
             certification = None
@@ -586,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             from agentbench_hl.application.live_run import resume_live_run
             from agentbench_hl.application.run_lease import RunLease
 
-            repository_root = arguments.config.resolve().parents[2]
+            repository_root = repository_root_for(arguments.config)
             _load_env_file(repository_root / ".env")
             pursued = resume_live_run(arguments.config.resolve(), run_id=arguments.run_id)
             acts_completed = 0

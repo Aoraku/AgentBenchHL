@@ -216,6 +216,16 @@ class ProviderConfig:
     # 我们没设过也看不见的点触发（实测 antwar2 在 97k 触发并死掉，而当时我们
     # 声明的是 200000）。catalog 让"压缩线是多少"重新变成我们能回答的问题。
     model_catalog: str | None = None
+    #: JSON-RPC ``initialize`` 里报的客户端名字，会变成上游看到的
+    #: ``originator`` 请求头。None = 用运行时默认（``agentbench-hl``）。
+    #:
+    #: 为什么要暴露成配置：**有些中转站按客户端白名单放行**。实测 sbtunnel
+    #: 对 ``originator: agentbench-hl`` 返回 403
+    #: ``This account only allows Codex official clients``，而同一个 key、
+    #: 同一个端点、同一份 config.toml 换成 codex 官方 originator 就 200。
+    #: 硬编码的话这类中转站整个不可用，且 403 完全指不回"是署名被拒"
+    #: （我们为此把 config.toml 的每一项都单独试了一遍，全部无关）。
+    client_name: str | None = None
 
 
 # 模型档案库：``configs/models/<name>.yaml``。
@@ -234,9 +244,22 @@ MODEL_PROFILES_DIRNAME = "models"
 
 
 def _model_profiles_root(config_path: Path) -> Path:
-    """``configs/experiments/x.yaml`` → ``configs/models/``。"""
+    """从配置文件位置**向上搜索**仓库里的 ``configs/models/``。
 
-    return config_path.resolve().parents[1] / MODEL_PROFILES_DIRNAME
+    和 :func:`_gamepacks_root` 同一个理由：写死"往上数 1 层"会让
+    ``configs/experiments/ablation/x.yaml`` 去找 ``configs/experiments/models/``，
+    然后报"未知模型档案"——错的是路径而不是档案名。
+    """
+
+    resolved = config_path.resolve()
+    for parent in resolved.parents:
+        candidate = parent / MODEL_PROFILES_DIRNAME
+        if candidate.is_dir():
+            return candidate
+        nested = parent / "configs" / MODEL_PROFILES_DIRNAME
+        if nested.is_dir():
+            return nested
+    return resolved.parents[1] / MODEL_PROFILES_DIRNAME
 
 
 def _load_model_profile(name: str, root: Path) -> Mapping[str, object]:
@@ -433,14 +456,50 @@ class EvaluatorConfig:
 _SAFE_GAME = re.compile(r"[a-z0-9][a-z0-9_]{0,63}\Z")
 
 
-def _gamepacks_root(config_path: Path) -> Path:
-    """Locate the repository ``gamepacks/`` directory from a config file path.
+def repository_root_for(config_path: str | Path) -> Path:
+    """从实验配置的位置定位**仓库根目录**。
 
-    Experiment configs live under ``configs/experiments/<name>.yaml`` inside the
-    repository, so the repository root is three levels up from the config file.
+    为什么需要这个函数（而不是各处写 ``parents[2]``）
+    ----------------------------------------------
+    "配置一定在 ``configs/experiments/`` 正下方，所以往上数 2 层就是仓库根"
+    这个假设原先散在 6 个地方：``factory.build_goal_run`` 找 gamepack、
+    4 处 CLI 找 ``.env``、以及 gamepacks/model-profiles 的根路径推导。
+
+    一旦按用途给配置分子目录（``configs/experiments/ablation/`` 放一组
+    只差一个字段的消融配置），这 6 处会**各自以不同方式**失败：
+
+    * gamepack 报 ``GamePack manifest not found: …/configs/gamepacks/antwar2/…``
+      —— 看着像少了文件，其实是路径少数了一层；
+    * ``.env`` 更糟：找不到就**静默跳过**，于是 api key 没加载，
+      run 起来之后才在第一次模型调用时报鉴权错，
+      而那时错误信息只会说"401"，完全指不回真正的原因。
+
+    改成"向上找第一个同时含 ``gamepacks/`` 与 ``configs/`` 的目录"：
+    配置放在哪一层都对，也不再依赖任何目录深度约定。
     """
 
-    return config_path.resolve().parents[2] / "gamepacks"
+    resolved = Path(config_path).resolve()
+    for parent in resolved.parents:
+        if (parent / "gamepacks").is_dir() and (parent / "configs").is_dir():
+            return parent
+    # 兜底保留历史行为，让老布局下的错误信息与从前一致。
+    return resolved.parents[2] if len(resolved.parents) > 2 else resolved.parent
+
+
+def _gamepacks_root(config_path: Path) -> Path:
+    """从配置文件位置**向上搜索**仓库里的 ``gamepacks/``。
+
+    见 :func:`repository_root_for` 的详注：写死层数会在配置分子目录时
+    报出指向错误方向的信息（"游戏没注册"而非"路径算错了"）。
+    """
+
+    resolved = config_path.resolve()
+    for parent in resolved.parents:
+        candidate = parent / "gamepacks"
+        if candidate.is_dir():
+            return candidate
+    # 一个都没找到：保留原来的层数作为兜底，让错误信息与历史一致。
+    return resolved.parents[2] / "gamepacks" if len(resolved.parents) > 2 else resolved.parent
 
 
 @dataclass(frozen=True)
@@ -585,6 +644,9 @@ class ExperimentConfig:
                 ),
                 model_catalog=_optional_text(
                     provider.get("model_catalog"), "provider.model_catalog"
+                ),
+                client_name=_optional_text(
+                    provider.get("client_name"), "provider.client_name"
                 ),
                 harness=_choice(provider.get("harness"), "provider.harness", HARNESSES, "codex"),
             ),

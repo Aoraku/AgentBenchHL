@@ -7,6 +7,7 @@ from agentbench_hl.config import (
     UNBOUNDED_MAX_ITERATIONS,
     EvaluatorConfig,
     ExperimentConfig,
+    repository_root_for,
 )
 
 VALID_CONFIG = """
@@ -40,6 +41,77 @@ def _gamepacks_with(tmp_path: Path, *games: str) -> Path:
     for game in games:
         (packs / game).mkdir(parents=True, exist_ok=True)
     return packs
+
+
+def test_configs_in_a_subdirectory_still_find_gamepacks_and_profiles(tmp_path: Path) -> None:
+    """配置放在 ``configs/experiments/<子目录>/`` 里也必须能解析。
+
+    为什么要锁这个：一组消融配置（只差一个字段的 4 份）自然会想放进
+    ``configs/experiments/ablation/``。原实现把根路径写成"往上数固定层数"，
+    多一层目录就把 gamepacks 算到 ``configs/gamepacks``，
+    报的却是 ``no GamePack registered for game 'antwar2'`` ——
+    看起来像"游戏没注册"，实际是路径推导错。这种误导性报错比崩溃更费时间。
+    """
+
+    repo = tmp_path / "repo"
+    (repo / "gamepacks" / "antwar2").mkdir(parents=True)
+    profiles = repo / "configs" / "models"
+    profiles.mkdir(parents=True)
+    (profiles / "sol.yaml").write_text(
+        "model: gpt-5.6-sol\n"
+        "base_url: https://relay.invalid/v1\n"
+        "api_key_env: ABHL_API_KEY\n"
+        "reasoning_effort: high\n"
+        "disable_response_storage: true\n",
+        encoding="utf-8",
+    )
+    nested = repo / "configs" / "experiments" / "ablation"
+    nested.mkdir(parents=True)
+    path = nested / "ab32.yaml"
+    path.write_text(
+        VALID_CONFIG.replace(
+            "provider:\n"
+            "  model: gpt-5.5\n"
+            "  reasoning_effort: xhigh\n"
+            "  base_url: https://example.invalid/responses\n"
+            "  api_key_env: ABHL_API_KEY\n"
+            "  disable_response_storage: true\n",
+            "provider:\n  model_profile: sol\n",
+        ),
+        encoding="utf-8",
+    )
+
+    config = ExperimentConfig.load(
+        path, env={"AB_ROOT": "/bench", "ABHL_API_KEY": "secret"}
+    )
+
+    assert config.game == "antwar2"
+    assert config.provider.model == "gpt-5.6-sol"
+
+
+def test_repository_root_is_found_from_any_config_depth(tmp_path: Path) -> None:
+    """仓库根定位必须与配置的目录深度无关。
+
+    这条锁的是一个**会静默出错**的路径：CLI 用仓库根去找 ``.env``，而
+    ``_load_env_file`` 在文件不存在时是 ``return``（不报错）。所以根算错的
+    后果不是"找不到 .env"，而是 api key 根本没加载、run 起来之后在第一次模型
+    调用时报 401 —— 那个错误信息完全指不回真正的原因（路径少数了一层）。
+    """
+
+    repo = tmp_path / "repo"
+    (repo / "gamepacks" / "antwar2").mkdir(parents=True)
+    (repo / "configs" / "experiments" / "ablation" / "deep").mkdir(parents=True)
+    (repo / ".env").write_text("ABHL_API_KEY=x\n", encoding="utf-8")
+
+    for relative in (
+        "configs/experiments/a.yaml",
+        "configs/experiments/ablation/b.yaml",
+        "configs/experiments/ablation/deep/c.yaml",
+    ):
+        path = repo / relative
+        path.write_text("game: antwar2\n", encoding="utf-8")
+        assert repository_root_for(path) == repo, relative
+        assert (repository_root_for(path) / ".env").is_file(), relative
 
 
 def test_config_expands_public_paths_but_never_serializes_key(

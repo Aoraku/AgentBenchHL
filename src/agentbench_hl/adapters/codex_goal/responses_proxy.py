@@ -13,6 +13,22 @@ from agentbench_hl.adapters.http_retry import request_bytes_with_backoff
 
 
 class ResponsesCompatProxy:
+    #: 上游拒绝时要打印哪些请求头。
+    #:
+    #: 为什么需要这个：有些中转站按**客户端指纹**放行（实测 sbtunnel 返回
+    #: ``403 This account only allows Codex official clients``）。这类失败里，
+    #: 端点、key、模型名全都是对的，唯一的线索是 codex 发的 ``originator`` /
+    #: ``user-agent`` —— 而它们默认不落盘，于是排查只能靠猜（我们为此把
+    #: config.toml 的每一项都单独试了一遍，全部无关）。
+    #:
+    #: 只在**非 2xx** 时打印，且只打印这几个非敏感头（绝不打印 authorization）。
+    _FINGERPRINT_HEADERS = (
+        "originator",
+        "user-agent",
+        "x-codex-beta-features",
+        "x-openai-internal-codex-responses-lite",
+    )
+
     def __init__(self, upstream_base_url: str, *, timeout_s: float = 120.0) -> None:
         self.upstream_base_url = upstream_base_url.rstrip("/")
         self.timeout_s = timeout_s
@@ -81,6 +97,21 @@ class ResponsesCompatProxy:
                     self.wfile.write(detail)
                     return
                 payload = upstream_response.body
+                if not 200 <= upstream_response.status < 300:
+                    # 上游拒绝：把客户端指纹打进 stderr（会进 app-server 日志）。
+                    # 这是"端点/key/模型都对但仍被拒"这类故障唯一的线索来源。
+                    fingerprint = {
+                        name: headers[key]
+                        for name in owner._FINGERPRINT_HEADERS
+                        for key in headers
+                        if key.lower() == name
+                    }
+                    print(
+                        f"[llm-upstream] {upstream_response.status} {url} "
+                        f"fingerprint={json.dumps(fingerprint, ensure_ascii=False)} "
+                        f"body={payload[:400].decode('utf-8', 'replace')}",
+                        file=sys.stderr,
+                    )
                 self.send_response(upstream_response.status)
                 content_type = upstream_response.content_type
                 if content_type:

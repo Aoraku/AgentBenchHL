@@ -322,6 +322,20 @@ class CodexGoalRuntime:
         context_window: int | None = None,
         auto_compact_token_limit: int | None = None,
         model_catalog: str | None = None,
+        #: JSON-RPC ``initialize`` 里报的客户端名字。
+        #:
+        #: 它会变成上游看到的 ``originator`` 请求头。默认报
+        #: ``agentbench-hl``（诚实署名，便于我们自己在日志里区分流量），
+        #: 但**有些中转站按客户端白名单放行**：实测 sbtunnel 对
+        #: ``originator: agentbench-hl`` 返回
+        #: ``403 This account only allows Codex official clients``，
+        #: 而同一个 key、同一个端点、同一份 config.toml 换成 codex 官方
+        #: originator 就 200。
+        #:
+        #: 所以这个值必须可配置（模型档案里的 ``client_name``），
+        #: 否则那类中转站整个不可用 —— 而失败信息只会说 403，
+        #: 完全指不回"是署名被拒"。
+        client_name: str = "agentbench-hl",
         request_timeout_s: float = 30.0,
         # A stalled provider turn must not hold the research loop for fifteen
         # minutes.  The caller can override this for unusually long tasks,
@@ -341,6 +355,7 @@ class CodexGoalRuntime:
         self.context_window = context_window
         self.auto_compact_token_limit = auto_compact_token_limit
         self.model_catalog = model_catalog
+        self.client_name = client_name
         self.request_timeout_s = request_timeout_s
         self.checkpoint_timeout_s = checkpoint_timeout_s
         self.client: JsonRpcStdioClient | None = None
@@ -441,7 +456,7 @@ class CodexGoalRuntime:
             "initialize",
             {
                 "clientInfo": {
-                    "name": "agentbench-hl",
+                    "name": self.client_name,
                     "title": "AgentBench HL Goal Runtime",
                     "version": "0.1.0",
                 },

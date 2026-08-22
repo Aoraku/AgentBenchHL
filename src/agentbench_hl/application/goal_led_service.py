@@ -799,14 +799,21 @@ class GoalLedService:
         ignored = shutil.ignore_patterns(
             "feedback", "research", "snapshots", "processed-requests", "rollouts", "runtime-tmp"
         )
-        base = self.workspace
-        if len(request.candidate_ids) == 1 and overlay.is_dir() and (overlay / "main.py").is_file():
-            base = overlay
-            shutil.copytree(base, destination, ignore=ignored)
-        else:
-            shutil.copytree(base, destination, ignore=ignored)
-            if overlay.is_dir():
-                shutil.copytree(overlay, destination, dirs_exist_ok=True)
+        # 语义是**叠加**，与 k 无关：先铺工作区（含 candidate_support 平铺进来的
+        # 运行时支撑：_bootstrap.py / common.py / 官方协议层 / SDK），再让 overlay
+        # 覆盖同名文件。
+        #
+        # 曾经在这里加过一个"k=1 且 overlay 有 main.py 就只拷 overlay"的捷径，
+        # 理由是"k=1 时 overlay 就是完整的一版"。那是错的：agent 的 overlay 只放
+        # 它改动的文件（实测就是 main.py + ai.py 两个），只拷 overlay 会把
+        # _bootstrap.py 落在外面，于是候选一启动就
+        # ``ModuleNotFoundError: No module named '_bootstrap'`` ——
+        # 而 main.py 顶部的 ``import _bootstrap`` 本来就是框架模板自己写的，
+        # 候选完全无辜。预检把它判成 startup_crash，整轮 0 局对局，
+        # 事件流里只留下一条"候选被拒"。
+        shutil.copytree(self.workspace, destination, ignore=ignored)
+        if overlay.is_dir():
+            shutil.copytree(overlay, destination, dirs_exist_ok=True)
         if not (destination / "main.py").is_file():
             shutil.rmtree(destination, ignore_errors=True)
             raise ValueError(

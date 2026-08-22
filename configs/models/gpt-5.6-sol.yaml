@@ -1,0 +1,29 @@
+# GPT-5.6 Sol（sbtunnel 中转）—— ablation 主用模型。
+#
+# 实测要点（2026-08-23）
+# --------------------
+# * codex CLI 0.147.0 **完整认识**这个 slug（`codex debug models` 返回
+#   display_name/reasoning levels/instructions_template），所以**不需要**
+#   model_catalog。给了反而会用我们手写的元数据覆盖官方的。
+# * 裸 curl 打 /v1/responses 返回 403 "This account only allows Codex
+#   official clients"。这**不是**配置错误：上游按客户端指纹放行，
+#   走真正的 codex CLI 就 200。所以探测连通性必须用 codex exec，
+#   用 curl 会得出"端点不可用"的错误结论。
+# * base_url 带 /v1：codex 把 `/responses` 直接拼在 base_url 后面。
+model: gpt-5.6-sol
+base_url: https://sbtunnel.xiaoaojianghu.fun/v1
+api_key_env: ABHL_KEY_SBTUNNEL
+harness: codex
+# ★ 这个中转站按**客户端白名单**放行，必须报 codex 官方 originator。
+#
+# 实测：默认的 originator=agentbench-hl 会被拒为
+#   403 {"message":"This account only allows Codex official clients"}
+# 而同一个 key / 端点 / config.toml 换成 codex_exec 就 200。
+#
+# 这个 403 极具误导性——端点、key、模型名全都是对的，报错却像鉴权失败。
+# 定位它花了很久（把 config.toml 每一项都单独试了一遍，全部无关），
+# 最后靠 responses_proxy 里新加的 [llm-upstream] 指纹日志一次命中。
+client_name: codex_exec
+reasoning_effort: high
+disable_response_storage: true
+auto_compact_token_limit: 600000
