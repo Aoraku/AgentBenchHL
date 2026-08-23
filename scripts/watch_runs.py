@@ -51,8 +51,13 @@ class RunView:
     failures: list[str] = field(default_factory=list)
     tokens: int = 0
     policy: str | None = None
+    batch: int = 0
     stop_reason: str | None = None
     alive: bool = False
+    #: 上游退避重试次数（503/429 等）。它不是错误，但**直接决定吞吐**：
+    #: 四个 run 并发打同一个中转站时，503 会让每轮的墙钟从几分钟涨到几十分钟，
+    #: 表现是"进度看起来卡住了"而日志里毫无报错。不显示出来会被误判成挂死。
+    retries: int = 0
 
 
 def _events(path: Path) -> list[dict[str, Any]]:
@@ -72,9 +77,18 @@ def _events(path: Path) -> list[dict[str, Any]]:
 
 
 def _alive(run_id: str) -> bool:
+    """这个 run 的 driver 进程还在不在。
+
+    ``--`` 是必需的：pattern 是 ``--run-id <id>``，以 ``-`` 开头。
+    不加 ``--`` 的话 pgrep 会把它当成自己的选项解析，于是**永远返回空**，
+    脚本把每个 run 都报成"停"。这个误判很危险——看到"停了"的人会去重启，
+    而那会造成两个进程写同一份 events.jsonl（对局记录交错、thread 状态互相
+    覆盖），并且从曲线上看不出来。
+    """
+
     try:
         found = subprocess.run(  # noqa: S603,S607 - 固定参数
-            ["pgrep", "-f", f"--run-id {run_id}"],
+            ["pgrep", "-f", "--", f"--run-id {run_id}"],
             capture_output=True,
             text=True,
             check=False,
@@ -84,8 +98,24 @@ def _alive(run_id: str) -> bool:
     return bool(found.stdout.strip())
 
 
-def inspect(runs_root: Path, run_id: str) -> RunView:
+def inspect(runs_root: Path, run_id: str, *, log_dirs: tuple[Path, ...] = ()) -> RunView:
     view = RunView(run_id=run_id, alive=_alive(run_id))
+    # 退避重试次数只在 driver 的 stdout 日志里（不进事件账本，因为它是
+    # 传输层噪声而不是实验事实）。但它决定吞吐，所以要报出来。
+    #
+    # 日志与 run 目录可能不在同一处：配置里 runs_root 是相对路径，
+    # 解析结果（AgentBenchHL/runs/）和启动脚本写日志的地方
+    # （~/agentbench/runs/）未必一致。所以候选路径要多给几个。
+    for directory in (*log_dirs, runs_root, runs_root.parent, runs_root.parent.parent / "runs"):
+        candidate = directory / f"{run_id}.out"
+        if candidate.is_file():
+            try:
+                view.retries = candidate.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).count("[llm-retry]")
+            except OSError:
+                pass
+            break
     for event in _events(runs_root / run_id / "events.jsonl"):
         kind = event.get("event_type")
         payload = event.get("payload") or {}
@@ -96,6 +126,8 @@ def inspect(runs_root: Path, run_id: str) -> RunView:
                 view.tokens += value
         elif kind == "GoalMatchRequested":
             view.policy = payload.get("opponent_policy") or view.policy
+            if isinstance(payload.get("batch"), int):
+                view.batch = payload["batch"]
             assignment = payload.get("opponent_assignment") or {}
             chosen: list[str] = []
             for values in assignment.values():
@@ -150,12 +182,19 @@ def verdict(view: RunView, *, target: int | None) -> list[str]:
             "候选大概率协议格式错（0 回合=直接判负，学不到策略信息）"
         )
     # 对手策略生效性：这是 ablation 的命门。
-    if view.policy in ("random", "progress", "self") and len(view.opponents) <= 4:
+    #
+    # progress 故意不在这里检查："只打过 b 个对手"是它的**正确**行为——
+    # 窗口只在稳定打赢（得分率 > advance_win_rate）之后才推进，
+    # 所以胜率还低的时候窗口本来就不该动。实测 17 轮胜率 0.25 时累计
+    # 4 个对手，那是策略在如实工作，不是没生效。
+    # 判断 progress 有没有生效要看**胜率上去之后窗口是否跟着推进**，
+    # 那需要跨轮对比，由 --target 跑完后的曲线回答。
+    if view.policy in ("random", "self") and len(view.opponents) <= view.batch:
         notes.append(
             f"⚠️ policy={view.policy} 但累计只打过 {len(view.opponents)} 个对手 —— "
             "对手策略可能没生效（那样四组消融会退化成同一组）"
         )
-    if view.policy == "fix" and len(view.opponents) > 6:
+    if view.policy == "fix" and view.batch and len(view.opponents) > view.batch + 2:
         notes.append(
             f"⚠️ policy=fix 却打过 {len(view.opponents)} 个对手 —— fix 应当固定打前 b 名"
         )
@@ -166,10 +205,14 @@ def verdict(view: RunView, *, target: int | None) -> list[str]:
     if target and view.iterations >= target and view.alive:
         notes.append("已达目标轮数但进程仍在（正常：最后一轮的收尾）")
     if not view.alive and (target is None or view.iterations < target):
+        # stop_reason 为空 = driver 没走到正常收尾（被杀 / OOM / 未捕获异常）。
+        # 有 stop_reason 说明是它自己决定停的（预算耗尽、协议纠正超限…）。
+        cause = view.stop_reason or "未知（driver 没写 stop_reason，可能是被杀或崩溃）"
         notes.append(
             f"✗ 进程已退出但只完成 {view.iterations}"
             + (f"/{target}" if target else "")
-            + f" 轮，stop_reason={view.stop_reason}"
+            + f" 轮，原因={cause}；续跑：bash scripts/run_hl.sh <config> {view.run_id} "
+            + str((target or view.iterations) - view.iterations)
         )
     return notes
 
@@ -179,11 +222,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runs-root", required=True, type=Path)
     parser.add_argument("--run-id", nargs="+", required=True)
     parser.add_argument("--target", type=int, default=None, help="目标轮数，用于判断是否跑完")
+    parser.add_argument(
+        "--log-dir",
+        nargs="*",
+        type=Path,
+        default=[],
+        help="driver stdout 日志（<run-id>.out）所在目录；不给则在 runs-root 附近找",
+    )
     arguments = parser.parse_args(argv)
 
     problems = 0
     for run_id in arguments.run_id:
-        view = inspect(arguments.runs_root.resolve(), run_id)
+        view = inspect(
+            arguments.runs_root.resolve(),
+            run_id,
+            log_dirs=tuple(item.resolve() for item in arguments.log_dir),
+        )
         head = (
             f"[{run_id}] policy={view.policy} 轮数={view.iterations}"
             + (f"/{arguments.target}" if arguments.target else "")
@@ -201,7 +255,11 @@ def main(argv: list[str] | None = None) -> int:
             f"    对手: 累计 {len(view.opponents)} 个，最近一轮 "
             f"{[item.split('__')[0] for item in view.last_opponents] or '—'}"
         )
-        print(f"    token={view.tokens / 1_000_000:.2f}M")
+        print(f"    token={view.tokens / 1_000_000:.2f}M", end="")
+        if view.retries:
+            print(f"  上游退避重试={view.retries} 次（503/429，拖慢吞吐但不是错误）")
+        else:
+            print()
         for note in verdict(view, target=arguments.target):
             print(f"    {note}")
             if note.startswith(("⚠️", "✗")):

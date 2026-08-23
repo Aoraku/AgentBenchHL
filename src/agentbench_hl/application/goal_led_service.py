@@ -1271,28 +1271,32 @@ class GoalLedService:
             if entry["played"] > 0
         }
 
-        # Elo 反解：b 个对手时用**逐对手**胜率各自反解再取均值，而不是拿总胜率
-        # 去配一个"平均锚点"。后者在对手强度差得远时会系统性偏掉：例如打赢
-        # Elo 500 的、打输 Elo 1500 的，总胜率 0.5 配上均值锚 1000 会报 1000，
-        # 而真实水平显然更接近 500~700 那一段。逐对手反解再平均没有这个问题。
-        per_opponent_elo: list[float] = []
-        for opponent, entry in by_opponent.items():
-            anchor = self._opponent_score(opponent)
-            if anchor is None or entry["played"] <= 0:
-                continue
-            probability = _clip(entry["points"] / entry["played"], 0.02, 0.98)
-            per_opponent_elo.append(
-                anchor + 400.0 * math.log10(probability / (1.0 - probability))
-            )
-        if per_opponent_elo:
-            elo_estimate = sum(per_opponent_elo) / len(per_opponent_elo)
-        elif win_rate is not None:
-            anchors = [self._opponent_score(item) for item in opponent_ids]
-            anchor_values = [value for value in anchors if value is not None]
-            if anchor_values:
-                probability = _clip(win_rate, 0.02, 0.98)
-                anchor = sum(anchor_values) / len(anchor_values)
-                elo_estimate = anchor + 400.0 * math.log10(probability / (1.0 - probability))
+        # 在**全池刻度**上反解这一版的 Elo。
+        #
+        # 口径：拿"该候选这一轮真打过的那几局" + 冻结人类池的锚点，做锚定 BT/MLE
+        # （``domain.pool_elo.estimate_pool_elo``，带 2 场虚拟平局的正则）。
+        # 它回答的是"这一版插进全池会排在哪"，而不是"它对这 4 个人的胜率"。
+        #
+        # 为什么不再自己手写 logistic 反解（原实现）
+        # -----------------------------------------
+        # 原实现是逐对手 ``anchor + 400·log10(p/(1-p))`` 再取平均，并把 p 钳到
+        # [0.02, 0.98] 以避免 log(0)。那个钳位会制造**假的平坦曲线**：
+        # fix 组固定打榜单前 4 名、胜率恒 0，于是 p 恒被钳成 0.02，
+        # 反解恒等于 2107.5 − 676 = 1431.4 —— 实测 14 轮一动不动全是 1431.37。
+        # 看图会得出"这一组完全没在学"的结论，而同期分差从 −36.12 收窄到 −28.12。
+        #
+        # 正则 MLE 没有这个毛病：全败时 θ 由先验拉住而不是被硬钳，
+        # 且估计值取决于**对手锚点的具体分布**，所以换了对手它就会动。
+        # 另外它与慢通道（全池实测）用的是同一个估计器，两条 Elo 曲线才同尺度可比。
+        estimate = estimate_pool_elo(
+            [
+                {"opponent_id": str(row["opponent_id"]), "points": row.get("points")}
+                for row in scored
+            ],
+            {opponent: self._opponent_score(opponent) for opponent in by_opponent},
+        )
+        elo_estimate = None if estimate is None else estimate.elo
+        elo_estimate_detail = None if estimate is None else estimate.as_dict()
 
         # 连续奖励：胜负是二值的，但**分差**不是。
         #
@@ -1356,6 +1360,10 @@ class GoalLedService:
             "infra_errors": len(infra),
             "win_rate": win_rate,
             "elo_vs_opponent": elo_estimate,
+            # 估计的可信度线索：用了几局、其中几局有锚点、得分率、锚点均值、方法名。
+            # 没有它就无法判断一个 Elo 数字该不该信（2 局与 200 局的估计画在
+            # 同一条曲线上，看起来一模一样）。
+            "elo_estimate": elo_estimate_detail,
             "opponent_ids": opponent_ids,
             "win_rate_by_opponent": win_rate_by_opponent,
             "best_candidate_id": best_candidate,

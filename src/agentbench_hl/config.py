@@ -366,9 +366,28 @@ class GoalConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
+    #: 是否自动起后台慢评测（每 N 轮把中间版本拉去打完整个冻结人类池）。
+    #:
+    #: ★ 这个开关**现在真的生效**了。它以前只被解析、没有任何消费点：
+    #: 写 ``true`` 什么也不会发生，慢评测一直靠人手动敲
+    #: ``scripts/pool_elo_worker.py``。漏做的表现是 Elo 面板里少一条实测曲线
+    #: ——不报错，只是图上静静地少一条线。消费点见 ``cli/main.py``。
     background_pool: bool = False
     pool_sample: int = 16
     pool_seeds: tuple[int, ...] = (7,)
+    #: 每几轮取一个版本做全池评测（只测各轮的最佳候选，即演进主线）。
+    #:
+    #: 3 是成本与分辨率的平衡点：32 轮 → 11 版 × 约 458 局 ≈ 5k 局，
+    #: 与迭代并行跑得完。stride=1 会变成 32 版 ≈ 15k 局，慢评测永远追不上
+    #: 迭代，图上只会有前几个点。相邻轮次的池内 Elo 差异远小于 ±50 标准误，
+    #: 抽样不改变曲线形状。
+    pool_stride: int = 3
+    #: 分轨（非对称）游戏必填：挑战者**自己扮演**哪一轨（如 rollman / ghost）。
+    #:
+    #: 不给的话慢评测会出现同轨互殴（ghost 打 ghost），那种对局在协议层就没
+    #: 意义——实测 rollman 的回放只有 2 行、IG 恒为常数，排查了很久才发现
+    #: 根因是轨道没分。
+    challenger_track: str | None = None
 
 
 @dataclass(frozen=True)
@@ -805,6 +824,12 @@ class ExperimentConfig:
                     _seeds(evaluation.get("pool_seeds"), "evaluation.pool_seeds")
                     if evaluation.get("pool_seeds") is not None
                     else (7,)
+                ),
+                pool_stride=_positive_int(
+                    evaluation.get("pool_stride"), "evaluation.pool_stride", 3
+                ),
+                challenger_track=_optional_text(
+                    evaluation.get("challenger_track"), "evaluation.challenger_track"
                 ),
             ),
             _environment=environment,

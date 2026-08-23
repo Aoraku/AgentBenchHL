@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -283,6 +284,59 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if arguments.command == "run":
                         from agentbench_hl.application.goal_led_driver import drive
 
+                        # 慢评测：evaluation.background_pool 为真时，起一个**独立**
+                        # worker 进程，每 N 轮把中间版本拉去打完整个冻结人类池，
+                        # 算它的真实池内 Elo 与名次。
+                        #
+                        # 为什么放在这里而不是 driver 里：worker 只写 pool-elo/，
+                        # 主账本 events.jsonl 由迭代进程独占（两个进程追加同一个
+                        # 账本会让对局记录交错，而这从曲线上看不出来）；
+                        # 而且它自带 CPU 水位控制，忙时自己停下等，不拖慢迭代。
+                        #
+                        # 这个配置项以前**只被解析、没人消费**：写 true 什么也不会
+                        # 发生，慢评测一直靠人手动敲 scripts/pool_elo_worker.py，
+                        # 漏做的表现是 Elo 面板里少一条实测曲线（不报错）。
+                        slow_eval = None
+                        if config.evaluation.background_pool:
+                            from agentbench_hl.application import slow_eval as slow
+
+                            try:
+                                plan = slow.build_plan(
+                                    run_root=service.root,
+                                    agentbench_root=config.paths.agentbench_root,
+                                    game=config.game,
+                                    repository_root=repository_root,
+                                    seeds=config.evaluation.pool_seeds,
+                                    stride=config.evaluation.pool_stride,
+                                    challenger_track=config.evaluation.challenger_track,
+                                )
+                                slow_eval = slow.spawn(plan)
+                                print(
+                                    json.dumps(
+                                        {
+                                            "status": "slow_eval_started",
+                                            "pid": slow_eval.pid,
+                                            **plan.as_dict(),
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    file=sys.stderr,
+                                )
+                            except (OSError, FileNotFoundError) as error:
+                                # 慢评测起不来**不能**打死迭代：它只是观测通道。
+                                # 但必须吼出来，否则就变成"图上静静地少一条线"。
+                                print(
+                                    json.dumps(
+                                        {
+                                            "status": "slow_eval_failed",
+                                            "error": f"{type(error).__name__}: {error}",
+                                            "impact": "迭代继续，但不会有全池实测 Elo 曲线",
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                    file=sys.stderr,
+                                )
+
                         # 轮数优先级：CLI --iterations > config runtime.max_iterations >
                         # 无限（None）。这样 max_iterations 才真正有消费点——它以前
                         # 只被解析、没人读，配了也不生效。
@@ -290,7 +344,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                         iterations = arguments.iterations
                         if iterations is None:
                             iterations = config.runtime.max_iterations
-                        result = drive(service, iterations=iterations)
+                        try:
+                            result = drive(service, iterations=iterations)
+                        finally:
+                            if slow_eval is not None and slow_eval.poll() is None:
+                                # 迭代结束后给慢评测一段时间把队列里剩下的版本测完
+                                # （它落后于迭代是常态），超时再收掉。
+                                # 不等的话最后几个版本会永远缺数据，而那几个恰好是
+                                # 最强的版本——曲线的尾巴断在最有价值的地方。
+                                try:
+                                    slow_eval.wait(timeout=1800)
+                                except subprocess.TimeoutExpired:
+                                    slow_eval.terminate()
                         payload = {
                             "status": "finished",
                             "run_root": str(service.root),

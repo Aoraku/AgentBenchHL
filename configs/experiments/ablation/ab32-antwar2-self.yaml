@@ -55,9 +55,17 @@ goal:
   seed_policy_path: null
 
 evaluation:
-  background_pool: false
+  # 慢通道：每 pool_stride 轮把中间版本拉去打完整个冻结人类池（229 人），
+  # 算它真实的池内 Elo 与名次。独立进程、独立对局、只写 pool-elo/，
+  # 不碰主账本，且自带 CPU 水位控制（忙时自己停下等），所以不拖慢迭代。
+  # Elo 面板上的**实测曲线**只来自这里；关掉它那条线就没有数据。
+  background_pool: true
+  pool_stride: 3
   pool_sample: 16
   pool_seeds: [7]
+  # antwar2 是对称游戏，无需指定轨道。分轨游戏（rollman）必填，
+  # 否则慢评测会同轨互殴（ghost 打 ghost），那种对局在协议层就没意义。
+  challenger_track: null
 
 isolation:
   backend: auto

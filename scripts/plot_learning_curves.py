@@ -55,6 +55,8 @@ COLORS = {
     "win_rate_live": "#9ecae1",  # 浅蓝（快通道）
     "elo": "#2ca02c",  # 绿（慢通道）
     "elo_live": "#ff7f0e",  # 橙（零成本反解，沿用历史配色）
+    "margin": "#8c564b",  # 棕（平均分差）
+    "margin_best": "#c49c94",  # 浅棕（最好的一局）
     "tokens": "#e377c2",  # 粉
 }
 TOKEN_BAR_COLOR = "#c5b0d5"
@@ -93,6 +95,16 @@ class Point:
     opponents: int
     tokens: int | None
     tokens_delta: int | None
+    #: 终局分差（平均 / 最好的一局）。
+    #:
+    #: 为什么必须单独画一栏：胜率与 Elo 对"长期打不赢"的组**完全是盲的**。
+    #: 实测 fix 组（固定打榜单前 4 名）14 轮胜率恒 0、反解 Elo 恒 1431.37
+    #: 一动不动，看图会得出"这一组没有任何学习"的结论；
+    #: 而同期分差从 -36.12 收窄到 -28.12（最好局 -32 → -18，改善 44%）——
+    #: agent 确实在稳步变强，只是还没跨过"能赢前 4 名"那道门槛。
+    #: 分差是连续量，没有胜率那种 0/1 的阈值效应，所以它才能显示这段进展。
+    margin_mean: float | None = None
+    margin_best: float | None = None
 
 
 @dataclass
@@ -103,6 +115,24 @@ class Run:
     pool_top_elo: float | None
     pool_median_elo: float | None
     evaluated: int
+    #: run 目录名，用来区分**同一游戏的多个 run**。
+    #:
+    #: 为什么不能只用 game 当标识：ablation 的四个 run 都是 antwar2，
+    #: 只按 game 命名会让四张图写到同一个文件名上互相覆盖（最后只剩一张），
+    #: 对比图的图例也会是四个一模一样的 "antwar2"，完全分不出谁是谁。
+    run_id: str = ""
+    #: 对手选择策略，ablation 的自变量。图例里要显示它。
+    policy: str | None = None
+    batch: int = 0
+
+    @property
+    def label(self) -> str:
+        """图例与文件名用的标识：优先显示自变量（policy），其次 run 目录名。"""
+
+        if self.policy:
+            suffix = f"b={self.batch}" if self.batch else ""
+            return f"{self.policy}{('/' + suffix) if suffix else ''}"
+        return self.run_id or self.game
 
 
 def _read_events(run_dir: Path) -> list[dict[str, Any]]:
@@ -198,6 +228,8 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
     pool_size, pool_top, pool_median = _pool_meta(run_dir)
 
     game = ""
+    policy: str | None = None
+    batch = 0
     points: list[Point] = []
     for event in events:
         if event.get("event_type") != METRICS_EVENT:
@@ -207,6 +239,9 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
         if not isinstance(iteration, int):
             continue
         game = str(payload.get("game") or game)
+        policy = payload.get("opponent_policy") or policy
+        if isinstance(payload.get("batch"), int):
+            batch = payload["batch"]
         champion = payload.get("best_candidate_id")
         result = static.get(str(champion)) if champion else None
         cumulative, delta = tokens.get(str(payload.get("request_id")), (None, None))
@@ -232,10 +267,30 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
                 opponents=len(payload.get("opponent_ids") or []),
                 tokens=cumulative,
                 tokens_delta=delta,
+                margin_mean=(
+                    float(payload["margin_mean"])
+                    if isinstance(payload.get("margin_mean"), (int, float))
+                    else None
+                ),
+                margin_best=(
+                    float(payload["margin_best"])
+                    if isinstance(payload.get("margin_best"), (int, float))
+                    else None
+                ),
             )
         )
     points.sort(key=lambda item: item.iteration)
-    return Run(game, points, pool_size, pool_top, pool_median, len(static))
+    return Run(
+        game,
+        points,
+        pool_size,
+        pool_top,
+        pool_median,
+        len(static),
+        run_id=run_dir.name,
+        policy=policy,
+        batch=batch,
+    )
 
 
 X_AXES = (("iteration", "迭代轮数"), ("trajectories_seen", "看过的轨迹数"))
@@ -273,22 +328,28 @@ def _draw_win_rate(axis, run: Run, x_key: str, x_label: str) -> None:
             label=f"迭代中实时胜率（每轮 {batch} 个对手，零成本）" if batch else "迭代中实时胜率",
         )
     xs, ys, _ = _xy(run, x_key, "win_rate")
-    axis.plot(
-        xs,
-        ys,
-        marker="o",
-        markersize=4,
-        linewidth=1.8,
-        color=COLORS["win_rate"],
-        label="慢评测：对冻结人类池总胜率",
-    )
+    if xs:
+        axis.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=4,
+            linewidth=1.8,
+            color=COLORS["win_rate"],
+            label="慢评测：对冻结人类池总胜率",
+        )
     axis.axhline(0.5, color=REFERENCE_COLOR, linestyle=":", linewidth=1.0, label="0.5 基准线")
     axis.set_ylim(-0.05, 1.05)
     axis.set_xlabel(x_label)
     axis.set_ylabel("胜率")
     # 标题必须写明两条线口径不同：实时胜率会随对手变强而下降，
     # 不写清楚的话"上升的静态胜率 + 下降的实时胜率"会被读成数据自相矛盾。
-    axis.set_title("胜率（虚线=对本轮对手，实线=对全池；口径不同，别直接比高低）")
+    # 慢通道没数据时更要写清楚，否则"只有一条虚线"会被当成图坏了。
+    axis.set_title(
+        "胜率（虚线=对本轮对手，实线=对全池；口径不同，别直接比高低）"
+        if xs
+        else "胜率（仅对本轮对手；对手难度逐轮变化，未做全池慢评测）"
+    )
     axis.legend(loc="lower right")
 
 
@@ -308,7 +369,10 @@ def _draw_elo(axis, run: Run, x_key: str, x_label: str) -> None:
             label="零成本反解（本轮那几局 + 冻结池锚点）",
         )
     xs, ys, items = _xy(run, x_key, "elo")
-    axis.plot(xs, ys, linewidth=1.8, color=COLORS["elo"], zorder=3, label="慢评测：全池实测 Elo")
+    if xs:
+        axis.plot(
+            xs, ys, linewidth=1.8, color=COLORS["elo"], zorder=3, label="慢评测：全池实测 Elo"
+        )
     if items:
         sizes = [18 + 0.35 * point.matches for point in items]
         axis.scatter(xs, ys, s=sizes, color=COLORS["elo"], zorder=4, edgecolor="white")
@@ -336,7 +400,13 @@ def _draw_elo(axis, run: Run, x_key: str, x_label: str) -> None:
         labels.append(f"池内中位 {run.pool_median_elo:.0f}")
     axis.set_xlabel(x_label)
     axis.set_ylabel("Elo")
-    axis.set_title("Elo（橙点=零成本反解，绿线=全池实测；标注为池内名次，点面积∝对局数）")
+    # 标题要如实说明这张图里**有什么**：慢通道没跑时只有橙点，
+    # 写"绿线=全池实测"会让人以为图缺了东西。
+    axis.set_title(
+        "Elo（橙点=零成本反解，绿线=全池实测；标注为池内名次，点面积∝对局数）"
+        if xs
+        else "Elo（仅零成本反解：本轮那几局 + 冻结池锚点；未做全池慢评测）"
+    )
     axis.legend(handles, labels, loc="lower right")
 
 
@@ -383,20 +453,63 @@ def _draw_tokens(axis, run: Run, x_key: str, x_label: str) -> None:
     axis.legend(line_handles + bar_handles, line_labels + bar_labels, loc="upper left")
 
 
+def _draw_margin(axis, run: Run, x_key: str, x_label: str) -> None:
+    """终局分差：胜率与 Elo 都看不见的那段进展。
+
+    实测 fix 组 14 轮胜率恒 0、反解 Elo 恒 1431.37，看那两栏会以为这一组
+    完全没在学；而分差同期从 -36.12 收窄到 -28.12（最好局 -32 → -18）。
+    胜率有阈值效应（赢不下来就一直是 0），分差是连续量，所以它先动。
+    """
+
+    xs, ys, _ = _xy(run, x_key, "margin_mean")
+    bx, by, _ = _xy(run, x_key, "margin_best")
+    if xs:
+        axis.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=4,
+            linewidth=1.8,
+            color=COLORS["margin"],
+            label="平均分差",
+        )
+    if bx:
+        axis.plot(
+            bx,
+            by,
+            marker="^",
+            markersize=3.5,
+            linewidth=1.2,
+            linestyle="--",
+            color=COLORS["margin_best"],
+            label="最好的一局",
+        )
+    axis.axhline(0.0, color=REFERENCE_COLOR, linestyle=":", linewidth=1.0, label="0（胜负分界）")
+    axis.set_xlabel(x_label)
+    axis.set_ylabel("终局分差")
+    axis.set_title("分差（连续量；胜率卡在 0/1 时靠它看进展）")
+    if xs or bx:
+        axis.legend(loc="best")
+
+
 PANELS = (
     ("win_rate", _draw_win_rate),
     ("elo", _draw_elo),
+    ("margin", _draw_margin),
     ("tokens", _draw_tokens),
 )
 
 
 def render(run: Run, output: Path) -> Path:
-    figure, axes = plt.subplots(3, 2, figsize=(15, 14))
+    figure, axes = plt.subplots(4, 2, figsize=(15, 18))
     for row, (_key, draw) in enumerate(PANELS):
         for column, (x_key, x_label) in enumerate(X_AXES):
             draw(axes[row][column], run, x_key, x_label)
     figure.suptitle(
-        f"{run.game}　迭代 {len(run.points)} 轮　"
+        f"{run.game}"
+        + (f"　对手策略 {run.policy}" if run.policy else "")
+        + (f"　b={run.batch}" if run.batch else "")
+        + f"　迭代 {len(run.points)} 轮　"
         f"人类池 {run.pool_size} 人（冻结）　已全池评测 {run.evaluated} 版",
         fontsize=14,
     )
@@ -408,8 +521,8 @@ def render(run: Run, output: Path) -> Path:
 
 
 def render_comparison(runs: list[Run], output: Path) -> Path:
-    figure, axes = plt.subplots(3, 2, figsize=(15, 14))
-    # 每个游戏一套独立配色：原先只有两组样式循环复用，5 个 run 会让
+    figure, axes = plt.subplots(4, 2, figsize=(15, 18))
+    # 一条曲线一套配色：原先只有两组样式循环复用，5 个 run 会让
     # generals / miracle / rollman 和 antwar 同色同线型，图例根本分不出谁是谁。
     styles = [
         ("#1f77b4", "-", "o"),
@@ -421,12 +534,29 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
         ("#8c564b", "-.", "X"),
         ("#e377c2", ":", "*"),
     ]
-    rows = (
-        ("win_rate", "静态池胜率"),
-        ("elo", "静态池 Elo"),
-        ("tokens", "累计 token (百万)"),
-    )
-    for row_index, (y_key, y_label) in enumerate(rows):
+
+    # 慢通道（全池实测）有没有数据，决定胜率/Elo 用哪个字段。
+    #
+    # 为什么必须自动回落：ablation 为了不占满机器会关掉 background_pool，
+    # 那时 win_rate / elo 全是 None。硬画慢通道字段的结果是**两张空白图**
+    # ——图上什么都没有，却不会报错，看图的人只会以为"实验没产生信号"。
+    slow = any(point.elo is not None for run in runs for point in run.points)
+    if slow:
+        rows = (
+            ("win_rate", "对冻结人类池胜率", "（慢通道：全池实测）"),
+            ("elo", "全池实测 Elo", "（各游戏池刻度独立，纵向不可比）"),
+            ("margin_mean", "平均终局分差", "（连续量；胜率卡在 0/1 时靠它看进展）"),
+            ("tokens", "累计 token (百万)", ""),
+        )
+    else:
+        rows = (
+            ("live_win_rate", "对当轮对手胜率", "（快通道；对手难度逐轮变化，只看趋势）"),
+            ("live_elo", "反解 Elo（全池尺度）", "（用本轮那几局 + 冻结池锚点反解）"),
+            ("margin_mean", "平均终局分差", "（连续量；胜率卡在 0/1 时靠它看进展）"),
+            ("tokens", "累计 token (百万)", ""),
+        )
+
+    for row_index, (y_key, y_label, note) in enumerate(rows):
         for column, (x_key, x_label) in enumerate(X_AXES):
             axis = axes[row_index][column]
             for index, run in enumerate(runs):
@@ -442,22 +572,31 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
                     linewidth=1.6,
                     linestyle=linestyle,
                     color=color,
-                    label=run.game,
+                    # 同游戏多 run（ablation）时 game 全一样，必须用 label
+                    # 显示自变量，否则图例是 4 个一模一样的 "antwar2"。
+                    label=run.label,
                 )
             axis.set_xlabel(x_label)
             axis.set_ylabel(y_label)
-            # Elo 必须写明不可比：每个游戏的人类池是各自独立拟合的，
-            # 锚点不同、量纲不同，放同一根轴上只能看趋势不能比高低。
-            axis.set_title(
-                y_label + ("（各游戏池刻度独立，纵向不可比）" if y_key == "elo" else "")
-            )
-            if y_key == "win_rate":
+            axis.set_title(y_label + note)
+            if y_key in ("win_rate", "live_win_rate"):
                 axis.set_ylim(-0.05, 1.05)
+                axis.axhline(0.5, color="0.6", linestyle=":", linewidth=1.0)
+            if y_key == "margin_mean":
+                axis.axhline(0.0, color="0.6", linestyle=":", linewidth=1.0)
             axis.legend(loc="best")
-    figure.suptitle(
-        "各游戏 HL 迭代对比（" + "、".join(run.game for run in runs) + "）",
-        fontsize=14,
-    )
+
+    games = sorted({run.game for run in runs})
+    if len(games) == 1 and len({run.policy for run in runs}) > 1:
+        # ablation 口径：同游戏、同模型，只有对手策略不同。
+        heading = (
+            f"{games[0]}　对手选择方式 ablation（"
+            + "、".join(run.label for run in runs)
+            + "）"
+        )
+    else:
+        heading = "各游戏 HL 迭代对比（" + "、".join(run.label for run in runs) + "）"
+    figure.suptitle(heading + ("" if slow else "　※ 未做全池慢评测，图为快通道口径"), fontsize=14)
     figure.tight_layout(rect=(0, 0, 1, 0.978))
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, dpi=150)
@@ -481,6 +620,8 @@ def table(run: Run) -> list[dict[str, Any]]:
             "live_elo": None if point.live_elo is None else round(point.live_elo, 2),
             "live_matches": point.live_matches,
             "opponents": point.opponents,
+            "margin_mean": None if point.margin_mean is None else round(point.margin_mean, 2),
+            "margin_best": None if point.margin_best is None else round(point.margin_best, 2),
             "tokens": point.tokens,
             "tokens_delta": point.tokens_delta,
         }
@@ -506,7 +647,11 @@ def main(argv: list[str] | None = None) -> int:
     for index, run_dir in enumerate(arguments.run_dir):
         pool_dir = pool_dirs[index] if index < len(pool_dirs) else None
         run = load_run(run_dir.resolve(), pool_dir)
-        name = run.game or run_dir.name
+        # 文件名用 **run 目录名**，不能用 game。
+        # ablation 的四个 run 都是 antwar2，按 game 命名会让四张图写到
+        # 同一个 curves-antwar2.png 上互相覆盖，最后只剩最后跑的那一张
+        # ——而命令行输出看起来是"四张都出好了"。
+        name = run_dir.name or run.game
         rows = table(run)
         rated = [row for row in rows if row["elo"] is not None]
         if len(rated) < arguments.require_evaluated:
@@ -521,7 +666,20 @@ def main(argv: list[str] | None = None) -> int:
         (arguments.out_dir / f"curves-{name}.json").write_text(
             json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        print(f"[{name}] {len(rows)} 轮，全池评测覆盖 {len(rated)} 轮 -> {image}")
+        live = [row for row in rows if row["live_win_rate"] is not None]
+        print(
+            f"[{name}] policy={run.policy} b={run.batch} {len(rows)} 轮，"
+            f"全池评测覆盖 {len(rated)} 轮 -> {image}"
+        )
+        if live:
+            # 用 live_matches（快通道对局数），不是 matches（慢通道全池局数）。
+            # 两个字段名只差一个前缀，写错的表现是"每轮 4 个对手 / 0 局"——
+            # 自相矛盾但不会报错。
+            print(
+                f"        快通道胜率 首轮 {live[0]['live_win_rate']} → "
+                f"最近 {live[-1]['live_win_rate']}"
+                f"（每轮 {live[-1]['opponents']} 个对手 / {live[-1]['live_matches']} 局）"
+            )
         if rated:
             peak = max(rated, key=lambda row: row["elo"])
             print(
