@@ -309,6 +309,41 @@ def _write_status(queue_root: Path, payload: dict[str, object]) -> None:
 # ------------------------------------------------------------------ 主循环
 
 
+def _iteration_finished(run_root: Path) -> bool:
+    """主迭代是不是已经结束了（没有 driver 进程在跑这个 run）。
+
+    判据用**进程**而不是"轮数是否达到 max_iterations"：run 可能因超时/失败
+    提前停下，也可能被续跑（32 → 64），轮数判断在这两种情况下都会算错。
+
+    读 ``/proc/<pid>/cmdline`` 而不是 ``pgrep -f``：pattern ``--run-id x`` 以
+    ``-`` 开头，pgrep 会把它当成自己的选项；而绕过之后 pgrep 又会匹配到调用者
+    自己的命令行。两种误判都实测踩过（一次让四个健康 run 全被报成"停"，
+    一次让已死的 run 一直被报成"活"）。
+
+    ``/proc`` 不存在时（非 Linux）返回 ``False``（当作"还在跑"），
+    宁可多空转也不要把还在产出的 worker 提前收掉。
+    """
+
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+
+    run_id = run_root.name
+    self_pid = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == self_pid:
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+        except (OSError, PermissionError):
+            continue
+        if run_id in command and "abhl" in command and "goal-led" in command:
+            return False
+    return True
+
+
 def run_worker(
     run_root: Path,
     agentbench_root: Path,
@@ -367,6 +402,19 @@ def run_worker(
             write_index(queue_root, pool)
             if once:
                 log("[pool-elo] 队列已空，退出（--once）")
+                return 0
+            # 迭代已经结束、且没有待测版本 —— 这个 worker 已经没有存在的理由了，
+            # 继续轮询就是白占机时。
+            #
+            # 为什么必须自动退出：实测有 9 个早已跑完的 run（sota-antwar / g4 /
+            # m4 / r4 / snakego4 …）的 worker 还在空转，每个 --parallel 6，
+            # 它们把新起的 ablation 慢评测**完全饿死**（35 版排队只完成 1 版）。
+            # 白占的机时不会报错，只会让别的东西慢，所以很难发现。
+            if _iteration_finished(run_root):
+                log(
+                    f"[pool-elo] 队列已空且迭代已结束（共评测 {evaluated} 版），"
+                    "自动退出以释放机时"
+                )
                 return 0
             log(f"[pool-elo] 队列已空，{poll_s:.0f}s 后重新扫描新版本")
             time.sleep(poll_s)

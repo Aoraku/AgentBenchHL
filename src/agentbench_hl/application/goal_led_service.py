@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import shutil
 import subprocess
 import time
@@ -58,6 +57,8 @@ from agentbench_hl.application.info_gain import (
     replay_divergence,
 )
 from agentbench_hl.application.opponent_policy import (
+    PROGRESS_WINDOW_ITERATIONS,
+    PROGRESS_WINDOW_WINS,
     SELF_DECIDE,
     LadderEntry,
     OpponentHistory,
@@ -117,6 +118,10 @@ class GoalLedService:
         advance_min_matches: int = 2,
         advance_win_rate: float = 0.75,
         advance_streak: int = 1,
+        #: progress 的晋级判据：最近 N 轮共 2N 局里至少 W 胜。
+        #: 默认 2 轮 4 局 3 胜（见 opponent_policy.PROGRESS_WINDOW_*）。
+        progress_window_iterations: int = PROGRESS_WINDOW_ITERATIONS,
+        progress_window_wins: int = PROGRESS_WINDOW_WINS,
         match_parallelism: int = 1,
         prompt_override: str | None = None,
         experience_skills: bool = True,
@@ -211,31 +216,47 @@ class GoalLedService:
             target_rank=opponent_rank,
             start_rank=opponent_start_rank,
             seed=abs(hash(str(self.root))) % 10_000,
-            advance_min_matches=self.advance_rule.min_matches,
-            advance_win_rate=self.advance_rule.win_rate,
+            # progress 的晋级判据：最近 N 轮共 2N 局至少 W 胜（默认 2 轮 4 局 3 胜）。
+            # 与上面的 AdvanceRule 是**两套不同用途**：AdvanceRule 只服务
+            # ladder_up/ladder_down 的"顺序征服进度"展示，而这里决定 progress
+            # 的槽位什么时候往前挪。
+            window_iterations=progress_window_iterations,
+            window_wins=progress_window_wins,
         )
 
     # -------------------------------------------------------- opponent history
 
     def _opponent_history(self) -> OpponentHistory:
-        """迄今对每个对手的累计战绩（progress 晋级与 self 决策的依据）。
+        """迄今对每个对手的战绩（progress 晋级与 self 决策的依据）。
 
         从事件流重算而不是内存累加：断点续跑、事后复盘、换机器都要得到同一份
         进度。只算 ``status == complete`` 的局——一次沙箱故障不该被读成"打不赢"。
+
+        除累计值外还给出**逐轮明细**：progress 的晋级判据是"最近 2 轮共 4 局
+        至少 3 胜"，那是个滑动窗口，从累计值里还原不出来。
         """
 
         totals: dict[str, dict[str, float]] = {}
+        rounds: dict[str, dict[int, dict[str, float]]] = {}
         for row in self._match_rows_from_events():
             if row.get("status") != "complete":
                 continue
             opponent = row.get("opponent_id")
             if not isinstance(opponent, str):
                 continue
+            points = row.get("points")
+            value = float(points) if isinstance(points, (int, float)) else 0.0
             entry = totals.setdefault(opponent, {"played": 0.0, "points": 0.0})
             entry["played"] += 1.0
-            points = row.get("points")
-            entry["points"] += float(points) if isinstance(points, (int, float)) else 0.0
-        return OpponentHistory(totals)
+            entry["points"] += value
+            iteration = row.get("iteration")
+            if isinstance(iteration, int):
+                slot = rounds.setdefault(opponent, {}).setdefault(
+                    iteration, {"played": 0.0, "points": 0.0}
+                )
+                slot["played"] += 1.0
+                slot["points"] += value
+        return OpponentHistory(totals, rounds)
 
     # ------------------------------------------------------------------ state
 
@@ -2033,7 +2054,6 @@ class GoalLedService:
             "total_tokens": tokens,
             "token_events_sum": self._token_event_sum(),
             "total_wall_time_s": round(time.time() - self._started_at(), 3),
-            "infra_errors": summary.get("infra_errors"),
             # 实验 2 的第二个横坐标：agent 到目前为止真正能读到的完整轨迹数。
             "trajectories_seen": self._trajectories_seen(),
             # 实验 5：有序课程的征服进度（非有序策略为 null）。

@@ -59,7 +59,24 @@ DEFAULT_PROGRESS_START = 20
 DEFAULT_LADDER_UP_START = 10
 DEFAULT_LADDER_DOWN_START = 1
 # progress 的晋级门槛：得分率严格高于它才往前进一名。
-DEFAULT_PROGRESS_WIN_RATE = 0.75
+#: ``progress`` 的晋级判据：**最近 N 轮里至少 W 胜**才算稳定打过。
+#:
+#: 为什么是"最近 N 轮"而不是"累计得分率 > 0.75"
+#: ------------------------------------------
+#: 累计得分率有两个毛病，都会让课程走歪：
+#:
+#: 1. **早期噪声会永久拖住游标**。第 1 轮运气不好 0/2，之后连赢 6 局，
+#:    累计得分率是 6/8 = 0.75，不严格大于 0.75 —— 明明已经稳定赢了 3 轮，
+#:    游标还卡在原地。
+#: 2. **它不衡量"当前实力"而是"历史平均"**。策略在迭代，第 1 轮的败绩
+#:    不该被算进第 10 轮的实力判断里。
+#:
+#: 改成滑动窗口：只看**最近 2 轮**对该对手的 4 局（每轮双座次各 1 局），
+#: 至少 3 胜才晋级。这既要求"连续两轮都能赢"（不是单轮运气），
+#: 又不会被远古败绩污染。
+PROGRESS_WINDOW_ITERATIONS = 2
+PROGRESS_WINDOW_WINS = 3
+
 
 
 @dataclass(frozen=True)
@@ -75,9 +92,14 @@ class OpponentHistory:
 
     ``by_opponent`` 的每一项是 ``{"played": int, "points": float}``：
     points 是胜 1 / 平 0.5 / 负 0 的累加，与 :mod:`conquest` 同一套口径。
+
+    ``rounds`` 是**逐轮**明细 ``{对手: {轮次: {"played", "points"}}}``。
+    progress 的晋级判据需要它：判据是"最近 2 轮共 4 局至少 3 胜"，
+    那是个滑动窗口，从累计值里还原不出来。
     """
 
     by_opponent: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    rounds: Mapping[str, Mapping[int, Mapping[str, float]]] = field(default_factory=dict)
 
     def played(self, opponent_id: str) -> int:
         entry = self.by_opponent.get(opponent_id) or {}
@@ -90,13 +112,43 @@ class OpponentHistory:
             return None
         return float(entry.get("points") or 0.0) / played
 
-    def beaten(self, opponent_id: str, *, min_matches: int, win_rate: float) -> bool:
-        """是否算"稳定打过"：局数够 且 得分率严格高于门槛。"""
+    def recent_window(
+        self, opponent_id: str, *, iterations: int
+    ) -> tuple[float, int]:
+        """最近 ``iterations`` 轮对该对手的 (得分, 局数)。
 
-        rate = self.score_rate(opponent_id)
-        if rate is None or self.played(opponent_id) < min_matches:
+        只取**该对手实际出场过**的轮次：progress 的窗口会滑动，
+        某个对手可能连续几轮都不在名单里，那些轮次不该被算成"0 胜"。
+        """
+
+        per_round = self.rounds.get(opponent_id) or {}
+        if not per_round:
+            return 0.0, 0
+        recent = sorted(per_round)[-max(1, iterations):]
+        points = sum(float((per_round[key] or {}).get("points") or 0.0) for key in recent)
+        played = sum(int((per_round[key] or {}).get("played") or 0) for key in recent)
+        return points, played
+
+    def beaten(
+        self,
+        opponent_id: str,
+        *,
+        window_iterations: int = PROGRESS_WINDOW_ITERATIONS,
+        window_wins: int = PROGRESS_WINDOW_WINS,
+    ) -> bool:
+        """是否算"稳定打过"：**最近 window_iterations 轮**里至少 window_wins 胜。
+
+        默认 2 轮 / 3 胜：每轮双座次各 1 局，2 轮就是 4 局，4 局 3 胜。
+
+        窗口必须**填满**才判晋级（``played`` 要够 ``window_iterations`` 轮的量）：
+        只打了 1 轮就 2 胜也不能晋级 —— 判据的核心是"连续两轮都赢"，
+        单轮全胜可能只是座次或 seed 的运气。
+        """
+
+        points, played = self.recent_window(opponent_id, iterations=window_iterations)
+        if played < window_wins:
             return False
-        return rate > win_rate
+        return points >= float(window_wins)
 
 
 class OpponentPolicy(Protocol):
@@ -194,17 +246,27 @@ class Progressive(_Base):
     晋级规则（确定性、只依赖战绩，因此可复现）：
 
     1. 初始窗口是 ``[start, start-1, …, start-b+1]``（名次数字变小 = 越来越强）；
-    2. 某个槽位的对手若已"稳定打过"（局数 ≥ min_matches 且得分率 > win_rate），
+    2. 某个槽位的对手若已"稳定打过"（**最近 2 轮共 4 局里至少 3 胜**），
        该槽位往榜首方向前进；
     3. 前进时**跳过所有已经打过的名次**（否则 b 个槽位会互相踩）；
     4. 一直打不赢的对手留在原槽位不动，不会阻塞其它槽位前进。
 
     b=1 时退化成"一个一个往上升"，即原来的 ``ladder_up``。
+
+    判据为什么是"最近 2 轮 4 局 3 胜"而不是"累计得分率 > 0.75"
+    -------------------------------------------------------
+    累计得分率会被早期噪声永久拖住：第 1 轮运气不好 0/2、之后连赢 6 局，
+    累计是 6/8 = 0.75，**不严格大于** 0.75，于是明明已经连赢三轮，
+    游标还卡在原地。而且它衡量的是"历史平均"而不是"当前实力"——
+    策略在迭代，第 1 轮的败绩不该算进第 10 轮的判断里。
+
+    滑动窗口两者都解决：要求"连续两轮都能赢"（排除单轮运气），
+    又不被远古败绩污染。
     """
 
     start_rank: int = DEFAULT_PROGRESS_START
-    min_matches: int = 2
-    win_rate: float = DEFAULT_PROGRESS_WIN_RATE
+    window_iterations: int = PROGRESS_WINDOW_ITERATIONS
+    window_wins: int = PROGRESS_WINDOW_WINS
     name: str = "progress"
 
     def _window(self, batch: int, history: OpponentHistory | None) -> tuple[str, ...]:
@@ -232,7 +294,9 @@ class Progressive(_Base):
             item.opponent_id
             for item in ordered
             if history.beaten(
-                item.opponent_id, min_matches=self.min_matches, win_rate=self.win_rate
+                item.opponent_id,
+                window_iterations=self.window_iterations,
+                window_wins=self.window_wins,
             )
         }
         chosen: list[str] = []
@@ -269,9 +333,10 @@ class Progressive(_Base):
             return "榜单为空，本轮对手由框架回落选择。"
         return (
             f"本轮阶梯窗口 {len(targets)} 个对手：{self._describe(targets)}。"
-            f"规则：对某个对手的得分率超过 {self.win_rate:.0%}（至少 "
-            f"{self.min_matches} 局）就算稳定击败，框架会把那个槽位换成更强的一名"
-            "（已打过的名次会被跳过）；打不赢的会留在原位，所以请把它研究透。"
+            f"规则：对同一个对手在**最近 {self.window_iterations} 轮**共 "
+            f"{self.window_iterations * 2} 局里赢下至少 {self.window_wins} 局，"
+            "就算稳定击败，框架会把那个槽位换成更强的一名（已打过的名次会被跳过）；"
+            "打不赢的会留在原位，所以请把它研究透。"
         )
 
 
@@ -299,20 +364,22 @@ class SelfDecide(_Base):
             "等把中间段清完再回来面对。把这一轮的取舍理由写进 rationale。",
         ]
         if history is not None and history.by_opponent:
-            beaten = sorted(
-                item
-                for item in history.by_opponent
-                if history.beaten(item, min_matches=2, win_rate=DEFAULT_PROGRESS_WIN_RATE)
-            )
+            beaten = sorted(item for item in history.by_opponent if history.beaten(item))
             stuck = sorted(
                 item
                 for item in history.by_opponent
                 if history.played(item) >= 2 and (history.score_rate(item) or 0.0) <= 0.25
             )
             if beaten:
-                lines.append(f"框架统计：已稳定打赢 {len(beaten)} 个对手（{self._describe(beaten[:8])}）。")
+                lines.append(
+                    f"框架统计：已稳定打赢 {len(beaten)} 个对手"
+                    f"（{self._describe(beaten[:8])}）。"
+                )
             if stuck:
-                lines.append(f"框架统计：长期打不赢 {len(stuck)} 个对手（{self._describe(stuck[:8])}）。")
+                lines.append(
+                    f"框架统计：长期打不赢 {len(stuck)} 个对手"
+                    f"（{self._describe(stuck[:8])}）。"
+                )
         return "".join(lines)
 
 
@@ -346,7 +413,7 @@ class SequentialConquest(_Base):
             return 0
         cleared = 0
         for opponent_id in self.target_sequence():
-            if history.beaten(opponent_id, min_matches=2, win_rate=0.6):
+            if history.beaten(opponent_id):
                 cleared += 1
             else:
                 break
@@ -457,8 +524,12 @@ def build_policy(
     target_rank: int | None = None,
     start_rank: int | None = None,
     seed: int = 0,
-    advance_min_matches: int = 2,
-    advance_win_rate: float = DEFAULT_PROGRESS_WIN_RATE,
+    # progress 的晋级判据：最近 N 轮共 2N 局里至少 W 胜。
+    # 旧参数名（advance_min_matches / advance_win_rate）已移除：那套"累计得分率"
+    # 口径会被早期噪声永久拖住游标（0/2 之后连赢 6 局，累计恰好 0.75，
+    # 不严格大于门槛，游标不动）。
+    window_iterations: int = PROGRESS_WINDOW_ITERATIONS,
+    window_wins: int = PROGRESS_WINDOW_WINS,
 ) -> OpponentPolicy:
     entries = tuple(ladder)
     if not entries:
@@ -472,8 +543,8 @@ def build_policy(
         return Progressive(
             entries,
             start_rank=start_rank or DEFAULT_PROGRESS_START,
-            min_matches=max(1, int(advance_min_matches)),
-            win_rate=float(advance_win_rate),
+            window_iterations=max(1, int(window_iterations)),
+            window_wins=max(1, int(window_wins)),
         )
     if resolved == SELF_DECIDE:
         return SelfDecide(entries)

@@ -154,6 +154,61 @@ def _materialize_bootstrap(
             shutil.copy2(seed_policy, bootstrap / seed_policy.name)
 
 
+#: 续跑时**允许**变化的配置键（顶层段名 → 该段内允许变化的字段）。
+#:
+#: 为什么需要区分
+#: --------------
+#: "续跑时配置必须逐字节一致"这道校验本身是对的：中途改模型、改 k、改对手
+#: 策略会让前后轮次不可比，而事故只会在事后画图时才显现。
+#:
+#: 但它原来把**观测通道**和**实验变量**一视同仁，于是"打开慢评测"这种
+#: 完全不碰迭代的改动也会让续跑直接失败：
+#:
+#:     ContractFactoryError: current experiment config differs from frozen run config
+#:
+#: 报错还不说是哪个字段变了，只能靠人 diff 两份 JSON。实测 random 组因此
+#: 无法续跑最后 6 轮——而它死于第 26 轮的 checkpoint 超时，本该一条命令救回来。
+#:
+#: 判据：**这个字段会不会改变 agent 看到的东西或它的对局？** 不会的就放行。
+#: * ``evaluation``：慢评测完全在另一个进程、另建对局，只写 pool-elo/。
+#: * ``budget``：预算是停机条件而不是实验变量；续跑本来就是"再给一些预算"。
+#: * ``runtime.max_iterations``：同理，"再跑几轮"是续跑的定义本身。
+#: * ``runtime.match_parallelism`` / ``match_timeout_s``：并发度与超时是
+#:   机时调度参数。超时放宽会改变"能不能跑完"，但不改变对局的规则与对手。
+_RESUME_MUTABLE: dict[str, frozenset[str] | None] = {
+    "evaluation": None,  # None = 整段都可变
+    "budget": None,
+    "runtime": frozenset({"max_iterations", "match_parallelism", "match_timeout_s"}),
+}
+
+
+def _significant_config_changes(previous: dict, current: dict) -> list[str]:
+    """列出续跑时**不允许**变化的配置差异（空列表 = 可以续跑）。
+
+    返回的是"段.字段"清单而不是布尔值：报错必须说出到底哪里变了，
+    否则调用方只能自己 diff 两份 JSON 去猜。
+    """
+
+    changed: list[str] = []
+    for key in sorted(set(previous) | set(current)):
+        before, after = previous.get(key), current.get(key)
+        if before == after:
+            continue
+        if key not in _RESUME_MUTABLE:
+            changed.append(key)
+            continue
+        allowed = _RESUME_MUTABLE[key]
+        if allowed is None:
+            continue
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            changed.append(key)
+            continue
+        for field in sorted(set(before) | set(after)):
+            if before.get(field) != after.get(field) and field not in allowed:
+                changed.append(f"{key}.{field}")
+    return changed
+
+
 def build_goal_run(
     config_path: str | Path,
     *,
@@ -256,8 +311,19 @@ def build_goal_run(
     config_path_out = run_root / "run-config.json"
     if resume and config_path_out.is_file():
         previous = json.loads(config_path_out.read_text(encoding="utf-8"))
+        changed = _significant_config_changes(previous, frozen)
+        if changed:
+            raise ContractFactoryError(
+                "current experiment config differs from frozen run config: "
+                + ", ".join(changed)
+            )
+        # 只有观测通道变了（例如打开慢评测）：更新冻结副本并继续。
+        # 见 _significant_config_changes 的详注。
         if previous != frozen:
-            raise ContractFactoryError("current experiment config differs from frozen run config")
+            config_path_out.write_text(
+                json.dumps(frozen, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
     else:
         config_path_out.write_text(
             json.dumps(frozen, ensure_ascii=False, sort_keys=True, indent=2) + "\n",

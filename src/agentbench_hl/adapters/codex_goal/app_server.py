@@ -363,6 +363,16 @@ class CodexGoalRuntime:
         self.events: list[MappedAgentEvent] = []
         self._turn_telemetry: list[dict[str, object]] = []
 
+    def _proxy_backoff_seconds(self) -> float:
+        """proxy 至今在上游退避上累计等待的秒数（没有 proxy 时为 0）。
+
+        用于把"等上游"的时间从 checkpoint 预算里扣掉，见 run_until_checkpoint
+        里的详注（random 组曾因此被限流误杀）。
+        """
+
+        proxy = self.responses_proxy
+        return proxy.backoff_seconds if proxy is not None else 0.0
+
     def set_turn_reasoning_effort(self, effort: str) -> None:
         if not effort.strip():
             raise ValueError("turn reasoning effort cannot be empty")
@@ -580,13 +590,34 @@ class CodexGoalRuntime:
         turn_value = turn.get("turn", {})
         if isinstance(turn_value, dict) and isinstance(turn_value.get("id"), str):
             session.active_turn_id = turn_value["id"]
+        # checkpoint 预算只应该衡量 **agent 自己花的时间**，不该被上游限流吃掉。
+        #
+        # 实测事故：random 组死在第 26 轮，报
+        #     TimeoutError: Codex Goal did not reach a checkpoint in time
+        # 而当时日志里是连续十几次 503。agent 根本没有卡住，是限流的退避等待
+        # 把这个固定墙钟耗光了。最坏的地方是它**归错了因**——看事件账本会以为
+        # "模型这一轮没产出候选"，实际是基建抖动。
+        #
+        # 做法：每次检查剩余时间时，把 proxy 至今累计的退避秒数加回 deadline。
+        # 这样"等上游"的时间不计入 agent 的思考预算，而 agent 真的卡住时
+        # 仍然会照常超时（退避计数器不会增长）。
+        backoff_at_start = self._proxy_backoff_seconds()
         deadline = time.monotonic() + self.checkpoint_timeout_s
         runtime_error: str | None = None
         turn_started = False
         while True:
-            remaining = deadline - time.monotonic()
+            compensation = self._proxy_backoff_seconds() - backoff_at_start
+            remaining = deadline + compensation - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Codex Goal did not reach a checkpoint in time")
+                raise TimeoutError(
+                    "Codex Goal did not reach a checkpoint in time"
+                    + (
+                        f"（已扣除上游退避等待 {compensation:.0f}s，"
+                        f"仍超过 {self.checkpoint_timeout_s:.0f}s 预算）"
+                        if compensation > 0
+                        else ""
+                    )
+                )
             try:
                 notification = client.next_notification(min(remaining, 60.0))
             except TimeoutError:

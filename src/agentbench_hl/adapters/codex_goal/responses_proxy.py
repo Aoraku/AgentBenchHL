@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, urlunsplit
@@ -34,6 +35,41 @@ class ResponsesCompatProxy:
         self.timeout_s = timeout_s
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # 退避上**累计等了多久**，以及被吸收掉的可重试失败次数。
+        #
+        # 为什么必须暴露出来：checkpoint 超时是一个**固定墙钟**
+        # （app_server 的 checkpoint_timeout_s），而 503 退避的等待会直接
+        # 吃掉它。实测 random 组死在第 26 轮：
+        #
+        #     TimeoutError: Codex Goal did not reach a checkpoint in time
+        #
+        # 而当时日志里是连续十几次 503 —— agent 根本没有超时，是限流把
+        # checkpoint 预算耗光了。这类死法最坏的地方是它**归错了因**：
+        # 看事件账本会以为"模型这一轮没产出候选"。
+        #
+        # 所以 app_server 会读这个计数器，把退避等待从 deadline 里扣掉。
+        self._backoff_lock = threading.Lock()
+        self._backoff_seconds = 0.0
+        self._absorbed_failures = 0
+
+    @property
+    def backoff_seconds(self) -> float:
+        """至今在退避上累计等待的秒数（供 checkpoint deadline 补偿）。"""
+
+        with self._backoff_lock:
+            return self._backoff_seconds
+
+    @property
+    def absorbed_failures(self) -> int:
+        """被退避吸收掉的可重试失败次数（限流/上游抖动）。"""
+
+        with self._backoff_lock:
+            return self._absorbed_failures
+
+    def _record_backoff(self, seconds: float, failures: int) -> None:
+        with self._backoff_lock:
+            self._backoff_seconds += max(0.0, seconds)
+            self._absorbed_failures += max(0, failures)
 
     @property
     def base_url(self) -> str:
@@ -70,12 +106,24 @@ class ResponsesCompatProxy:
                 # （502 重试成功后读 205 KB 响应体时断掉，异常冒到 HTTP 线程，
                 # 整个 run 终止）。把读体一起纳入重试才有原子语义。
                 try:
+                    retried = 0
+
+                    def _log(message: str) -> None:
+                        nonlocal retried
+                        retried += 1
+                        print(message, file=sys.stderr)
+
+                    attempt_started = time.monotonic()
                     upstream_response = request_bytes_with_backoff(
                         request,
                         timeout_s=owner.timeout_s,
-                        log=lambda message: print(message, file=sys.stderr),
+                        log=_log,
                     )
+                    if retried:
+                        # 只在真的退避过时记账，避免把正常请求的耗时也算进去。
+                        owner._record_backoff(time.monotonic() - attempt_started, retried)
                 except Exception as error:  # noqa: BLE001 - 必须翻译成 HTTP 响应
+                    owner._record_backoff(time.monotonic() - attempt_started, 1)
                     # 重试耗尽也不能让异常冒到 ThreadingHTTPServer：那会打死整个
                     # turn。翻译成 502 交回 codex CLI，由它自己的重试/报错路径处理。
                     detail = json.dumps(

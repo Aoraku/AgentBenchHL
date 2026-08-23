@@ -127,3 +127,34 @@ def test_log_path_sits_next_to_the_run_directory(tmp_path: Path) -> None:
 
     assert plan.log_path.name == "ab32-antwar2-fix.pool-elo.log"
     assert plan.log_path.parent == (tmp_path / "runs")
+
+
+def test_spawn_refuses_to_start_a_second_worker(tmp_path: Path, monkeypatch) -> None:
+    """同一个 run 只能有一个 worker。
+
+    慢评测有两个入口：新 run 由 ``background_pool: true`` 自动挂，
+    已在跑的 run 用 ``attach_slow_eval.sh`` 手动挂。两者撞车时会有两个 worker
+    **并发写同一个 pool-elo/**：同一版本重复调度、``matches.jsonl`` 交错追加、
+    ``challenger-elo.json`` 互相覆盖。这些都不报错，只是白烧机时、数据可疑。
+    """
+
+    from agentbench_hl.application import slow_eval
+
+    plan = _plan(tmp_path)
+    monkeypatch.setattr(slow_eval, "already_running", lambda _root: 4242)
+
+    assert slow_eval.spawn(plan) is None, "已有 worker 时必须返回 None 而不是再起一个"
+
+
+def test_already_running_ignores_unrelated_workers(tmp_path: Path) -> None:
+    """别的 run 的 worker 不该被误认成自己的。
+
+    四个 ablation run 的 worker 会同时存在，run_root 只差最后一段路径；
+    用子串匹配时若不带完整路径就会互相误判，结果是**三个 run 都不会挂上
+    慢评测**（各自以为已经有人在跑了），而 Elo 面板静静地少三条线。
+    """
+
+    from agentbench_hl.application.slow_eval import already_running
+
+    # 真实进程表里不会有这个路径的 worker。
+    assert already_running(tmp_path / "runs" / "no-such-run-xyz") is None

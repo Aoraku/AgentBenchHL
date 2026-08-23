@@ -69,10 +69,20 @@ RETRYABLE_READ_ERRORS = (
     TimeoutError,
 )
 
-DEFAULT_ATTEMPTS = 12
+#: 单次请求最多试几次。
+#:
+#: 次数只是**上限**，真正的闸门是 ``DEFAULT_MAX_TOTAL_DELAY``（总退避预算）。
+#: 提到 24 是因为 sbtunnel 的限流是**持续几十分钟**的：实测四个 run 并发时
+#: 累计 213 次 503，单次请求最多连续被拒 12 次以上。次数卡死在 12 会让
+#: "本该等得起"的限流变成一轮迭代报废（几十万 token 白花）。
+DEFAULT_ATTEMPTS = 24
 DEFAULT_MAX_DELAY = 90.0
 #: 单次请求允许累计等待多久（秒）。限流是等得起的故障，见模块头注释。
-DEFAULT_MAX_TOTAL_DELAY = 600.0
+#:
+#: 30 分钟：一轮迭代的 agent 思考本身就要几分钟到几十分钟，等半小时换回
+#: 一轮不报废是划算的。checkpoint 超时不会因此被误触发——app_server 会把
+#: 退避等待从 checkpoint 预算里扣掉（见 codex_goal/app_server.py 的详注）。
+DEFAULT_MAX_TOTAL_DELAY = 1800.0
 
 
 @dataclass(frozen=True)

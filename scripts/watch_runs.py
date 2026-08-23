@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,26 +76,58 @@ def _events(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+#: driver 进程的命令行特征（必须同时出现，才算是它）。
+DRIVER_MARKERS = ("abhl", "goal-led")
+
+
 def _alive(run_id: str) -> bool:
     """这个 run 的 driver 进程还在不在。
 
-    ``--`` 是必需的：pattern 是 ``--run-id <id>``，以 ``-`` 开头。
-    不加 ``--`` 的话 pgrep 会把它当成自己的选项解析，于是**永远返回空**，
-    脚本把每个 run 都报成"停"。这个误判很危险——看到"停了"的人会去重启，
-    而那会造成两个进程写同一份 events.jsonl（对局记录交错、thread 状态互相
-    覆盖），并且从曲线上看不出来。
+    为什么不能用 ``pgrep -f "--run-id <id>"``
+    ---------------------------------------
+    两个坑，都实测踩过，而且**都会得出"进程还活着"这个错误结论**：
+
+    1. ``--run-id …`` 以 ``-`` 开头，pgrep 会把它当成自己的选项解析，报
+       "only one pattern can be provided" 并退出非零；调用方把非零读成
+       "没找到"，于是永远报"停"。
+    2. 加了 ``--`` 绕过第一个坑之后，pgrep 会匹配到**本脚本自己**——
+       ``watch_runs.py --run-id ab32-antwar2-random …`` 的命令行里
+       字面上就含那个字符串。于是每个 run 都被报成"活"，
+       连已经因 TimeoutError 死掉 的 run 也一样。
+
+    这两个误报方向相反，但危害都实在：报"停"会诱使人重启一个还在跑的 run
+    （两个进程写同一份 events.jsonl，账本静默错乱）；报"活"会让死掉的 run
+    一直没人管，白等几小时才发现它在第 26 轮就停了。
+
+    所以改成直接读 ``/proc/<pid>/cmdline``：既要求命令行里有 run_id，
+    也要求它确实是 driver（含 ``abhl`` 与 ``goal-led``），并排除自己。
+
+    ``/proc`` 不存在时（非 Linux 开发机）返回 ``False``：本地看不到远端进程，
+    报"停"比报"活"安全 —— 前者会促使人去核实，后者会让死掉的 run 没人管。
     """
 
-    try:
-        found = subprocess.run(  # noqa: S603,S607 - 固定参数
-            ["pgrep", "-f", "--", f"--run-id {run_id}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
+    proc = Path("/proc")
+    if not proc.is_dir():
         return False
-    return bool(found.stdout.strip())
+
+    self_pid = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        # cmdline 以 NUL 分隔；转成空格便于整体匹配。
+        command = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+        if run_id not in command:
+            continue
+        if all(marker in command for marker in DRIVER_MARKERS):
+            return True
+    return False
 
 
 def inspect(runs_root: Path, run_id: str, *, log_dirs: tuple[Path, ...] = ()) -> RunView:
@@ -110,11 +142,27 @@ def inspect(runs_root: Path, run_id: str, *, log_dirs: tuple[Path, ...] = ()) ->
         candidate = directory / f"{run_id}.out"
         if candidate.is_file():
             try:
-                view.retries = candidate.read_text(
-                    encoding="utf-8", errors="ignore"
-                ).count("[llm-retry]")
+                text = candidate.read_text(encoding="utf-8", errors="ignore")
             except OSError:
-                pass
+                break
+            view.retries = text.count("[llm-retry]")
+            # driver 退出时会把结果打成一行 JSON。stop_reason 与 error 只在那里，
+            # **不在事件账本里**（driver 只做节流记账，不写科学事实）。
+            # 不读它的话，一个死掉的 run 只能报"原因未知"，而真正的原因
+            # （例如 TimeoutError: Codex Goal did not reach a checkpoint in time）
+            # 就摆在日志最后一行。
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if not line.startswith("{") or "stop_reason" not in line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                view.stop_reason = payload.get("stop_reason") or view.stop_reason
+                if payload.get("error"):
+                    view.failures.append(str(payload["error"])[:160])
+                break
             break
     for event in _events(runs_root / run_id / "events.jsonl"):
         kind = event.get("event_type")

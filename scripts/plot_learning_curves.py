@@ -62,6 +62,28 @@ COLORS = {
 TOKEN_BAR_COLOR = "#c5b0d5"
 REFERENCE_COLOR = "#d62728"
 
+#: 分差要有多少个不同取值才算"有分辨力"。
+#:
+#: 为什么需要这道闸门：**分差不是所有游戏都有意义的**。实测 8 个游戏的
+#: ``score_margin`` 取值个数（同一批对局内）：
+#:
+#:     antwar     54 种 / 344 局      antwar2   55 种 / 440 局
+#:     snakego    13 种 /  16 局      rollman    9 种 /  16 局
+#:     miracle     4 种 /  16 局（值域 ±3 万，准连续但样本少）
+#:     ---- 以下几乎没有信息 ----
+#:     generals    2 种：{-1, +1}   ← 分差**就是**胜负本身
+#:     lostspace   2 种：{-3, 0}
+#:     aquawar     2 种：{-2, 0}
+#:
+#: generals 的分差字面上等于胜负（赢 +1 / 输 −1），画它等于把胜率图再画一遍；
+#: aquawar / lostspace 只有 2 档，比胜率略好但撑不起一条曲线。
+#:
+#: 硬画的代价不是"多一张没用的图"，而是**误导**：一条在 {−3, 0} 之间跳的折线
+#: 看起来就像"分差没在改善"，而事实是这个游戏没有"分差"这个连续量。
+#:
+#: 4 是分界点：胜负本身最多 3 档（win / draw / loss），要比它多才算带来新信息。
+MARGIN_DISTINCT_MIN = 4
+
 plt.rcParams.update(
     {
         "font.sans-serif": sans_serif_stack(),
@@ -124,6 +146,12 @@ class Run:
     #: 对手选择策略，ablation 的自变量。图例里要显示它。
     policy: str | None = None
     batch: int = 0
+    #: 逐局**原始**分差的取值集合（判断分辨力用，不画）。
+    #:
+    #: 为什么要留原始值而不只看逐轮平均：逐局值在 aquawar 这类游戏里只有
+    #: {−2, 0} 两档，但一轮 8 局的**平均**能凑出十几个不同小数，
+    #: 只看平均会误判成"有分辨力"，而那只是 2 个离散值的组合噪声。
+    raw_margin_values: frozenset[float] = frozenset()
 
     @property
     def label(self) -> str:
@@ -133,6 +161,17 @@ class Run:
             suffix = f"b={self.batch}" if self.batch else ""
             return f"{self.policy}{('/' + suffix) if suffix else ''}"
         return self.run_id or self.game
+
+    @property
+    def margin_is_informative(self) -> bool:
+        """这个游戏的分差值不值得画。
+
+        判据是**实测取值个数**而不是游戏名白名单：白名单要人去维护，
+        接第 9 个游戏时一定忘（然后默默画出一张误导的图）。
+        取值个数是数据自己说的，新游戏接进来自动就对。
+        """
+
+        return len(self.raw_margin_values) >= MARGIN_DISTINCT_MIN
 
 
 def _read_events(run_dir: Path) -> list[dict[str, Any]]:
@@ -227,6 +266,17 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
     tokens = _token_series(events)
     pool_size, pool_top, pool_median = _pool_meta(run_dir)
 
+    # 逐局原始分差：用来判断这个游戏的分差**是不是一个连续量**。
+    # 见 MARGIN_DISTINCT_MIN 的详注（generals 的分差就是胜负 ±1）。
+    raw_margins = {
+        float(payload["score_margin"])
+        for event in events
+        if event.get("event_type") == "GoalMatchCompleted"
+        for payload in [event.get("payload") or {}]
+        if payload.get("status") == "complete"
+        and isinstance(payload.get("score_margin"), (int, float))
+    }
+
     game = ""
     policy: str | None = None
     batch = 0
@@ -290,6 +340,7 @@ def load_run(run_dir: Path, pool_elo_dir: Path | None) -> Run:
         run_id=run_dir.name,
         policy=policy,
         batch=batch,
+        raw_margin_values=frozenset(raw_margins),
     )
 
 
@@ -459,7 +510,34 @@ def _draw_margin(axis, run: Run, x_key: str, x_label: str) -> None:
     实测 fix 组 14 轮胜率恒 0、反解 Elo 恒 1431.37，看那两栏会以为这一组
     完全没在学；而分差同期从 -36.12 收窄到 -28.12（最好局 -32 → -18）。
     胜率有阈值效应（赢不下来就一直是 0），分差是连续量，所以它先动。
+
+    **但分差不是所有游戏都有意义**（见 ``MARGIN_DISTINCT_MIN``）：
+    generals 的分差字面上就是胜负 ±1。那种情况下如实说明并留白 ——
+    一条在两三个离散值之间跳的折线会被读成"分差没在改善"，
+    而事实是这个游戏没有"分差"这个连续量。
     """
+
+    axis.set_xlabel(x_label)
+    axis.set_ylabel("终局分差")
+    if run.raw_margin_values and not run.margin_is_informative:
+        observed = sorted(run.raw_margin_values)
+        axis.set_title(f"分差（{run.game or run.run_id} 不适用）")
+        axis.text(
+            0.5,
+            0.5,
+            f"这个游戏的分差只有 {len(observed)} 种取值：{observed[:6]}\n"
+            "它等价于胜负本身，画成折线会被误读成\n"
+            "「分差没在改善」，所以这里留白。\n"
+            "该游戏的进展请看胜率与 Elo 两栏。",
+            transform=axis.transAxes,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="0.35",
+        )
+        axis.set_xticks([])
+        axis.set_yticks([])
+        return
 
     xs, ys, _ = _xy(run, x_key, "margin_mean")
     bx, by, _ = _xy(run, x_key, "margin_best")
@@ -561,6 +639,10 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
             axis = axes[row_index][column]
             for index, run in enumerate(runs):
                 color, linestyle, marker = styles[index % len(styles)]
+                # 分差对某些游戏等价于胜负（generals 是 ±1），那种曲线不画。
+                # 多游戏对比时逐个判断：跳过没意义的，保留有意义的。
+                if y_key == "margin_mean" and not run.margin_is_informative:
+                    continue
                 xs, ys, _ = _xy(run, x_key, y_key)
                 if y_key == "tokens":
                     ys = [value / 1_000_000.0 for value in ys]
@@ -578,13 +660,23 @@ def render_comparison(runs: list[Run], output: Path) -> Path:
                 )
             axis.set_xlabel(x_label)
             axis.set_ylabel(y_label)
-            axis.set_title(y_label + note)
+            title = y_label + note
+            if y_key == "margin_mean":
+                skipped = [
+                    run.label for run in runs if not run.margin_is_informative
+                ]
+                if skipped:
+                    # 必须说出谁被跳过，否则图例里少一条线会被当成"数据缺失"。
+                    title += f"　※ 分差不适用：{'、'.join(skipped)}"
+            axis.set_title(title)
             if y_key in ("win_rate", "live_win_rate"):
                 axis.set_ylim(-0.05, 1.05)
                 axis.axhline(0.5, color="0.6", linestyle=":", linewidth=1.0)
             if y_key == "margin_mean":
                 axis.axhline(0.0, color="0.6", linestyle=":", linewidth=1.0)
-            axis.legend(loc="best")
+            # 一条线都没画时不要调 legend（matplotlib 会打警告，且空图例更费解）。
+            if axis.get_legend_handles_labels()[0]:
+                axis.legend(loc="best")
 
     games = sorted({run.game for run in runs})
     if len(games) == 1 and len({run.policy for run in runs}) > 1:

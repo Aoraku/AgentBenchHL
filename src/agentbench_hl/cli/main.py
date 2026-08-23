@@ -314,8 +314,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 print(
                                     json.dumps(
                                         {
-                                            "status": "slow_eval_started",
-                                            "pid": slow_eval.pid,
+                                            "status": (
+                                                "slow_eval_started"
+                                                if slow_eval is not None
+                                                # 已经有 worker 在跑（例如之前用
+                                                # attach_slow_eval.sh 手动挂过）。
+                                                # 不重复起：两个 worker 并发写同一个
+                                                # pool-elo/ 会让对局重复调度、
+                                                # 结果文件互相覆盖，且不报错。
+                                                else "slow_eval_already_running"
+                                            ),
+                                            "pid": (
+                                                slow_eval.pid
+                                                if slow_eval is not None
+                                                else slow.already_running(service.root)
+                                            ),
                                             **plan.as_dict(),
                                         },
                                         ensure_ascii=False,

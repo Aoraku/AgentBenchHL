@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -120,13 +121,60 @@ def build_plan(
     )
 
 
-def spawn(plan: SlowEvalPlan) -> subprocess.Popen[bytes]:
+def already_running(run_root: Path) -> int | None:
+    """这个 run 是否已经有慢评测 worker 在跑；返回它的 pid。
+
+    为什么必须有这道检查：慢评测有两个入口 —— 新 run 由
+    ``background_pool: true`` 自动挂，已经在跑的 run 用
+    ``scripts/attach_slow_eval.sh`` 手动挂。两者撞车时会有两个 worker
+    **并发写同一个 ``pool-elo/`` 目录**：同一版本的对局被重复调度、
+    ``matches.jsonl`` 交错追加、``challenger-elo.json`` 互相覆盖。
+    这些都不会报错，只会让机时白烧、数据可疑。
+
+    读 ``/proc`` 而不是 ``pgrep -f``：pattern 里含 ``--run-root``（以 ``-``
+    开头）会被 pgrep 当成选项，而绕过之后它又会匹配到调用者自己的命令行。
+    两种误判都实测踩过。
+
+    ``/proc`` 不存在时（macOS 等非 Linux 开发机）返回 ``None`` —— 宁可漏检
+    也不能崩：这个函数在 run 的启动路径上，抛异常会连带打死整个 run，
+    而它本身只是一道防重复的护栏。
+    """
+
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return None
+
+    target = str(run_root)
+    self_pid = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        try:
+            command = (
+                (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+            )
+        except (OSError, PermissionError):
+            continue
+        if "pool_elo_worker.py" in command and target in command:
+            return pid
+    return None
+
+
+def spawn(plan: SlowEvalPlan) -> subprocess.Popen[bytes] | None:
     """起 worker 进程（detached，日志落盘）。
+
+    已经有 worker 在跑同一个 run 时返回 ``None``（不重复起，见
+    :func:`already_running`）。
 
     ``start_new_session=True``：慢评测不应该跟着启动它的 shell 一起被 Ctrl-C
     掉。它的生命周期由 run 决定，而不是由那个终端决定。
     """
 
+    if already_running(plan.run_root) is not None:
+        return None
     plan.log_path.parent.mkdir(parents=True, exist_ok=True)
     handle = plan.log_path.open("ab")
     return subprocess.Popen(  # noqa: S603 - 命令由本模块构造

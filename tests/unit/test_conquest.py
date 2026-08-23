@@ -27,6 +27,30 @@ def ladder(*ranks: int) -> tuple[LadderEntry, ...]:
     )
 
 
+def history(**per_opponent: list[float]) -> OpponentHistory:
+    """按**逐轮**战绩构造 history。
+
+    ``rank20=[2.0, 1.0]`` 读作："第 1 轮对 rank20 拿 2 分（2 局全胜），
+    第 2 轮拿 1 分"。每轮固定 2 局（双座次各 1 局），与真实 run 一致。
+
+    为什么测试必须按逐轮构造：``progress`` 的晋级判据是**滑动窗口**
+    （最近 2 轮共 4 局至少 3 胜），从累计值 ``{"played": 4, "points": 3}``
+    里还原不出"这 3 分是集中在最近两轮还是散在很久以前"。
+    用累计值写的测试会通过一个错的实现。
+    """
+
+    totals: dict[str, dict[str, float]] = {}
+    rounds: dict[str, dict[int, dict[str, float]]] = {}
+    for opponent, per_round in per_opponent.items():
+        played = 2.0 * len(per_round)
+        totals[opponent] = {"played": played, "points": float(sum(per_round))}
+        rounds[opponent] = {
+            index: {"played": 2.0, "points": float(points)}
+            for index, points in enumerate(per_round, start=1)
+        }
+    return OpponentHistory(totals, rounds)
+
+
 # ----------------------------------------------------------------- 目标序列
 
 
@@ -160,20 +184,12 @@ def test_policy_selects_the_conquest_target_from_the_beaten_history() -> None:
 
     assert policy.select(iteration=1, batch=1) == ("rank10",)
 
-    # 打赢 rank10 / 09 / 08（各 2 局全胜）后，目标推进到 rank07。
-    beaten = OpponentHistory(
-        {
-            "rank10": {"played": 2.0, "points": 2.0},
-            "rank09": {"played": 2.0, "points": 2.0},
-            "rank08": {"played": 2.0, "points": 2.0},
-        }
-    )
+    # 打赢 rank10 / 09 / 08（各连续 2 轮全胜 = 4 局 4 胜）后，目标推进到 rank07。
+    beaten = history(rank10=[2.0, 2.0], rank09=[2.0, 2.0], rank08=[2.0, 2.0])
     assert policy.select(iteration=5, batch=1, history=beaten) == ("rank07",)
 
     # 全部征服后停在最后一个目标（继续巩固），不越界。
-    everything = OpponentHistory(
-        {f"rank{rank:02d}": {"played": 2.0, "points": 2.0} for rank in range(1, 11)}
-    )
+    everything = history(**{f"rank{rank:02d}": [2.0, 2.0] for rank in range(1, 11)})
     assert policy.select(iteration=99, batch=1, history=everything) == ("rank01",)
 
 
@@ -224,18 +240,11 @@ def test_progress_advances_a_slot_and_skips_ranks_already_beaten() -> None:
     上打转，而"稳定上升"这件事从曲线上完全看不出来。
     """
 
-    policy = build_policy(
-        "progress", ladder(*range(1, 31)), start_rank=20, advance_win_rate=0.75
-    )
-    # rank20 与 rank19 都已稳定打赢（得分率 1.0 > 0.75）。
-    history = OpponentHistory(
-        {
-            "rank20": {"played": 4.0, "points": 4.0},
-            "rank19": {"played": 4.0, "points": 4.0},
-        }
-    )
+    policy = build_policy("progress", ladder(*range(1, 31)), start_rank=20)
+    # rank20 与 rank19 都已稳定打赢：最近 2 轮各 2 局全胜 = 4 局 4 胜 ≥ 3。
+    beaten = history(rank20=[2.0, 2.0], rank19=[2.0, 2.0])
 
-    window = policy.select(iteration=3, batch=4, history=history)
+    window = policy.select(iteration=3, batch=4, history=beaten)
 
     assert "rank20" not in window and "rank19" not in window, "打赢的不再重复打"
     assert len(set(window)) == 4, "槽位之间不许撞人"
@@ -243,24 +252,64 @@ def test_progress_advances_a_slot_and_skips_ranks_already_beaten() -> None:
     assert set(window) == {"rank18", "rank17", "rank16", "rank15"}
 
 
-def test_progress_keeps_an_unbeaten_opponent_in_place() -> None:
-    policy = build_policy(
-        "progress", ladder(*range(1, 31)), start_rank=20, advance_win_rate=0.75
-    )
-    # 打了 4 局只拿 1 分（0.25 ≤ 0.75）：不算稳定击败，留在原位继续研究。
-    history = OpponentHistory({"rank20": {"played": 4.0, "points": 1.0}})
+def test_progress_advances_on_three_wins_out_of_the_last_four_games() -> None:
+    """判据是"最近 2 轮共 4 局至少 3 胜"，赢 3 局就够（不必 4 胜）。"""
 
-    assert "rank20" in policy.select(iteration=5, batch=4, history=history)
+    policy = build_policy("progress", ladder(*range(1, 31)), start_rank=20)
+    # 第 1 轮 2 胜、第 2 轮 1 胜 → 4 局 3 胜，达标。
+    assert "rank20" not in policy.select(
+        iteration=3, batch=4, history=history(rank20=[2.0, 1.0])
+    )
+    # 4 局 2 胜 → 不达标，留在原位。
+    assert "rank20" in policy.select(
+        iteration=3, batch=4, history=history(rank20=[1.0, 1.0])
+    )
+
+
+def test_progress_needs_two_consecutive_rounds_not_one_lucky_sweep() -> None:
+    """单轮全胜不算晋级：判据的核心是"连续两轮都赢"。
+
+    只打了 1 轮就 2 胜可能只是座次或 seed 的运气。窗口没填满就不判晋级。
+    """
+
+    policy = build_policy("progress", ladder(*range(1, 31)), start_rank=20)
+
+    assert "rank20" in policy.select(
+        iteration=2, batch=4, history=history(rank20=[2.0])
+    ), "只赢了一轮（2 局）不该晋级"
+
+
+def test_progress_ignores_ancient_losses_outside_the_window() -> None:
+    """判据只看**最近** 2 轮，早期败绩不该永久拖住游标。
+
+    这是换掉"累计得分率 > 0.75"的直接原因：第 1 轮 0/2、之后连赢 6 局，
+    累计是 6/8 = 0.75，**不严格大于** 0.75 —— 明明连赢三轮，游标还卡着。
+    """
+
+    policy = build_policy("progress", ladder(*range(1, 31)), start_rank=20)
+    # 第 1 轮全败，之后三轮全胜。累计 6/8 = 0.75（旧判据不通过）。
+    recovered = history(rank20=[0.0, 2.0, 2.0, 2.0])
+
+    assert "rank20" not in policy.select(iteration=5, batch=4, history=recovered), (
+        "最近两轮 4 局 4 胜就该晋级，早期那一轮败绩不该有否决权"
+    )
+
+
+def test_progress_keeps_an_unbeaten_opponent_in_place() -> None:
+    policy = build_policy("progress", ladder(*range(1, 31)), start_rank=20)
+    # 最近 2 轮 4 局只拿 1 分：不算稳定击败，留在原位继续研究。
+    assert "rank20" in policy.select(
+        iteration=5, batch=4, history=history(rank20=[1.0, 0.0])
+    )
 
 
 def test_progress_with_b_equals_one_is_the_old_one_by_one_ladder() -> None:
-    policy = build_policy(
-        "progress", ladder(*range(1, 21)), start_rank=20, advance_win_rate=0.75
-    )
+    policy = build_policy("progress", ladder(*range(1, 21)), start_rank=20)
 
     assert policy.select(iteration=1, batch=1) == ("rank20",)
-    history = OpponentHistory({"rank20": {"played": 2.0, "points": 2.0}})
-    assert policy.select(iteration=2, batch=1, history=history) == ("rank19",)
+    assert policy.select(
+        iteration=3, batch=1, history=history(rank20=[2.0, 2.0])
+    ) == ("rank19",)
 
 
 def test_self_leaves_the_choice_to_the_agent() -> None:
@@ -280,14 +329,9 @@ def test_self_instruction_surfaces_the_beaten_and_stuck_opponents() -> None:
     """
 
     policy = build_policy("self", ladder(*range(1, 11)))
-    history = OpponentHistory(
-        {
-            "rank09": {"played": 4.0, "points": 4.0},  # 稳定赢
-            "rank01": {"played": 4.0, "points": 0.0},  # 一直输
-        }
-    )
+    record = history(rank09=[2.0, 2.0], rank01=[0.0, 0.0])
 
-    instruction = policy.instruction(iteration=3, batch=4, history=history)
+    instruction = policy.instruction(iteration=3, batch=4, history=record)
 
     assert "rank09" in instruction
     assert "rank01" in instruction
