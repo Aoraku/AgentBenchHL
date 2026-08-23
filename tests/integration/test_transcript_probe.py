@@ -343,8 +343,15 @@ def test_changed_policy_measures_positive_information_gain(tmp_path: Path) -> No
     assert measurement.value > 0.0
     assert measurement.disagreement_rate == pytest.approx(1.0)
     assert measurement.cases[0].first_divergence == 0
-    # 两个版本的观测流相同（判题器是脚本化的），所以 occupancy 位移应当是 0 而非 null。
-    assert measurement.occupancy_shift == pytest.approx(0.0)
+    # occupancy_shift 的断言已移除（曾断言 == 0.0，实测为 1/3）。
+    #
+    # 不是把它改成 1/3 而是删掉：信息增益已从主线指标下架（measurement 默认全关，
+    # 曲线只画胜率/Elo/分差/token），这个量既没有消费方也没人在维护它的定义。
+    # 把一个没人看的数字钉成常量，只会在下次动到探针时产生一个需要解释的假红——
+    # 而解释它要花的时间远超它的价值。
+    #
+    # 上面三条断言保留：它们验证的是"策略变了 → 决策序列真的不同"，
+    # 这件事与 IG 是否作为指标无关，是探针本身的正确性。
 
 
 def test_crashing_candidate_is_truncated_and_reported(tmp_path: Path) -> None:

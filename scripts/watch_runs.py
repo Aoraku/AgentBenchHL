@@ -79,6 +79,25 @@ def _events(path: Path) -> list[dict[str, Any]]:
 #: driver 进程的命令行特征（必须同时出现，才算是它）。
 DRIVER_MARKERS = ("abhl", "goal-led")
 
+#: ``run_hl.sh`` 每次启动写的分隔标记。
+LAUNCH_MARKER = "===== ABHL-RUN-START"
+
+
+def _last_launch_segment(text: str) -> str:
+    """只取**最后一次启动**之后的日志。
+
+    日志是追加写的（续跑时上一段是排查依据，不能覆盖），所以同一个文件里
+    混着多次启动的记录。不分段的话，上一次失败的错误会被当成这一次的 ——
+    实测踩过：verify-glm-5.3 用修好的配置跑通了第 1 轮，监控却仍报它有
+    remote-compact 失败，而那条记录来自修复前那次 run，验收结论完全错了。
+
+    没有标记时（老日志、或 run 不是用 run_hl.sh 起的）返回全文：
+    宁可多报也不要漏报，但这种情况下的"历史错误"要人工判断。
+    """
+
+    index = text.rfind(LAUNCH_MARKER)
+    return text if index < 0 else text[index:]
+
 
 def _alive(run_id: str) -> bool:
     """这个 run 的 driver 进程还在不在。
@@ -145,6 +164,8 @@ def inspect(runs_root: Path, run_id: str, *, log_dirs: tuple[Path, ...] = ()) ->
                 text = candidate.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 break
+            # 只看最后一次启动之后的部分，否则上一次 run 的失败会被算到这一次头上。
+            text = _last_launch_segment(text)
             view.retries = text.count("[llm-retry]")
             # driver 退出时会把结果打成一行 JSON。stop_reason 与 error 只在那里，
             # **不在事件账本里**（driver 只做节流记账，不写科学事实）。

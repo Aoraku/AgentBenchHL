@@ -268,6 +268,24 @@ def write_codex_config(
             "",
             "[features]",
             "goals = true",
+            # 关掉服务端压缩。理由有两条，都是实测的：
+            #
+            # 1. **它对多数非 OpenAI 模型必定失败**：模型返回
+            #    [reasoning, message] 两个 output item，而 codex v2 只接受一个，
+            #    于是报 "remote compaction v2 expected exactly one compaction
+            #    output item, got 0 from 2 output items" 并把整个 turn 打成
+            #    failed。我们靠 thread_rotate_each_iteration（每轮换 thread，
+            #    上下文清零）控制上下文，本来就不需要服务端压缩。
+            #
+            # 2. **开着它会让某些模型整个不可用**：codex 会发
+            #    `x-codex-beta-features: remote_compaction_v2`，而中转对不支持
+            #    这个特性的模型直接拒绝：
+            #        400 {"code":"invalid_request_error",
+            #             "message":"Model is not supported by composite groups"}
+            #    实测 LongCat-2.0 在清华中转上就是这样被拒的 —— 而同一个
+            #    key/端点/模型用 `codex exec` 却能通，因为 exec 不发这个 header。
+            #    这个差异极难定位：报错说的是"模型不支持"，听起来像模型的问题。
+            "remote_compaction_v2 = false",
             "",
             "[analytics]",
             "enabled = false",

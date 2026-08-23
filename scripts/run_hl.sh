@@ -63,6 +63,15 @@ mkdir -p "$RUNS"
 LOG="$RUNS/$RUN_ID.out"
 # 追加而不是覆盖：续跑时上一段日志是排查依据，覆盖掉就没法回溯
 # "第 32 轮到底怎么收尾的"。
+#
+# 但追加意味着**同一个文件里混着多次启动的记录**，读日志的工具必须能分段，
+# 否则会把上一次失败的错误当成这一次的。实测踩过：verify-glm-5.3 用修好的
+# 配置跑通了第 1 轮，watch_runs 却仍报它有 remote-compact 失败——
+# 那条记录来自修复前那次 run，验收结论因此完全错了。
+#
+# 所以每次启动写一行分隔标记，工具只读最后一段（见 watch_runs.py 的
+# _last_launch_segment）。标记要好认且不可能出现在正常输出里。
+printf '\n===== ABHL-RUN-START %s pid-placeholder =====\n' "$(date -Iseconds)" >> "$LOG"
 setsid nohup "$VENV/abhl" "${ARGS[@]}" >> "$LOG" 2>&1 < /dev/null &
 PID=$!
 
