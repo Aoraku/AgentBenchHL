@@ -1,33 +1,36 @@
 # GLM-5.3（清华 sub2api）
 #
-# 实测 2026-08-23：codex exec 直通。高峰期会 429 限流；
-# 中转站限流时返回的是 **404 而不是 429**（看起来像"模型不存在"），
-# 遇到别去改模型名，退回 glm-5.2 或等一会。
+# ★ 这份配置照抄 sota-antwar2 那个跑通 40+ 轮的 run，**不要自作主张改**。
 #
-# 模型名用中转站认的大写形式（/v1/models 返回 "GLM-5.3"）。
-# 清华中转的注意事项见 longcat-2.0.yaml 的注释。
-model: GLM-5.3
+# 三个曾经被改坏的地方（每一处都让 run 直接死）：
+#
+# 1. `model` 必须是**小写** `glm-5.3`。
+#    框架内置的 ZHIPU_MODEL_CATALOG 里 slug 就是小写，改成 /v1/models 返回的
+#    大写 `GLM-5.3` 会让 catalog **匹配不上** → codex 退回兜底元数据
+#    （很小的 context_window）→ 压缩在一个我们没设过的点触发 →
+#    而 glm 系的远程压缩必定失败：
+#        remote compaction v2 expected exactly one compaction output item,
+#        got 0 from 2 output items
+#    → 整个 run 死。中转本身**不区分大小写**，所以大写"看起来能用"
+#    （curl 和 codex exec 都通），只有走框架时才炸。
+#
+# 2. `auto_compact_token_limit` 是 **900000**，不是 90000。
+#    这个值不是"保险"而是"引雷开关"：设低了会主动触发上面那个必死的压缩。
+#    真正防止上下文膨胀的是 thread_rotate_each_iteration（每轮换 thread，
+#    上下文清零），阈值只需高到够**一轮**用。
+#
+# 3. **不要**加 `client_name`。旧 run 用框架默认的 originator=agentbench-hl
+#    跑通了 40+ 轮 —— 清华中转不按客户端白名单放行，加了纯属多余。
+#    （sbtunnel 才需要，见 gpt-5.6-sol.yaml。）
+model: glm-5.3
 base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
 api_key_env: ABHL_KEY_GLM
 harness: codex
-# ★ 报 codex 官方 originator。
-#
-# 不配的话上游看到的是框架默认的 originator=agentbench-hl，而中转站可能按
-# 客户端白名单放行。实测 LongCat-2.0 因此被拒：
-#     400 {"code":"invalid_request_error",
-#          "message":"Model is not supported by composite groups"}
-# 这句报错极具误导性——它说的像是"模型不支持"，实际是"你这个客户端不被
-# 允许调这个模型"。同一 key/端点/模型换成 codex_exec 就 200。
-#
-# 同一中转上 kimi-k3 与 GLM-5.x 不配也能通（它们不在受限分组里），
-# 但没有理由赌哪个模型受限：统一报官方 originator。
-client_name: codex_exec
 reasoning_effort: high
+# 必须给：不给的话 codex 不认识这个 slug，会走兜底元数据（同第 1 条的后果）。
+# catalog 里声明 context_window = 1048576。
+# 中转普遍不支持服务端 response storage，不关掉会在续接 turn 时
+# 找不到上一条 response。旧 run（跑通 40+ 轮）就是这么配的。
 disable_response_storage: true
-# 非 OpenAI 家模型：必须给 catalog，否则 codex 用兜底元数据、
-# 压缩在一个我们没设过的点触发并打死整个 run（antwar2 曾死在 97k，
-# 而当时声明的窗口是 200000）。
 model_catalog: zhipu
-# 上下文 204800，阈值取不到一半：这个模型的 remote compaction 必定失败
-# （返回 [reasoning, message] 两个 item，codex 只接受一个）。
-auto_compact_token_limit: 90000
+auto_compact_token_limit: 900000

@@ -7,6 +7,24 @@ model: deepseek-v4-pro
 base_url: https://api.deepseek.com/v1
 api_key_env: ABHL_KEY_DEEPSEEK
 harness: codex
+# 报 codex 官方 originator。不写会用框架默认 agentbench-hl，
+# 可能被中转的客户端白名单拒绝，而报错会指向"模型不支持"这个错误方向
+# （实测 LongCat-2.0 就是这样被拒的）。
+client_name: codex_exec
 reasoning_effort: high
 disable_response_storage: true
-auto_compact_token_limit: 90000
+# ★ 这个值要设得**足够高，让远程压缩永不触发**，而不是"留个保险"。
+#
+# codex 的 remote compaction 对多数非 OpenAI 模型**必定失败**：
+#     Error running remote compact task: Fatal error: remote compaction v2
+#     expected exactly one compaction output item, got 0 from 2 output items
+# （模型返回 [reasoning, message] 两个 item，codex v2 只接受一个）
+# 一旦触发就把整个 turn 打成 failed，run 直接死。
+#
+# 所以阈值低 = 主动引雷。曾经写成 90000（比 900000 少一个 0），
+# 于是 verify-glm-5.3 在第 0 轮、smoke8-miracle 在第 2 轮都被压缩打死；
+# 而历史上跑通的 run（snakego4 / aquawar4 / g4 / m4）用的都是 900000。
+#
+# 真正防止上下文膨胀的是 thread_rotate_each_iteration：每轮换 thread，
+# 上下文清零。那是在**轮末**生效的，所以轮内阈值必须高到够一轮用。
+auto_compact_token_limit: 900000

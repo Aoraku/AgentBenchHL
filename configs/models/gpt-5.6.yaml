@@ -7,6 +7,10 @@ model: gpt-5.6
 base_url: https://api.teamorouter.com/v1
 api_key_env: ABHL_KEY_GPT56
 harness: codex
+# 报 codex 官方 originator。不写会用框架默认 agentbench-hl，
+# 可能被中转的客户端白名单拒绝，而报错会指向"模型不支持"这个错误方向
+# （实测 LongCat-2.0 就是这样被拒的）。
+client_name: codex_exec
 reasoning_effort: high
 disable_response_storage: true
 auto_compact_token_limit: 600000
