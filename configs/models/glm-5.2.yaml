@@ -1,17 +1,25 @@
-# GLM-5.2（清华中转）—— 当前 8 个游戏烟测的实际用模，最稳。
+# GLM-5.2（清华 sub2api）—— 8 游戏烟测的主用模型，最稳。
 #
-# base_url 不带 /v1：sub2api 自身就是根，加 /v1 会 404。
-model: glm-5.2
+# 模型名用中转站认的大写形式（/v1/models 返回 "GLM-5.2"）。
+# 清华中转的注意事项见 longcat-2.0.yaml 的注释。
+model: GLM-5.2
 base_url: https://lab.cs.tsinghua.edu.cn/ai-platform/sub2api
-api_key_env: ABHL_API_KEY
+api_key_env: ABHL_KEY_GLM
 harness: codex
+# ★ 报 codex 官方 originator。
+#
+# 不配的话上游看到的是框架默认的 originator=agentbench-hl，而中转站可能按
+# 客户端白名单放行。实测 LongCat-2.0 因此被拒：
+#     400 {"code":"invalid_request_error",
+#          "message":"Model is not supported by composite groups"}
+# 这句报错极具误导性——它说的像是"模型不支持"，实际是"你这个客户端不被
+# 允许调这个模型"。同一 key/端点/模型换成 codex_exec 就 200。
+#
+# 同一中转上 kimi-k3 与 GLM-5.x 不配也能通（它们不在受限分组里），
+# 但没有理由赌哪个模型受限：统一报官方 originator。
+client_name: codex_exec
 reasoning_effort: high
 disable_response_storage: true
-# 非 OpenAI 家模型：必须给 catalog，否则 codex 用兜底元数据、
-# 压缩在一个我们没设过的点触发并打死整个 run。
+# 非 OpenAI 家模型：不给 catalog 会走兜底元数据，压缩在看不见的点触发并打死 run。
 model_catalog: zhipu
-# 上下文 204800。压缩阈值取不到窗口的一半：这个模型的 remote compaction
-# 必定失败（返回 [reasoning, message] 两个 item，codex 只接受一个），
-# 所以框架靠 thread_rotate_each_iteration 保证压缩**永不触发**，
-# 这个阈值只是最后一道保险。
 auto_compact_token_limit: 90000

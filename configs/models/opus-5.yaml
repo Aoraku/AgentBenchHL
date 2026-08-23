@@ -1,10 +1,31 @@
-# Claude Opus 5 —— 待接。
+# Claude Opus 5 —— ⛔ 尚未接通，**不要拿这份档案去起 run**。
 #
-# ⚠️ base_url 与 key 待确认。走 codex harness 时它仍然要一个 /responses
-# 兼容端点；如果中转站只提供 Anthropic 原生协议，就得改用 harness: cc。
-model: opus-5
-base_url: https://api.teamorouter.com/v1
-api_key_env: ABHL_KEY_OPUS5
+# 探测结果（2026-08-23，sbtunnel）
+# -------------------------------
+# * `/v1/models` 只列 OpenAI 家模型（gpt-5.2 … gpt-5.6-terra、gpt-image-*），
+#   **没有任何 claude / opus 条目**；
+# * `/v1/messages`（Anthropic 原生协议）返回：
+#
+#       403 {"error":{"message":"This group does not allow /v1/messages dispatch",
+#                     "type":"permission_error"}}
+#
+#   注意这句话的含义：端点**存在**，是当前这个 key 所属的**分组**无权调用。
+#   所以问题不在路径，也不在协议 —— 换路径试是白费时间（已试过
+#   `/anthropic/v1/models`，返回的是站点 HTML 首页）。
+#
+# 需要人确认的三件事之一
+# ---------------------
+# 1. 另给一个有 `/v1/messages` 权限的 key（或把现有 key 加进那个分组）；
+# 2. 或者确认 opus5 走 **Claude Code harness**（`harness: cc`）而不是 codex ——
+#    那条路不经过 /responses，配置形状完全不同；
+# 3. 或者给一个别的中转站端点。
+#
+# 下面的值是**占位**，仅表示"字段该长什么样"，没有一个是验证过的。
+model: claude-opus-5
+base_url: https://sbtunnel.xiaoaojianghu.fun/v1
+api_key_env: ABHL_KEY_SBTUNNEL
+# ⚠️ harness 可能要改成 cc：codex harness 只会打 /responses，
+# 而 Anthropic 家模型在多数中转上走的是 /v1/messages。
 harness: codex
 reasoning_effort: high
 disable_response_storage: true
