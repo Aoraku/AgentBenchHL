@@ -14,7 +14,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -180,6 +180,32 @@ def _game_of(config_path: str | Path) -> str:
     return ExperimentConfig.load(Path(config_path).resolve()).game
 
 
+def challenger_seats(roles: Sequence[str], challenger_track: str | None) -> tuple[str, ...]:
+    """候选这一轮要坐哪些座次。
+
+    对称游戏（``challenger_track is None``）返回**全部**座次：先后手优势差很多，
+    只打一边的胜率没有意义，所以每个对手都要正反各打一局。
+
+    分轨游戏返回**唯一**那个座次。分轨游戏的两个角色不是"座次"而是两种不同的
+    游戏 —— rollman 轨的选手只实现吃豆人一侧的协议。对手已经被过滤成对位轨了，
+    这时再让候选去坐对位座次就是安排**同轨互殴**。
+
+    实测 s8k4-rollman 第 1 轮 8 局里有 4 局就是这么来的::
+
+        role=rollman → 352~500 回合，score_margin 37~140   （真实对局）
+        role=ghost   → 0 回合，却记成 result=win / margin=0 （无效局）
+
+    于是那一轮胜率被抬到 1.0。最坏的是它**归错了因**：监控只报得出
+    "0 回合对局占 4/8 —— 候选大概率协议格式错"，而候选其实完全正常。
+    """
+
+    if challenger_track is None:
+        return tuple(roles)
+    if challenger_track not in roles:
+        raise ValueError(f"challenger_track {challenger_track!r} 不在座次 {list(roles)} 里")
+    return (challenger_track,)
+
+
 def _load_player_tracks(agentbench_root: str | Path, game: str) -> dict[str, str]:
     """读 ``players/tracks.tsv``：非对称游戏里每名选手扮演哪个角色。
 
@@ -241,7 +267,23 @@ def build_goal_led_service(
     if isinstance(run.runtime, CodexGoalRuntime):
         # Plan I is a true long-running Goal.  Its turn duration is controlled
         # by Codex itself, not by the five-minute Plan II checkpoint budget.
-        run.runtime.checkpoint_timeout_s = 3600.0
+        #
+        # 为什么是 2 小时而不是 1 小时
+        # --------------------------
+        # 这个预算是**扣掉上游退避之后**的净思考时间（app_server 会把退避等待从
+        # deadline 里减掉，见 responses_proxy 的详注）。1 小时曾经够用，但那是
+        # k=1 时代的量级；k=4 之后一轮要在同一个 turn 里读完 b×2 份回放**再写出
+        # 4 份完整策略**，净思考时间本身就到几十分钟，中转一旦变慢（token/s 掉一半，
+        # 但不报错、因此不计入退避）就会越过 1 小时。
+        #
+        # 实测 fix3-aquawar 第 2 轮：
+        #     TimeoutError: Codex Goal did not reach a checkpoint in time
+        #     （已扣除上游退避等待 721s，仍超过 3600s 预算）
+        # 那一轮的 8 局对局本身是干净的，整个 run 却以 iteration_failed 报废。
+        #
+        # 注意这不是实验变量：它只决定"等多久算放弃"，不影响任何一轮的内容，
+        # 所以放宽它对跨模型可比性没有影响（而调 reasoning_effort / rollout_k 有）。
+        run.runtime.checkpoint_timeout_s = 7200.0
     seeds = (
         config.curriculum.development_seeds
         if config.curriculum.seed_mode == "generalize"
@@ -280,10 +322,18 @@ def build_goal_led_service(
     # ``ghost-seed-1`` 有 1204 行——同一场对局差 600 倍。
     opponents = [item for item in run.opponents if item.runnable]
     tracks = _load_player_tracks(config.paths.agentbench_root, config.game)
+    # 候选实际会坐的座次。对称游戏是全部座次（先后手都要打，见下）；
+    # 分轨游戏**只有一个**，理由见 challenger_roles 的赋值处。
+    challenger_roles = roles
     if tracks:
-        # 候选扮演 roles[0]（game.yaml 的首个角色），对手只能来自对位轨。
-        challenger_track = roles[0]
-        opponent_track = next((item for item in roles[1:]), None)
+        # 候选扮演 challenger_track，对手只能来自对位轨。
+        challenger_track = config.evaluation.challenger_track or roles[0]
+        if challenger_track not in roles:
+            raise ValueError(
+                f"{config.game} 的座次只有 {list(roles)}，"
+                f"evaluation.challenger_track 写的是 {challenger_track!r}"
+            )
+        opponent_track = next((item for item in roles if item != challenger_track), None)
         if opponent_track is None:
             raise ValueError(f"{config.game} 声明了分轨却只有一个角色：{roles}")
         eligible = [
@@ -298,6 +348,7 @@ def build_goal_led_service(
                 f"{sorted({tracks.get(item.opponent_id) for item in opponents})} 都不对位"
             )
         opponents = eligible
+        challenger_roles = challenger_seats(roles, challenger_track)
 
     return GoalLedService(
         run_root=run.root,
@@ -324,7 +375,7 @@ def build_goal_led_service(
             if item.rank is not None
         ),
         game=config.game,
-        roles=roles,
+        roles=challenger_roles,
         seeds=seeds,
         rollout_k=config.runtime.rollout_k,
         opponent_policy=config.curriculum.opponent_policy,

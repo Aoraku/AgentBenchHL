@@ -5,10 +5,30 @@ import copy
 from enum import Enum
 
 class STATUS(Enum):
+    """玩家状态，**取值必须与后端一致**。
+
+    官方后端 ``src/config.py`` 的 ``PlayerStatus`` 有 **6** 个值::
+
+        Alive = 0; Died = 1; Escaped = 2; Skip = 3
+        WaitForEsacape = 4      # 官方把 Escape 拼错了，照抄以免对不上
+        Error = 5
+
+    而**官方 SDK 只声明了 0~3** —— 官方 SDK 与官方后端自己就对不齐
+    （已在 saiblo 上核对原版，不是社区抄坏的）。选手拿到 ``status: 4`` 或 ``5``
+    时，原版 SDK 里根本没有对应枚举。
+
+    漏掉 4 的后果是**死锁**：后端 ``GameController.turn`` 对
+    ``Alive`` 与 ``WaitForEsacape`` 才进 ``inround()`` 阻塞等回复，
+    见 :meth:`AIClient.start_turn`。5（Error）后端不等，但也必须有名字，
+    否则读到它的代码只能拿裸数字比较。
+    """
+
     ALIVE = 0
     DEAD = 1
     ESCAPED = 2
     SKIPPED = 3
+    WAIT_FOR_ESCAPE = 4
+    ERROR = 5
 
 import random
 class Node:
@@ -390,10 +410,28 @@ class AIClient:
             self.others[index].status = self.root["others"][index]["status"]
             self.others[index].keys = self.root["others"][index]["keys"]
             self.others[index].hp = self.root["others"][index]["hp"]
+        # ★ 回复条件必须与后端"是否等待回复"**逐位对齐**。
+        #
+        # 后端 GameController.turn()：
+        #     if status == Alive(0) or status == WaitForEsacape(4):
+        #         self.inround()          # ← 阻塞等这名玩家的回复
+        # 其余状态（1 挂了 / 2 逃了 / 3 跳过）后端**不等**，直接 round_end。
+        #
+        # 旧代码回复的是 {0, 2}，于是两头都错：
+        #
+        # * 状态 4（逃生等待中）后端在等、我们不回 → **死锁**。表现是对局卡住直到
+        #   超时，账本上记成 0 回合、result=loss（evaluator_status=game_error），
+        #   而监控只会说"候选大概率协议格式错"——候选其实完全正常。
+        #   实测 s8k4-lostspace 16 局里 12 局是这么废的；候选一旦摸到逃生舱
+        #   就会进状态 4，所以几乎必然触发。
+        # * 状态 2（已逃离）后端不等、我们却发了一条 finish → 它留在后端 stdin 里，
+        #   等下一次轮到自己时被当成**本回合的行动**读掉，回合直接被结束。
+        #   这条是静默的，比死锁更难查。
         if self.player.status == STATUS.ALIVE.value:
             self.play()         #选手进行操作
             self.end_turn()
-        elif self.player.status == STATUS.ESCAPED.value:
+        elif self.player.status == STATUS.WAIT_FOR_ESCAPE.value:
+            # 逃生等待中不能行动，但后端在等回复，必须结束回合。
             self.end_turn()
     
     def in_turn(self):
@@ -414,8 +452,22 @@ class AIClient:
             self.player.status = STATUS.DEAD
             self.player.hp = 0
             if self.root["box"]:
-                node_index = self.view.nodes[self.pos_to_node_index(self.player.pos)]
-                self.view.nodes[node_index].interprops.append("Box")
+                # 玩家带着箱子死亡 → 箱子掉在当前格。
+                #
+                # 原来这里索引了**两次**：
+                #     node_index = self.view.nodes[self.pos_to_node_index(...)]  # 已经是 Node
+                #     self.view.nodes[node_index]                                # 又拿 Node 当下标
+                # 于是必定 TypeError: list indices must be integers or slices, not Node，
+                # 候选进程当场退出（runner 记退出码 20），而后端还在等它这一回合的
+                # 回复 → 对局卡到超时 → 记 0 回合 / result=loss。
+                # 实测 fix3-lostspace 16 局里有 5 局是这么废的，而且**与候选策略无关**：
+                # 任何候选只要带着箱子死一次就会崩。
+                #
+                # pos_to_node_index 找不到时返回 -1，必须挡住：-1 会静默地把箱子
+                # 记到视野里的**最后一个**格子上，那是错的局面而不是崩溃，更难查。
+                node_index = self.pos_to_node_index(self.player.pos)
+                if node_index >= 0:
+                    self.view.nodes[node_index].interprops.append("Box")
             self.player.pos = self.player.spawn_pos     #玩家死亡，回到出生点待命
 
     def off_turn(self):

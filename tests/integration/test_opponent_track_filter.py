@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from agentbench_hl.application.live_run import _load_player_tracks
+from agentbench_hl.application.live_run import _load_player_tracks, challenger_seats
 
 
 def _write_tracks(root: Path, game: str, rows: list[tuple[str, str]]) -> None:
@@ -104,6 +104,42 @@ def test_opponent_selection_keeps_only_the_facing_track(tmp_path: Path) -> None:
     assert sorted(eligible) == ["facing_1", "facing_2"]
     # 同轨选手一个都不能留下——留下就会产生 0 回合的"complete"局。
     assert not [player for player in eligible if tracks[player] == roles[0]]
+
+
+def test_asymmetric_game_plays_exactly_one_seat() -> None:
+    """分轨游戏候选**只坐一个座次**——换座次就是同轨互殴。
+
+    这是上面那组测试漏掉的另一半。对手过滤修好之后，候选仍然被安排去坐
+    **对位座次**，于是同一个 bug 换了个方向又回来了：对手是 ghost，
+    候选也去当 ghost。
+
+    实测 s8k4-rollman 第 1 轮（8 局）::
+
+        role=rollman → 352~500 回合，margin 37~140   真实对局
+        role=ghost   → 0 回合，却记 result=win        无效局
+
+    4/8 局无效，那一轮胜率被抬到 1.0。而监控给出的结论是"候选大概率协议
+    格式错"——完全错误的方向，候选本身没有任何问题。
+
+    上面那几个用例之所以没拦住：它们**复现**了 live_run 里的过滤表达式，
+    而不是调用真实代码，所以座次那一半根本没被覆盖到。
+    """
+
+    assert challenger_seats(("rollman", "ghost"), "rollman") == ("rollman",)
+    assert challenger_seats(("rollman", "ghost"), "ghost") == ("ghost",)
+
+
+def test_symmetric_game_still_plays_both_seats() -> None:
+    """对称游戏必须保留两个座次：先后手优势差很多，只打一边的胜率没有意义。"""
+
+    assert challenger_seats(("P0", "P1"), None) == ("P0", "P1")
+
+
+def test_bogus_challenger_track_is_rejected() -> None:
+    """轨道名写错要当场报错，而不是静默退回全座次（那会重新引入同轨互殴）。"""
+
+    with pytest.raises(ValueError, match="不在座次"):
+        challenger_seats(("rollman", "ghost"), "pacman")
 
 
 def test_empty_facing_track_must_raise_not_silently_pass(tmp_path: Path) -> None:

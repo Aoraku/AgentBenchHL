@@ -1,36 +1,38 @@
-# Claude Opus 5 —— ⛔ 尚未接通，**不要拿这份档案去起 run**。
+# Claude Opus 5（teamorouter 中转，**cc harness**）
 #
-# 探测结果（2026-08-23，sbtunnel）
-# -------------------------------
-# * `/v1/models` 只列 OpenAI 家模型（gpt-5.2 … gpt-5.6-terra、gpt-image-*），
-#   **没有任何 claude / opus 条目**；
-# * `/v1/messages`（Anthropic 原生协议）返回：
+# ★ 这份档案与其它 7 个形状不同：它走 `harness: cc`（Claude Code），不是 codex。
+#   原因不是偏好，是上游的硬性要求，见下。
 #
-#       403 {"error":{"message":"This group does not allow /v1/messages dispatch",
-#                     "type":"permission_error"}}
+# 三件实测确定的事（2026-08-23，api.teamorouter.cn）
+# --------------------------------------------------
+# 1. **域名必须是 .cn，不是 .com。**
+#    `.com` 那个域在本机被按 SNI 阻断：同一个 IP，`-servername api.teamorouter.com`
+#    的 ClientHello 直接被 RST（write:errno=104），换成别的 SNI 就能拿到证书链。
+#    TLS1.2 / HTTP1.1 / 80 端口 / 两个 A 记录 / apex 域名全试过，一律 RST。
+#    `.cn` 同一时刻 `/v1/models` 返回 200，列出 claude-opus-5。
 #
-#   注意这句话的含义：端点**存在**，是当前这个 key 所属的**分组**无权调用。
-#   所以问题不在路径，也不在协议 —— 换路径试是白费时间（已试过
-#   `/anthropic/v1/models`，返回的是站点 HTML 首页）。
+# 2. **codex harness 走不通，这是上游明说的。**
+#    打 `/v1/responses` 返回 400，报错原文：
+#        当前请求模型为 claude-opus-5，请求协议为 OpenAI Responses API，
+#        模型和协议不匹配……正确的请求协议为：Anthropic Messages API。
+#    所以这不是配置能绕过去的，只能换 harness。
 #
-# 需要人确认的三件事之一
-# ---------------------
-# 1. 另给一个有 `/v1/messages` 权限的 key（或把现有 key 加进那个分组）；
-# 2. 或者确认 opus5 走 **Claude Code harness**（`harness: cc`）而不是 codex ——
-#    那条路不经过 /responses，配置形状完全不同；
-# 3. 或者给一个别的中转站端点。
+# 3. **cc 这条路是通的。** `/v1/messages` 与 `/v1/chat/completions` 都实测 200。
+#    cc harness 起一个本地 AnthropicBridge：对 Claude Code 说 Anthropic 协议，
+#    对上游翻译成 `/v1/chat/completions`。
 #
-# 下面的值是**占位**，仅表示"字段该长什么样"，没有一个是验证过的。
+# ⚠️ 跨 harness 比较时必须注明：cc 侧**没有** reasoning_effort 这个旋钮
+#    （Anthropic 的 thinking 块在桥接里还原不了），所以 opus-5 的"推理深度"
+#    与其余 7 个 codex 模型的 `high` 不是同一个量，不能当成同一条件下的对照。
 model: claude-opus-5
-base_url: https://sbtunnel.xiaoaojianghu.fun/v1
-api_key_env: ABHL_KEY_SBTUNNEL
-# ⚠️ harness 可能要改成 cc：codex harness 只会打 /responses，
-# 而 Anthropic 家模型在多数中转上走的是 /v1/messages。
-harness: codex
-# 报 codex 官方 originator。不写会用框架默认 agentbench-hl，
-# 可能被中转的客户端白名单拒绝，而报错会指向"模型不支持"这个错误方向
-# （实测 LongCat-2.0 就是这样被拒的）。
-client_name: codex_exec
+# ★ 这里**不带** /v1 —— 与其它 teamorouter 档案相反，因为拼路径的人不同：
+#   codex harness 把 `/responses` 拼在 base_url 后面（所以要带 /v1），
+#   而 AnthropicBridge 拼的是 `/v1/chat/completions`（所以不能带，否则 /v1/v1）。
+#   见 anthropic_bridge.py 的 `f"{upstream_base}/v1/chat/completions"`。
+base_url: https://api.teamorouter.cn
+api_key_env: ABHL_KEY_TEAMOROUTER
+harness: cc
+# 不写 client_name：那是 codex harness 报 originator 用的，cc 这条路不经过它。
+# reasoning_effort 保留只为满足配置 schema，cc runtime 不消费（见上面 ⚠️）。
 reasoning_effort: high
 disable_response_storage: true
-auto_compact_token_limit: 400000

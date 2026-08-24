@@ -59,7 +59,14 @@ def _build_guard(build_root: Path) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _load_evaluator(agentbench_root: Path, game: str, build_root: Path, artifact_root: Path) -> Any:
+def _load_evaluator(
+    agentbench_root: Path,
+    game: str,
+    build_root: Path,
+    artifact_root: Path,
+    timeout_s: float | None = None,
+    step_timeout_s: float | None = None,
+) -> Any:
     """按 A 的注册表装配该游戏的对战器，并尽量使用 per-case 的构建/工件目录。
 
     per-case 目录是并行安全的前提：默认目录是 ``A/data/<game>-build`` 共享路径，
@@ -69,6 +76,12 @@ def _load_evaluator(agentbench_root: Path, game: str, build_root: Path, artifact
     各游戏构造函数支持的关键字并不一致（例如 rollman/snakego 只有 ``artifact_root``，
     没有 ``build_root``）。因此**逐个探测签名**按需传参——原先"两个一起传，
     TypeError 就整体回落"的写法会让这些游戏静默退回只读默认目录。
+
+    ``timeout_s`` 同理，而且漏传它的后果更隐蔽：各游戏自带的默认值只有
+    180~900s（antwar2/aquawar/miracle 都是 180s），而外层 subprocess 超时用的是
+    配置里的 ``runtime.match_timeout_s``（默认 1800s）。两者不一致时**内层先到**，
+    于是配置形同虚设，长局被判成候选的失败（实测 s8k4-miracle 两局
+    ``match timed out after 180.000s``，记成 0 回合 + loss）。
     """
 
     source_root = agentbench_root / "src"
@@ -90,6 +103,13 @@ def _load_evaluator(agentbench_root: Path, game: str, build_root: Path, artifact
         kwargs["build_root"] = build_root
     if "artifact_root" in parameters:
         kwargs["artifact_root"] = artifact_root
+    if timeout_s is not None and "timeout_s" in parameters:
+        kwargs["timeout_s"] = float(timeout_s)
+    # 每步上限：目前还没有游戏 evaluator 认这个参数，所以传了也不会改变行为。
+    # 先把通道打通，等各游戏 arena 按 saiblo 的按步计时改造时直接就能用
+    # （saiblo 每步重发 send_init(AI_TIME=3)，我们一直只有整局墙钟）。
+    if step_timeout_s is not None and "step_timeout_s" in parameters:
+        kwargs["step_timeout_s"] = float(step_timeout_s)
     if not kwargs:
         return evaluator
     try:
@@ -119,7 +139,14 @@ def run_request(request: dict[str, Any]) -> dict[str, Any]:
     canonical_roles = [str(item) for item in (request.get("canonical_roles") or roles)]
     seed = int(request["seed"])
 
-    evaluator = _load_evaluator(agentbench_root, game, build_root, artifact_root)
+    # timeout_s 缺省时保持各游戏自带默认（老 request.json 仍能重放）。
+    raw_timeout = request.get("timeout_s")
+    timeout_s = float(raw_timeout) if isinstance(raw_timeout, (int, float)) else None
+    raw_step = request.get("step_timeout_s")
+    step_timeout_s = float(raw_step) if isinstance(raw_step, (int, float)) else None
+    evaluator = _load_evaluator(
+        agentbench_root, game, build_root, artifact_root, timeout_s, step_timeout_s
+    )
     with _build_guard(build_root):
         result = evaluator.evaluate(players, roles, seed)
         result = _retry_with_canonical_roles(

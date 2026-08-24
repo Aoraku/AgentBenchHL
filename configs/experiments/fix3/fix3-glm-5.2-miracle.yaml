@@ -1,0 +1,106 @@
+# 自动生成（scripts/make_verify_configs.py），不要手改。
+#
+# 用途：验证 miracle 在 k=4/b=1/progress/用历史 下跑得通
+#
+# 除了被测维度（game（以及随之而来的 challenger_track））之外，所有字段与同批其它配置**逐字节一致**——
+# 手写必然漂移，而漂移在图上看不出来。要改就改生成脚本再重新生成。
+schema_version: '1.1'
+
+game: miracle
+origin: from_scratch
+
+provider:
+  model_profile: glm-5.2
+
+runtime:
+  max_iterations: 2
+  codex_binary: codex
+  # harness 可执行文件：agent_binary 优先，回落 codex_binary。
+  # cc harness（opus-5）要写成 claude —— 不写的话会去执行 codex，
+  # 而 codex 不认识 Claude Code 的参数，报错指向的方向完全是错的。
+  agent_binary: null
+  branch_width: 1
+  # k = 一轮提交几个候选策略。
+  #
+  # k>1 的价值不是"一轮多试几个"，而是**并行假设检验**：一轮把 k 条不同的
+  # 取胜路径同时下水，下一轮把胜出那条变成所有候选的共同底盘，再从那里分叉。
+  # 一轮拿到 k bit 而不是 1 bit。
+  #
+  # 实测对照（antwar2，同一个人类池）：
+  #   k=4 + 单对手 progress → 第 3 轮进池内 #84，第 9 轮 #24，第 21 轮 #10
+  #   k=1 + b=4 对手        → 第 30 轮才 #107
+  # b 个对手只是把同一个策略的评估变精确（降方差），**不产生新的候选假设**，
+  # 所以它替代不了 k。
+  rollout_k: 4
+  # 一轮的对局数 = k × b × 座次 × seed。
+  match_parallelism: 8
+  # 各游戏单局长度差一个数量级（miracle 约 7s，snakego 实测 246s）。
+  # 420s 会误杀长局，而那在结果里看起来像"这个模型不会玩这个游戏"。
+  match_timeout_s: 1800
+  network_access: disabled
+  # 每轮换 thread：这是上下文控制的主要手段（轮末清零），也顺带躲开 codex 的
+  # remote compaction。工作区侧历史一份不动，所以不影响 history_mode: full。
+  thread_rotate_each_iteration: true
+  thread_rotate_context_tokens: 60000
+  iteration_mode: lockstep
+
+curriculum:
+  opponent_policy: progress
+  batch: 1
+  opponent_start_rank: 10
+  order: lowest_rank_first
+  development_seeds: [1]
+  seed_mode: fixed
+  # auto = measured → reference → crawled 逐选手回落。
+  # 绝不能写 crawled：那只有第一批爬取的选手有名次，榜单会从 229 人缩到 20 人。
+  ladder_scope: auto
+
+goal:
+  # 用历史：常驻会话 + 经验文档 + 历次候选代码都保留。
+  history_mode: full
+  prompt_override: null
+  experience_skills: true
+  code_constraint: any
+  seed_policy_path: null
+
+evaluation:
+  # 慢评测（中间版本）：每 pool_stride 轮把一版拉去打完整个冻结人类池，
+  # 算它的真实池内 Elo 与名次。独立进程、只写 pool-elo/。
+  #
+  # ★ 默认 false：**绝大多数实验只需要终局名次**，那个在迭代跑完之后用
+  #   pool_elo_worker 的 --last-n-best 1 单独测就行（几个版本 vs 几十个版本，
+  #   成本差一个数量级，而且那时机器是空的，--parallel 可以开大）。
+  #   只有需要**学习曲线**的实验才开它（--background-pool）。
+  #
+  # 为什么默认关：它是**每个 run 一个 worker**，而水位控制是**各自判断**的，
+  # 不是全局配额 —— 每个 worker 等的是 `load + headroom <= 总核数`，于是 N 个
+  # worker 会在同一时刻各自看到"load 18 < 24，可以派发"然后一起下水。
+  # **每个都"预留 8 核"等于谁也没预留。**
+  #
+  # 实测（16 个 run × 2 轮，32 核）：
+  #   worker-status.json 记到 load_average 40.4（超配 125%）
+  #   慢评测打了 1484 局，而迭代本身只有 232 局 —— 6.4 倍
+  #   同一个 8 局波次：机器空时 56s，铺满后 607~1230s（慢 10~20 倍）
+  #   45 个排队版本**一个都没完成**（每版要 458 局，worker 随 run 退出，
+  #   实测某版停在 234/458）—— 那 1484 局机时换回来 0 个 Elo 数据点。
+  background_pool: false
+  # 只在 background_pool 为 true 时有意义。4 轮一版：32 轮出 8 个点。
+  pool_stride: 4
+  pool_sample: 16
+  pool_seeds: [7]
+  challenger_track: null
+
+isolation:
+  backend: auto
+  rival_code_visible: false
+  docker_image: null
+
+budget:
+  # 不设 token 预算：停止条件是 max_iterations。
+  # 旧的 3000000 是在 token 记账低估 14 倍的口径下拍的，修好后会在第 1 轮掐死 run。
+  tokens: null
+  wall_seconds: null
+
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs

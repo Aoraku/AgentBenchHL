@@ -18,7 +18,21 @@ curriculum:
   order: lowest_rank_first
   seed_mode: fixed
 evaluation:
-  background_pool: true
+  # ★ 消融实验只看**终局名次**，所以不开中间版本的慢评测。
+  #
+  # 消融要回答的是"同样迭代 N 轮之后，哪一组在 229 人池里排得更高"——那是一个
+  # 数字，不需要整条曲线。迭代跑完之后用 scripts/final_elo.sh 只测末轮那一版，
+  # 成本差一个数量级（实测 4 个 run：50 版 22900 局 ≈ 17h vs 4 版 1832 局 ≈ 1.6h），
+  # 而且那时机器是空的，不和迭代抢机时。
+  #
+  # 开着它的代价是实测过的：它**每个 run 起一个 worker**，而 CPU 水位控制是
+  # 各自判断的（每个 worker 等 `load + headroom <= 总核数`），于是 N 个 worker
+  # 会同时看到"还有余量"然后一起下水 —— 每个都"预留 8 核"等于谁也没预留。
+  # 16 个 run 时实测 load 冲到 40/32，迭代慢 10~20 倍，而 45 个排队版本
+  # **一个都没测完**。详见 USER_GUIDE §4。
+  #
+  # 需要曲线的只有主线实验（exp2/exp3），它们显式开 true。
+  background_pool: false
   pool_sample: 16
   pool_seeds:
   - 7

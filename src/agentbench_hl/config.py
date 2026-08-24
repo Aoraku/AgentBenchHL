@@ -286,18 +286,51 @@ class RuntimeConfig:
     network_access: str
     # 每轮候选数。默认 1：一轮只写一个策略，拿它去打 ``curriculum.batch`` 个对手。
     #
-    # 为什么默认从 4 改成 1：见 application/opponent_policy.py 顶部的详注。
-    # 简版是 k=4 的"多样性"在硬约束下退化成同一份代码改几个阈值，一轮花 4 倍
-    # 对局开销只探到 1 个点；而固定打同一个对手让胜率曲线变成一条直线
-    # （实测 4 个游戏四轮胜率恒 0、一个恒 1）。k=1 × b 个对手把探索预算
-    # 从"写 4 个相似版本"移到"拿 1 个版本收 4 份不同证据"。
-    rollout_k: int = 1
+    # 默认 4，而且这个值**有实测依据**（antwar2，同一个 229 人池）：
+    #
+    #   k=4 + 单对手 progress → 第 3 轮进池内 #84，第 9 轮 #24，第 21 轮 #10
+    #   k=1 + b=4 对手        → 第 30 轮才 #107
+    #
+    # 曾经改成 1，理由是"k=4 的多样性会退化成同一份代码改几个阈值"。
+    # 那个判断被数据推翻了：旧 run 前 14 轮的 pairwise 行差异是 48~251 行
+    # （阈值 15），全部判定 distinct —— 多样性是真的。
+    #
+    # k>1 的价值是**并行假设检验**：一轮把 k 条取胜路径同时下水，下一轮把胜出
+    # 那条变成所有候选的共同底盘，再从那里分叉测增量。一轮拿到 k bit。
+    # 我原先以为"b 个对手能提供探索广度"，这是错的：b 个对手只让**同一个策略**
+    # 的评估更精确（降方差），不产生新的候选假设。广度必须来自策略侧。
+    #
+    # k=1 仍然是合法配置（消融维度之一），但它测的是"没有并行假设检验时
+    # 能走多远"，不该用来代表框架能达到的水平。
+    rollout_k: int = 4
     match_parallelism: int = 1
     # 单局墙钟上限。默认 1800s，而不是原来硬编码的 420s——
     # 各游戏单局长度差一个数量级：miracle 一局 7s，snakego 一局实测 246s，
     # 而全池评分时 snakego 还有 19 局连 900s 都没跑完。420s 会让长局被超时判负，
     # 主表上看起来就是"这个模型不会玩 snakego"，属于把基建问题读成实验结论。
     match_timeout_s: float = 1800.0
+    #: **每一步**的思考上限（秒）。None = 不限（历史行为）。
+    #:
+    #: 为什么这是个一等实验变量，而不是一个运维旋钮
+    #: --------------------------------------------
+    #: saiblo 判题器对 AI 选手是**按步**计时的，不是按整局。已在 saiblo 上核对：
+    #: lostspace/miracle 后端每步都重发 ``send_init(AI_TIME, length)``，
+    #: 而 miracle 写得最直白::
+    #:
+    #:     AI_TIME = 3          # AI 选手每步 3 秒
+    #:     PLAYER_TIME = 300    # 真人玩家每步 300 秒
+    #:
+    #: 我们的 arena 一直把这一帧里的 ``time`` **丢掉**，只保留整局墙钟。后果有两层：
+    #:
+    #: 1. 一名选手卡在某一步，saiblo 上只是那一步判超时、对局继续；我们这边是
+    #:    整局耗尽墙钟后 TimeoutError，**整局作废**（0 回合 / loss / 无回放）。
+    #: 2. 更要紧的是**有效性**：人类选手池是在"每步 3 秒"下写出来的（所以清一色
+    #:    C++），而我们的候选此前享受每步无限时间。那样算出来的池内 Elo
+    #:    不是同一个游戏的 Elo。
+    #:
+    #: 所以默认给一个**宽松但有限**的值：既拿回"一步卡住不毁整局"，又不至于把
+    #: Python 候选按 3 秒直接打死。要做同条件对照就显式写 3。
+    step_timeout_s: float | None = 30.0
     agent_binary: str | None = None
     # 会话轮转阈值（当前 thread 的上下文 token 数）。None = 不轮转。
     #
@@ -674,12 +707,20 @@ class ExperimentConfig:
                 branch_width=branch_width,
                 max_iterations=max_iterations,
                 network_access="disabled",
-                rollout_k=_positive_int(runtime.get("rollout_k"), "runtime.rollout_k", 1),
+                rollout_k=_positive_int(runtime.get("rollout_k"), "runtime.rollout_k", 4),
                 match_parallelism=_positive_int(
                     runtime.get("match_parallelism"), "runtime.match_parallelism", 1
                 ),
                 match_timeout_s=_positive_float(
                     runtime.get("match_timeout_s"), "runtime.match_timeout_s", 1800.0
+                ),
+                # 显式写 null = 不限（回到历史行为）；不写 = 30s 宽松档。
+                step_timeout_s=(
+                    None
+                    if "step_timeout_s" in runtime and runtime.get("step_timeout_s") is None
+                    else _positive_float(
+                        runtime.get("step_timeout_s"), "runtime.step_timeout_s", 30.0
+                    )
                 ),
                 agent_binary=_optional_text(runtime.get("agent_binary"), "runtime.agent_binary"),
                 thread_rotate_context_tokens=_optional_positive_int(

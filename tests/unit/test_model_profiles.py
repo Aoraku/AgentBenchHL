@@ -29,8 +29,8 @@ MODELS_DIR = Path(__file__).resolve().parents[2] / "configs" / "models"
 #: 在第 0 轮、smoke8-miracle 在第 2 轮都被压缩打死；而历史上跑通的 run
 #: （snakego4 / aquawar4 / g4 / m4）用的都是 900000。
 #:
-#: 400000 这个下限取自已知能跑通的最小值（opus-5 档案），
-#: 足以拦住"少一个零"这一类错误 —— 那正是人眼最容易漏掉的。
+#: 400000 这个下限比现役档案里最小的那个（gpt-5.6-sol 的 600000）再低一档，
+#: 目的只是拦住"少一个零"这一类错误 —— 那正是人眼最容易漏掉的。
 MIN_AUTO_COMPACT_LIMIT = 400_000
 
 
@@ -109,16 +109,28 @@ def test_model_slug_matches_the_builtin_catalog_casing(name: str, profile: dict)
 
 @pytest.mark.parametrize(("name", "profile"), _profiles())
 def test_base_url_matches_the_relay_convention(name: str, profile: dict) -> None:
-    """``/responses`` 是直接拼在 ``base_url`` 后面的，所以两个中转的写法不同。
+    """路径是**谁拼的**决定要不要 ``/v1``，所以规则按 harness 分。
+
+    codex harness：``/responses`` 直接拼在 ``base_url`` 后面。
 
     * teamorouter / sbtunnel 的端点是 ``/v1/responses`` → 必须带 ``/v1``
     * 清华 ``.../sub2api`` 自身就是根 → **不带** ``/v1``
+
+    cc harness：拼的人是 ``AnthropicBridge``，它拼的是
+    ``f"{upstream_base}/v1/chat/completions"`` → base_url **不能**带 ``/v1``，
+    否则变成 ``/v1/v1/chat/completions``。
 
     写错的表现是 404，而且返回的是站点 HTML 首页，报错极具误导性。
     """
 
     url = profile.get("base_url")
     if not url:
+        return
+    if profile.get("harness") == "cc":
+        assert not url.rstrip("/").endswith("/v1"), (
+            f"{name}: cc harness 的 AnthropicBridge 自己会拼 /v1/chat/completions，"
+            "base_url 再带 /v1 就成了 /v1/v1"
+        )
         return
     if "sub2api" in url:
         assert not url.rstrip("/").endswith("/v1"), (

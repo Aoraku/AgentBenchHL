@@ -33,6 +33,17 @@ from agentbench_hl.ports.isolation import CandidateIsolation, IsolationRequest
 
 WORKER_MODULE = "agentbench_hl.adapters.contract.match_worker"
 
+#: 外层 subprocess 超时相对**对战器内层**超时多留的余量（秒）。
+#:
+#: 同一个 ``timeout_s`` 现在两处都用：内层给各游戏 evaluator（判"这一局打太久"），
+#: 外层给 subprocess（兜住编译/沙箱起停这类不在对局里的耗时）。两边取同一个值时
+#: 谁先到是随机的，而外层先到只能给出一句"exceeded Ns wall limit"——
+#: 内层先到才有"哪个进程还活着、返回码多少"这种能直接定位的诊断
+#: （lostspace 的死锁就是靠内层的 ``returncodes=[None,...]`` 定位到的）。
+#:
+#: 300s 取自 C++ 选手的编译上限（compile_cpp_package 的 timeout）。
+MATCH_TIMEOUT_GRACE_S = 300.0
+
 
 class ArenaError(RuntimeError):
     """对局无法发起（配置/资源问题，属基础设施故障）。"""
@@ -60,6 +71,8 @@ class ContractArena:
     extra_writable_roots: tuple[Path, ...] = ()
     opponents: Mapping[str, PoolPlayer] = field(default_factory=dict)
     timeout_s: float = 420.0
+    #: 每步思考上限（秒）。None = 不限。见 RuntimeConfig.step_timeout_s。
+    step_timeout_s: float | None = None
     python_executable: str = sys.executable
     # 每局独占的核数：后端 + 两个选手进程。少于 2 会让重计算选手被邻居拖成"超时"。
     cpus_per_match: int = 3
@@ -223,6 +236,21 @@ class ContractArena:
             ],
             "build_root": str(self.build_root),
             "artifact_root": str(artifact_root),
+            # ★ 单局墙钟上限必须**传进对战器内部**，不能只靠外层 subprocess 超时。
+            #
+            # 各游戏 evaluator 自己带默认值（实测 antwar2/aquawar/miracle 180s、
+            # lostspace 240s、antwar/rollman 300s、generals 600s、snakego 900s），
+            # 而 worker 以前只探测 build_root / artifact_root 两个参数，**从不传
+            # timeout_s**。于是 runtime.match_timeout_s 只能杀外层进程，内层照旧
+            # 按 180s 判超时 —— 配置写 1800 也没用。
+            #
+            # 后果正是手册里警告过的那种：长局被判成候选的失败。实测
+            # s8k4-miracle 有两局 `match timed out after 180.000s`，
+            # 记成 0 回合 + result=loss，读起来像"这个模型不会玩 miracle"。
+            "timeout_s": self.timeout_s,
+            # 每步思考上限。saiblo 判题器是**按步**计时的（AI_TIME=3），
+            # 我们一直只有整局墙钟，见 RuntimeConfig.step_timeout_s 的详注。
+            "step_timeout_s": self.step_timeout_s,
         }
         request_path = artifact_root / "request.json"
         request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -255,12 +283,22 @@ class ContractArena:
                     command,
                     capture_output=True,
                     text=True,
-                    timeout=self.timeout_s,
+                    # 外层要比内层**宽一点**：同一个 timeout_s 现在也传给了对战器
+                    # （见 request 里的 timeout_s）。两边取同一个值时谁先到是随机的，
+                    # 而外层先到只能得到一句"exceeded Ns wall limit"，
+                    # 内层先到才有"哪个进程还活着、返回码是多少"这类可查的诊断。
+                    # 留出的余量给编译（C++ 选手最多 300s）与沙箱起停。
+                    timeout=self.timeout_s + MATCH_TIMEOUT_GRACE_S,
                     env=environment,
                     check=False,
                 )
             except subprocess.TimeoutExpired:
-                return self._incomplete(case, f"match exceeded {self.timeout_s:.0f}s wall limit")
+                return self._incomplete(
+                    case,
+                    f"match exceeded {self.timeout_s + MATCH_TIMEOUT_GRACE_S:.0f}s wall limit "
+                    f"(对战器内层上限 {self.timeout_s:.0f}s 都没能收住，"
+                    f"通常是编译或沙箱起停卡住)",
+                )
             pinned = bool(cpus)
         (artifact_root / "worker.log").write_text(
             (completed.stderr or "") + "\n" + (completed.stdout or ""), encoding="utf-8"

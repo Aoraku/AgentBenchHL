@@ -29,22 +29,36 @@ curriculum:
   advance_min_matches: 2
   advance_streak: 1
   advance_win_rate: 0.6
+  # 一轮打几个对手（b）。默认形态 k=4 / b=1，显式写出来让账本与行为一致
+  # （旧的 ladder_up 无论 batch 写多少都只打 1 个，账本却记 4）。
+  batch: 1
   development_seeds:
   - 1
   - 2
   ladder_scope: auto
-  opponent_policy: ladder_up
+  # progress（不是旧的 ladder_up）：从 opponent_start_rank 起铺 b 个槽位往榜首爬，
+  # 稳定打赢（最近 2 轮 4 局至少 3 胜）才前进一名，已打过的名次会被跳过。
+  # 与 exp2-antwar2-conquest.yaml 同口径，理由见那份的注释。
+  opponent_policy: progress
   opponent_rank: null
-  # 从第 10 名起（antwar 的 rank10 Elo=911，rank1=1183）。
-  opponent_start_rank: 10
+  # 起点第 20 名（antwar 人类池 94 人，远大于 20）。
+  opponent_start_rank: 20
   order: lowest_rank_first
   seed_mode: fixed
-# ⚠️ 这里**故意不写 evaluation 段**。
-# Elo **不占迭代进程的任何时间**，也不需要任何旋钮：
-# `_pool_elo()` 是纯计算——拿该 run 迄今已打完的官方对局，以每个对手在人类池里的
-# Elo 作固定锚点做一维 BT 极大似然（domain/pool_elo.py）。它**不额外打任何一局**。
-# 曾经的 `evaluation.background_pool / pool_sample / pool_seeds` 在 src/ 里没有任何
-# 消费方（死配置），写上去只会让人误以为"测 Elo 要额外跑 16 局"。
+evaluation:
+  # ★ 主线实验要**学习曲线**，所以这里开中间版本的慢评测。
+  # 与 exp2-antwar2-conquest.yaml 完全同口径（两份只应差 game）。
+  #
+  # 上一版"故意不写 evaluation 段"的两条理由现在都不成立了，而它混淆的两个
+  # 东西值得说清：`_pool_elo()` 是**零成本反解**（本轮真打过的 8 局 + 冻结池
+  # 锚点，噪声大，曲线上的橙点）；慢评测是**全池实测**（这一版打完整个冻结
+  # 人类池，绿线，**结论要读这条**）。前者确实不需要旋钮，后者需要。
+  # 而 `background_pool` 现在**真的有消费方**了（cli/main.py 会起 worker）。
+  background_pool: true
+  # 4 轮取一版。每版几百局，再密慢评测就追不上迭代（见 USER_GUIDE §4）。
+  pool_stride: 4
+  # antwar 是对称游戏，不分轨。只有 rollman 要填这个。
+  challenger_track: null
 game: antwar
 goal:
   code_constraint: any

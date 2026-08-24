@@ -117,9 +117,18 @@ goal:
 
 evaluation:
   # 慢通道：中间版本对冻结人类池做后台评测，算真实 Elo 与池内名次。
-  # 它**不影响**迭代（另起进程、另建对局），只是把"这一版插进人类榜第几名"
-  # 这个问题回答清楚。曲线上的实线就来自这里。
-  background_pool: true
+  # 曲线上的实线就来自这里。
+  #
+  # ★ 默认 false。它"不影响迭代"这句话只在**单个 run** 时成立：worker 是
+  # 每个 run 一个，而 CPU 水位控制是各自判断的（每个 worker 等
+  # `load + headroom <= 总核数`），于是 N 个 worker 会同时看到"还有余量"
+  # 然后一起下水 —— 每个都"预留 8 核"等于谁也没预留。16 个 run 时实测
+  # load 冲到 40/32，迭代的对局波次从 56s 涨到 607~1230s（慢 10~20 倍），
+  # 而 45 个排队版本一个都没测完（每版要 458 局，worker 随 run 退出）。
+  #
+  # 多数实验只需要**终局名次**：迭代跑完用 scripts/final_elo.sh 只测末轮那一版。
+  # 只有需要学习曲线的主线实验才开 true，并配 pool_stride: 4。
+  background_pool: false
   pool_sample: 16
   pool_seeds: [7]
 

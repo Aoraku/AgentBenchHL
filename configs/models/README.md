@@ -42,11 +42,25 @@ glm / kimi / qwen 这些不配 `model_catalog` 就会打印
 
 ## 当前状态
 
-| 档案 | 状态 |
-|---|---|
-| `glm-5.2` | ✅ 跑通（8 游戏烟测都用它） |
-| `glm-5.3` | ✅ 跑通，但会 429 限流 |
-| 其余 5 个 | ⚠️ 端点与 key 待填（占位档案，`api_key_env` 已就位） |
+| 档案 | harness | 状态 |
+|---|---|---|
+| `glm-5.2` | codex | ✅ 跑通（8 游戏烟测都用它） |
+| `glm-5.3` | codex | ✅ 跑通，但会 429 限流 |
+| `gpt-5.6-sol` | codex | ✅ 跑通 32 轮 |
+| `kimi-k3` | codex | ✅ 验过 |
+| `deepseek-v4-pro` | codex | ✅ 官方 API，验过 |
+| `qwen3.8` | codex | ✅ 官方 API（slug `qwen3.8-max`），验过 |
+| `opus-5` | **cc** | ✅ teamorouter**.cn**，只能走 Messages API |
+| `longcat-2.0` | codex | ❌ 中转拒绝工具调用（见 USER_GUIDE §7）|
+| `gpt-5.6` | codex | ⚠️ 指向被 SNI 阻断的 `.com` 域，未验证 |
 
-占位档案里的 `base_url` 是待确认值。拿到真实中转站后只改这一处，
-所有引用该 profile 的实验自动跟上。
+## cc harness 的 base_url 规则与 codex **相反**
+
+上面说的"teamorouter 要带 `/v1`"只适用于 codex harness。`cc` harness 的路径是
+`AnthropicBridge` 拼的（`f"{upstream_base}/v1/chat/completions"`），所以它的
+`base_url` **不能**带 `/v1`，否则变成 `/v1/v1/chat/completions`。
+同一个中转、两个 harness、两条相反的规则 —— 有测试守着这一点。
+
+用 `cc` 的档案还要在**实验配置**里写 `runtime.agent_binary: claude`
+（生成脚本给了 `--agent-binary`）。不写会去执行 `codex`，而 codex 不认识
+Claude Code 的参数，报错方向完全是错的。

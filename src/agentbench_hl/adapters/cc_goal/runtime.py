@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -49,9 +50,27 @@ class ClaudeCodeUnavailable(RuntimeError):
     """cc harness 不可用（缺二进制 / 版本不支持 headless 流式输出）。"""
 
 
+def resolve_harness_binary(binary: str) -> str:
+    """把 ``claude`` 这样的**裸名字**按 PATH 解析成绝对路径。
+
+    为什么需要：``runtime.agent_binary`` 的自然写法就是裸名字（``codex_binary``
+    一直是 ``codex``），但这里原先只做 ``Path(binary).exists()`` —— 裸名字被当成
+    相对于 cwd 的路径，于是明明 ``which claude`` 找得到，也会报
+    ``claude binary not found: claude``。实测 vk4-opus-5 第 1 轮就是这么死的，
+    而报错指向"没装 Claude Code"这个完全错误的方向。
+
+    带路径分隔符的写法（``./x`` 或 ``/usr/bin/x``）保持原样，不去查 PATH。
+    """
+
+    if os.sep in binary or (os.altsep and os.altsep in binary):
+        return binary
+    return shutil.which(binary) or binary
+
+
 def probe_claude_installation(binary: str) -> dict[str, object]:
     """检查 claude 可执行文件与 headless 能力。"""
 
+    binary = resolve_harness_binary(binary)
     path = Path(binary)
     if not path.exists():
         raise ClaudeCodeUnavailable(f"claude binary not found: {binary}")
@@ -102,11 +121,23 @@ class ClaudeCodeRuntime:
     _turn_index: int = field(default=0, repr=False)
     _relay_launcher: Path | None = field(default=None, repr=False)
     _network_isolation: str = field(default="unknown", repr=False)
+    #: ``start()`` 新建、但还没真正跑过一个 turn 的 thread id。
+    #:
+    #: 这些要用 ``--session-id``（新建会话），其余用 ``--resume``（续接）。
+    #: 为什么不能用"这是第几个 turn"来判断：``thread_rotate_each_iteration``
+    #: 每轮都会再调一次 ``start()`` 拿一个**全新**的 uuid，而那时全局 turn 计数
+    #: 早已 > 0，于是对一个从未建立过的会话发 ``--resume``：
+    #:     claude exited 1: No conversation found with session ID: 97264be0-…
+    #: 实测 vk4-opus-5 第 1 轮的 4 个候选与 8 局全部正常，第 2 轮开头就这么死了。
+    _fresh_threads: set[str] = field(default_factory=set, repr=False)
 
     # -- 生命周期 ---------------------------------------------------------
 
     def _ensure_ready(self) -> None:
         if not self._capabilities:
+            # 解析成绝对路径再存回去：命令要在 bwrap 沙箱里执行，那里的 PATH
+            # 与宿主不同，裸名字可能解析不到（或解析到另一个二进制）。
+            self.binary = resolve_harness_binary(self.binary)
             self._capabilities = probe_claude_installation(self.binary)
         self.agent_home.mkdir(parents=True, exist_ok=True)
         if self.gateway is not None and self._relay_launcher is None:
@@ -117,6 +148,9 @@ class ClaudeCodeRuntime:
         self._ensure_ready()
         # Claude Code 的会话 id 由 --session-id 指定（支持时），否则从首轮结果里回读。
         thread_id = str(uuid.uuid4())
+        # 标记成"待新建"：这是 --session-id 还是 --resume 的唯一依据。
+        # 轮转时 start() 会被再调一次，那个新 thread 同样必须走新建。
+        self._fresh_threads.add(thread_id)
         self._pending_system_prompt = self._system_prompt(run_context)
         self._record(
             "AgentSessionStarted",
@@ -193,8 +227,11 @@ class ClaudeCodeRuntime:
                 {"reason": "nonzero_exit", "exit_code": completed.returncode, "detail": tail},
             )
             raise ClaudeCodeUnavailable(f"claude exited {completed.returncode}: {tail}")
+        # 这个 thread 已经真的建立起来了，后续 turn 一律走 --resume。
+        self._fresh_threads.discard(session.thread_id)
         if session_id and session_id != session.thread_id:
             # 该 claude 版本不支持 --session-id：采用它自己生成的会话 id。
+            self._fresh_threads.discard(session_id)
             session.thread_id = session_id
         self._record(
             "AgentTurnCompleted",
@@ -239,7 +276,9 @@ class ClaudeCodeRuntime:
             "supports_append_system_prompt"
         ):
             arguments.extend(("--append-system-prompt", self._pending_system_prompt))
-        if self._turn_index == 0:
+        # 按**这个 thread 自己**是否已建立来选，不看全局 turn 计数（见
+        # _fresh_threads 的详注：轮转后用 --resume 会 "No conversation found"）。
+        if session.thread_id in self._fresh_threads:
             if self._capabilities.get("supports_session_id"):
                 arguments.extend(("--session-id", session.thread_id))
         else:

@@ -32,6 +32,7 @@ from agentbench_hl.adapters.contract.pool import (
 )
 from agentbench_hl.adapters.isolation import select_candidate_isolation
 from agentbench_hl.adapters.transcript import transcript_root
+from agentbench_hl.application.opponent_policy import effective_batch_for
 from agentbench_hl.config import ExperimentConfig, repository_root_for
 from agentbench_hl.gamepack import GamePack
 from agentbench_hl.ports.isolation import CandidateIsolation, IsolationRequest
@@ -277,6 +278,8 @@ def build_goal_run(
         # 单局墙钟上限来自配置（默认 1800s）。曾经硬编码 420s，而 snakego 单局实测
         # 246s、评分时还有 19 局连 900s 都超——那会把长局判成候选的失败。
         timeout_s=config.runtime.match_timeout_s,
+        # 每步上限：saiblo 按步计时，我们以前只有整局墙钟（详注见配置项本身）。
+        step_timeout_s=config.runtime.step_timeout_s,
     )
 
     runtime = _build_runtime(config, run_root)
@@ -297,6 +300,16 @@ def build_goal_run(
         },
         "opponent_policy": config.curriculum.opponent_policy,
         "rollout_k": config.runtime.rollout_k,
+        # b 是一等实验变量（"一轮对局数 = k × b × 座次"），清单里以前**根本没记**,
+        # 于是读账本的人无从校验对局数。
+        #
+        # 记的是**实际值**而不是配置里的 batch：单目标策略（ladder_up /
+        # ladder_down / fixed_rank）无论 batch 写多少都只打 1 个对手。
+        # exp2 主线就是 ladder_up 配着默认 batch: 4，照抄配置会让清单里写 4、
+        # 实际只打 1 个，对局数因此差 4 倍。
+        "batch": effective_batch_for(
+            config.curriculum.opponent_policy, config.curriculum.batch
+        ),
         "match_parallelism": config.runtime.match_parallelism,
         "budget": {
             "tokens": config.budget.tokens,

@@ -23,12 +23,28 @@ curriculum:
   opponent_start_rank: 10
   order: lowest_rank_first
   seed_mode: fixed
-# ⚠️ 这里**故意不写 evaluation 段**。
-# Elo **不占迭代进程的任何时间**，也不需要任何旋钮：
-# `_pool_elo()` 是纯计算——拿该 run 迄今已打完的官方对局，以每个对手在人类池里的
-# Elo 作固定锚点做一维 BT 极大似然（domain/pool_elo.py）。它**不额外打任何一局**。
-# 曾经的 `evaluation.background_pool / pool_sample / pool_seeds` 在 src/ 里没有任何
-# 消费方（死配置），写上去只会让人误以为"测 Elo 要额外跑 16 局"。
+evaluation:
+  # ★ 主线实验要**学习曲线**，所以这里开中间版本的慢评测。
+  #
+  # 上一版这里"故意不写 evaluation 段"，理由是"`_pool_elo()` 是纯计算、不额外
+  # 打任何一局，而 background_pool 在 src/ 里没有消费方（死配置）"。
+  # **那两句现在都不成立了**，留在这里是因为它混淆的两个东西很值得说清：
+  #
+  # 1. `_pool_elo()`（domain/pool_elo.py）算的是**零成本反解**：拿本轮真打过的
+  #    那几局 + 冻结池锚点做锚定 BT/MLE。它确实一局不多打，但样本只有 k×b×2 局
+  #    （这个配置下 8 局），噪声很大 —— 那是曲线上的橙点。
+  # 2. 慢评测才是**全池实测**：把这一版拉去打完整个冻结人类池（antwar2 = 458 局），
+  #    得到真实池内 Elo 与插入名次 —— 那是绿线，**结论要读的是这条**。
+  #    它当然要额外打局，而且是在**另一个进程**里打，不占迭代时间。
+  #
+  # 所以"Elo 不需要旋钮"只对第 1 种成立。主线要的是第 2 种。
+  # 而 `background_pool` 现在**真的有消费方**了（cli/main.py 会起 worker）。
+  background_pool: true
+  # 4 轮取一版。每版 458 局，再密慢评测就追不上迭代（stride=1 实测会让
+  # N 个 worker 把机器打满且一版都测不完，见 USER_GUIDE §4）。
+  pool_stride: 4
+  # antwar2 是对称游戏，不分轨。只有 rollman 要填这个。
+  challenger_track: null
 game: antwar2
 goal:
   code_constraint: any

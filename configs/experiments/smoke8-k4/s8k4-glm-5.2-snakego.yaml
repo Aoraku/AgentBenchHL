@@ -1,0 +1,85 @@
+# 自动生成（scripts/make_verify_configs.py），不要手改。
+#
+# 用途：验证 snakego 在 k=4/b=1/progress/用历史 下跑得通
+#
+# 除了被测维度（game（以及随之而来的 challenger_track））之外，所有字段与同批其它配置**逐字节一致**——
+# 手写必然漂移，而漂移在图上看不出来。要改就改生成脚本再重新生成。
+schema_version: '1.1'
+
+game: snakego
+origin: from_scratch
+
+provider:
+  model_profile: glm-5.2
+
+runtime:
+  max_iterations: 2
+  codex_binary: codex
+  agent_binary: null
+  branch_width: 1
+  # k = 一轮提交几个候选策略。
+  #
+  # k>1 的价值不是"一轮多试几个"，而是**并行假设检验**：一轮把 k 条不同的
+  # 取胜路径同时下水，下一轮把胜出那条变成所有候选的共同底盘，再从那里分叉。
+  # 一轮拿到 k bit 而不是 1 bit。
+  #
+  # 实测对照（antwar2，同一个人类池）：
+  #   k=4 + 单对手 progress → 第 3 轮进池内 #84，第 9 轮 #24，第 21 轮 #10
+  #   k=1 + b=4 对手        → 第 30 轮才 #107
+  # b 个对手只是把同一个策略的评估变精确（降方差），**不产生新的候选假设**，
+  # 所以它替代不了 k。
+  rollout_k: 4
+  # 一轮的对局数 = k × b × 座次 × seed。
+  match_parallelism: 8
+  # 各游戏单局长度差一个数量级（miracle 约 7s，snakego 实测 246s）。
+  # 420s 会误杀长局，而那在结果里看起来像"这个模型不会玩这个游戏"。
+  match_timeout_s: 1800
+  network_access: disabled
+  # 每轮换 thread：这是上下文控制的主要手段（轮末清零），也顺带躲开 codex 的
+  # remote compaction。工作区侧历史一份不动，所以不影响 history_mode: full。
+  thread_rotate_each_iteration: true
+  thread_rotate_context_tokens: 60000
+  iteration_mode: lockstep
+
+curriculum:
+  opponent_policy: progress
+  batch: 1
+  opponent_start_rank: 10
+  order: lowest_rank_first
+  development_seeds: [1]
+  seed_mode: fixed
+  # auto = measured → reference → crawled 逐选手回落。
+  # 绝不能写 crawled：那只有第一批爬取的选手有名次，榜单会从 229 人缩到 20 人。
+  ladder_scope: auto
+
+goal:
+  # 用历史：常驻会话 + 经验文档 + 历次候选代码都保留。
+  history_mode: full
+  prompt_override: null
+  experience_skills: true
+  code_constraint: any
+  seed_policy_path: null
+
+evaluation:
+  # 慢评测：每 3 轮把中间版本拉去打完整个冻结人类池，算真实池内 Elo 与名次。
+  # 独立进程、只写 pool-elo/、自带 CPU 水位控制。Elo 面板的实测曲线只来自这里。
+  background_pool: true
+  pool_stride: 1
+  pool_sample: 16
+  pool_seeds: [7]
+  challenger_track: null
+
+isolation:
+  backend: auto
+  rival_code_visible: false
+  docker_image: null
+
+budget:
+  # 不设 token 预算：停止条件是 max_iterations。
+  # 旧的 3000000 是在 token 记账低估 14 倍的口径下拍的，修好后会在第 1 轮掐死 run。
+  tokens: null
+  wall_seconds: null
+
+paths:
+  agentbench_root: ${AGENTBENCH_ROOT}
+  runs_root: ../../../runs

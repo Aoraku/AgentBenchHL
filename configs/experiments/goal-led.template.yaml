@@ -70,7 +70,11 @@ goal:
   seed_policy_path: null      # origin=seeded 时的起点策略
 
 evaluation:
-  background_pool: true       # 慢通道：中间版本对全池抽样评测算 Elo/胜率
+  # 慢通道：中间版本打全池算真实 Elo/名次。**默认关**——多数实验只要终局名次，
+  # 迭代跑完用 scripts/final_elo.sh 单独测更省机时（理由见 USER_GUIDE §4：
+  # 它每个 run 一个 worker 且水位各自判断，N 个一起下水会把机器打满）。
+  # 只有需要学习曲线的主线实验才改成 true 并配 pool_stride: 4。
+  background_pool: false
   pool_sample: 16             # 抽样对手数（分层）
   pool_seeds: [7]
 

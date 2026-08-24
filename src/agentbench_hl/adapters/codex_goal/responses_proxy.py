@@ -51,13 +51,35 @@ class ResponsesCompatProxy:
         self._backoff_lock = threading.Lock()
         self._backoff_seconds = 0.0
         self._absorbed_failures = 0
+        #: **正在**重试中的请求：token → 它开始的时刻。
+        #:
+        #: 为什么必须单独记在飞的
+        #: --------------------
+        #: 记账原来只在 ``request_bytes_with_backoff`` **返回之后**做，于是一个
+        #: 在内部反复重试几十分钟的请求，在它返回之前一秒都不会被计入
+        #: ``backoff_seconds`` —— 而 checkpoint 的 deadline 检查读的正是这个值。
+        #: 结果是：**这个补偿机制本来要保护的"长时间卡住"，恰好是它唯一覆盖不到
+        #: 的情况。**
+        #:
+        #: 实测 fix3-aquawar 第 2 轮：前面几个带重试的请求 credited 721s，
+        #: 最后那个请求在长重试循环里（IncompleteRead 每次都要先生成几分钟才断，
+        #: 一断整段重来）还没返回，deadline 就到了，报
+        #:     TimeoutError: … （已扣除上游退避等待 721s，仍超过 3600s 预算）
+        #: 那一轮的 8 局对局本身是干净的，整个 run 却以 iteration_failed 报废。
+        #: 从账本上看像"agent 想了一小时"，其实是几十分钟被丢弃的生成。
+        self._inflight_since: dict[int, float] = {}
 
     @property
     def backoff_seconds(self) -> float:
-        """至今在退避上累计等待的秒数（供 checkpoint deadline 补偿）。"""
+        """至今在退避上累计等待的秒数（供 checkpoint deadline 补偿）。
 
+        含**在飞**的重试：见 ``_inflight_since`` 的详注。
+        """
+
+        now = time.monotonic()
         with self._backoff_lock:
-            return self._backoff_seconds
+            pending = sum(now - started for started in self._inflight_since.values())
+            return self._backoff_seconds + pending
 
     @property
     def absorbed_failures(self) -> int:
@@ -70,6 +92,21 @@ class ResponsesCompatProxy:
         with self._backoff_lock:
             self._backoff_seconds += max(0.0, seconds)
             self._absorbed_failures += max(0, failures)
+
+    def _mark_retrying(self, token: int, started: float) -> None:
+        """标记"这个请求已经开始重试了"，从此刻起它的耗时实时计入补偿。"""
+
+        with self._backoff_lock:
+            self._inflight_since.setdefault(token, started)
+
+    def _clear_retrying(self, token: int) -> None:
+        """请求收尾：把它从在飞集合里摘掉。
+
+        必须在 :meth:`_record_backoff` **之前**调用，否则同一段时间会被算两次。
+        """
+
+        with self._backoff_lock:
+            self._inflight_since.pop(token, None)
 
     @property
     def base_url(self) -> str:
@@ -105,15 +142,20 @@ class ResponsesCompatProxy:
                 # urlopen 早已返回、退避层已经退场。实测 antwar 就是这样死的
                 # （502 重试成功后读 205 KB 响应体时断掉，异常冒到 HTTP 线程，
                 # 整个 run 终止）。把读体一起纳入重试才有原子语义。
+                attempt_started = time.monotonic()
+                token = id(request)
                 try:
                     retried = 0
 
                     def _log(message: str) -> None:
                         nonlocal retried
                         retried += 1
+                        if retried == 1:
+                            # 第一次重试就登记：从这一刻起，这个请求的耗时会被
+                            # backoff_seconds **实时**计入，而不是等它返回才补。
+                            owner._mark_retrying(token, attempt_started)
                         print(message, file=sys.stderr)
 
-                    attempt_started = time.monotonic()
                     upstream_response = request_bytes_with_backoff(
                         request,
                         timeout_s=owner.timeout_s,
@@ -121,8 +163,11 @@ class ResponsesCompatProxy:
                     )
                     if retried:
                         # 只在真的退避过时记账，避免把正常请求的耗时也算进去。
+                        # 先摘掉在飞标记，否则这段时间会被算两次。
+                        owner._clear_retrying(token)
                         owner._record_backoff(time.monotonic() - attempt_started, retried)
                 except Exception as error:  # noqa: BLE001 - 必须翻译成 HTTP 响应
+                    owner._clear_retrying(token)
                     owner._record_backoff(time.monotonic() - attempt_started, 1)
                     # 重试耗尽也不能让异常冒到 ThreadingHTTPServer：那会打死整个
                     # turn。翻译成 502 交回 codex CLI，由它自己的重试/报错路径处理。

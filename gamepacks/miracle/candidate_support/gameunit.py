@@ -87,7 +87,18 @@ class Artifact:
 
 class CreatureCapacity:
     def __init__(self, cc_list=None):
-        if cc_list is None:
+        # 官方原版写的是 `if cc_list is None`，只挡住了"参数没给"，没挡住
+        # **给了一个空列表**。而后端在生物槽为空时发的就是 `[]`，于是下一行
+        # UNIT_TYPE[cc_list[0]] 直接 IndexError，候选进程当场退出（runner 记 20），
+        # 对局记成 0 回合 + result=loss。
+        #
+        # 这与候选写的策略无关：崩在 update_game_info() 解析局面这一步，
+        # 任何候选遇到同一局面都会崩。实测 fix3-miracle 的 v000_air_dominance
+        # 两个座次都是这样死的（16 局里那 2 局唯一的失败）。
+        #
+        # 作者的本意从 None 分支就能看出来——空就当默认值。这里把判据放宽到
+        # "空即默认"，与那个分支保持一致。
+        if not cc_list:
             cc_list = [0, 0, []]
         self.type = UNIT_TYPE[cc_list[0]]         # 种类
         self.available_count = cc_list[1]  # 生物槽容量

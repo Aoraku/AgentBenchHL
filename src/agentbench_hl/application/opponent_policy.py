@@ -77,6 +77,29 @@ DEFAULT_LADDER_DOWN_START = 1
 PROGRESS_WINDOW_ITERATIONS = 2
 PROGRESS_WINDOW_WINS = 3
 
+#: 每轮只打**一个**对手的策略：``batch`` 写多少它们都只返回 1 个。
+#:
+#: 之所以要把这件事也做成一个模块级常量（而不是只有策略类上的
+#: :meth:`_Base.effective_batch`）：写 ``run-manifest.json`` 的地方
+#: （``adapters/contract/factory.py``）在装配策略实例之前就要落盘，
+#: 手里只有策略的**名字**。而 b 是一等实验变量（"一轮 = k × b × 座次"），
+#: 清单里写错就等于让所有读账本的人算错对局数。
+#:
+#: 两条路径必须给出同一个答案，有测试守着（test_effective_batch.py）。
+SINGLE_TARGET_POLICIES = frozenset({"ladder_up", "ladder_down", "fixed_rank"})
+
+
+def effective_batch_for(policy: str, batch: int) -> int:
+    """只知道策略**名字**时，这个策略每轮实际打几个对手。
+
+    与 :meth:`_Base.effective_batch` 同口径（有测试逐个策略对齐两者），
+    区别只是这里不需要策略实例，因此不受"榜单有多少人"的进一步限制。
+    """
+
+    if canonical_policy_name(policy) in SINGLE_TARGET_POLICIES:
+        return 1
+    return max(1, int(batch))
+
 
 
 @dataclass(frozen=True)
@@ -174,10 +197,36 @@ class OpponentPolicy(Protocol):
         """注入给 Goal 的自然语言说明。"""
         ...
 
+    def effective_batch(self, batch: int) -> int:
+        """这个策略**实际**每轮会打几个对手。见 :meth:`_Base.effective_batch`。"""
+        ...
+
 
 @dataclass(frozen=True)
 class _Base:
     ladder: tuple[LadderEntry, ...]
+
+    def effective_batch(self, batch: int) -> int:
+        """这个策略**实际**每轮会打几个对手（默认：要多少给多少，受榜单大小限制）。
+
+        为什么需要这个方法而不是直接用配置里的 ``batch``
+        ------------------------------------------------
+        单目标策略（``ladder_up`` / ``ladder_down`` / ``fixed_rank``）无论
+        ``batch`` 写多少都**只返回 1 个**对手。于是配置里的 ``batch: 4`` 是个
+        谎：事件账本、``run-manifest.json``、提示词里都写着 4，而实际只打 1 个。
+
+        后果不只是"数字不好看"：
+
+        * 提示词会告诉 agent "这一版会被拿去打 4 个对手，你能从 4 份不同的回放里
+          拿到证据"——而它只会拿到 1 份，等于在指导里撒谎；
+        * ``watch_runs.py`` 的对手数告警拿 b 当阈值，b 虚高会让告警失灵；
+        * 一轮对局数的公式 ``k × b × 座次`` 算出来是实际值的 4 倍，
+          读账本的人会以为丢了 3/4 的对局。
+
+        所以口径统一到**策略自己说**：配置写多少不重要，这里返回的才是真值。
+        """
+
+        return max(1, min(int(batch), len(self.ladder))) if self.ladder else max(1, int(batch))
 
     def _sorted(self) -> tuple[LadderEntry, ...]:
         return tuple(sorted(self.ladder, key=lambda item: item.rank))
@@ -395,6 +444,15 @@ class SequentialConquest(_Base):
     direction: str = "up"
     name: str = "ladder_up"
 
+    def effective_batch(self, batch: int) -> int:
+        """恒为 1：顺序征服一次只打一个目标，``batch`` 写多少都不看。
+
+        exp2 主线就是这个策略配着默认 ``batch: 4`` 在跑，于是账本里写着 4、
+        实际只打 1 个。见 :meth:`_Base.effective_batch` 的详注。
+        """
+
+        return 1
+
     def _sequence_entries(self) -> tuple[LadderEntry, ...]:
         ordered = self._sorted()
         if not ordered:
@@ -447,6 +505,11 @@ class FixedRank(_Base):
 
     target_rank: int = 1
     name: str = "fixed_rank"
+
+    def effective_batch(self, batch: int) -> int:
+        """恒为 1：定点突破只打那一个名次。见 :meth:`_Base.effective_batch`。"""
+
+        return 1
 
     def select(
         self, *, iteration: int, batch: int, history: OpponentHistory | None = None

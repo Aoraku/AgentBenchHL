@@ -1,16 +1,37 @@
-# Qwen3.8 —— 待接。
+# Qwen3.8 Max（阿里云百炼 DashScope 兼容模式，官方 API，不走中转）
 #
-# ⚠️ base_url 与 key 待确认。非 OpenAI 家模型，同 deepseek 的 catalog 注意事项。
-model: qwen3.8
+# 实测 2026-08-23：`/v1/responses` 直通（`scripts/probe_responses_models.py`，1/1 可用）。
+#
+# ★ slug 是 `qwen3.8-max`，不是档案名 `qwen3.8`。
+# DashScope 的 `/v1/models` 列了 241 个模型，qwen3.8 家族有三个：
+# `qwen3.8-max` / `qwen3.8-2.4t-a95b` / `qwen3.8-27b`。旗舰是 max。
+model: qwen3.8-max
+# 兼容模式端点是 `/compatible-mode/v1/responses`，而 codex 把 `/responses`
+# 直接拼在 base_url 后面，所以这里必须带 `/v1`。
 base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 api_key_env: ABHL_KEY_QWEN
 harness: codex
-# 报 codex 官方 originator。不写会用框架默认 agentbench-hl，
-# 可能被中转的客户端白名单拒绝，而报错会指向"模型不支持"这个错误方向
-# （实测 LongCat-2.0 就是这样被拒的）。
-client_name: codex_exec
 reasoning_effort: high
 disable_response_storage: true
+# ★ 不写 client_name。
+#
+# 它**只**为 sbtunnel / teamorouter 那种按客户端白名单放行的中转而设
+# （不写会被拒为 "This account only allows Codex official clients"）。
+# 这里是阿里云**官方** API，没有白名单这回事；给不需要的端点加这个字段
+# 等于凭空造出一处与已验证配置的差异，而每一处差异都要重新验证一遍。
+#
+# ★ 上下文窗口：实测下界，不是抄文档。
+#
+# 没有 catalog 覆盖 qwen，所以必须手写这个键 —— 不写的话 codex 报
+# "Unknown model … will use fallback model metadata"，压缩线就变成一个
+# 我们没设过、也看不见的数（实测 antwar2 在 97k 触发压缩并死掉，
+# 而当时 config.toml 里写的是 200000）。
+#
+# 800000 是**实际发进去过**的输入量（上游回了 200，usage.input_tokens=800053）。
+# 上游不报自己的上限（超长只会被静默截断，不像 deepseek 会把上限写进报错），
+# 所以这里取实测到的下界而不是猜一个。反正 thread_rotate_each_iteration
+# 把每轮上下文压在 6 万量级，真实天花板在哪里并不吃紧。
+context_window: 800000
 # ★ 这个值要设得**足够高，让远程压缩永不触发**，而不是"留个保险"。
 #
 # codex 的 remote compaction 对多数非 OpenAI 模型**必定失败**：

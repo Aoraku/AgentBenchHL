@@ -57,26 +57,38 @@ provider:
 runtime:
   max_iterations: {iterations}
   codex_binary: codex
-  agent_binary: null
+  # harness 可执行文件：agent_binary 优先，回落 codex_binary。
+  # cc harness（opus-5）要写成 claude —— 不写的话会去执行 codex，
+  # 而 codex 不认识 Claude Code 的参数，报错指向的方向完全是错的。
+  agent_binary: {agent_binary}
   branch_width: 1
-  # k=1：一轮只出一个策略，探索广度由 b 个对手提供。
-  rollout_k: 1
-  # 一轮的对局数 = 1 × b × 座次 × seed = 1 × 4 × 2 × 1 = 8 局。
-  match_parallelism: 8
+  # k = 一轮提交几个候选策略。
+  #
+  # k>1 的价值不是"一轮多试几个"，而是**并行假设检验**：一轮把 k 条不同的
+  # 取胜路径同时下水，下一轮把胜出那条变成所有候选的共同底盘，再从那里分叉。
+  # 一轮拿到 k bit 而不是 1 bit。
+  #
+  # 实测对照（antwar2，同一个人类池）：
+  #   k=4 + 单对手 progress → 第 3 轮进池内 #84，第 9 轮 #24，第 21 轮 #10
+  #   k=1 + b=4 对手        → 第 30 轮才 #107
+  # b 个对手只是把同一个策略的评估变精确（降方差），**不产生新的候选假设**，
+  # 所以它替代不了 k。
+  rollout_k: {rollout_k}
+  # 一轮的对局数 = k × b × 座次 × seed。
+  match_parallelism: {parallelism}
   # 各游戏单局长度差一个数量级（miracle 约 7s，snakego 实测 246s）。
   # 420s 会误杀长局，而那在结果里看起来像"这个模型不会玩这个游戏"。
   match_timeout_s: 1800
   network_access: disabled
-  # 每轮换 thread：躲开 codex 的 remote compaction（对 glm 系必死——
-  # 它返回 [reasoning, message] 两个 item，codex 只接受一个）。
-  # 工作区侧历史一份不动，所以不影响 history_mode: full 的语义。
+  # 每轮换 thread：这是上下文控制的主要手段（轮末清零），也顺带躲开 codex 的
+  # remote compaction。工作区侧历史一份不动，所以不影响 history_mode: full。
   thread_rotate_each_iteration: true
   thread_rotate_context_tokens: 60000
   iteration_mode: lockstep
 
 curriculum:
   opponent_policy: progress
-  batch: 4
+  batch: {batch}
   opponent_start_rank: {start_rank}
   order: lowest_rank_first
   development_seeds: [1]
@@ -94,9 +106,27 @@ goal:
   seed_policy_path: null
 
 evaluation:
-  # 慢评测：每 3 轮把中间版本拉去打完整个冻结人类池，算真实池内 Elo 与名次。
-  # 独立进程、只写 pool-elo/、自带 CPU 水位控制。Elo 面板的实测曲线只来自这里。
-  background_pool: true
+  # 慢评测（中间版本）：每 pool_stride 轮把一版拉去打完整个冻结人类池，
+  # 算它的真实池内 Elo 与名次。独立进程、只写 pool-elo/。
+  #
+  # ★ 默认 false：**绝大多数实验只需要终局名次**，那个在迭代跑完之后用
+  #   pool_elo_worker 的 --last-n-best 1 单独测就行（几个版本 vs 几十个版本，
+  #   成本差一个数量级，而且那时机器是空的，--parallel 可以开大）。
+  #   只有需要**学习曲线**的实验才开它（--background-pool）。
+  #
+  # 为什么默认关：它是**每个 run 一个 worker**，而水位控制是**各自判断**的，
+  # 不是全局配额 —— 每个 worker 等的是 `load + headroom <= 总核数`，于是 N 个
+  # worker 会在同一时刻各自看到"load 18 < 24，可以派发"然后一起下水。
+  # **每个都"预留 8 核"等于谁也没预留。**
+  #
+  # 实测（16 个 run × 2 轮，32 核）：
+  #   worker-status.json 记到 load_average 40.4（超配 125%）
+  #   慢评测打了 1484 局，而迭代本身只有 232 局 —— 6.4 倍
+  #   同一个 8 局波次：机器空时 56s，铺满后 607~1230s（慢 10~20 倍）
+  #   45 个排队版本**一个都没完成**（每版要 458 局，worker 随 run 退出，
+  #   实测某版停在 234/458）—— 那 1484 局机时换回来 0 个 Elo 数据点。
+  background_pool: {background_pool}
+  # 只在 background_pool 为 true 时有意义。4 轮一版：32 轮出 8 个点。
   pool_stride: {stride}
   pool_sample: 16
   pool_seeds: [7]
@@ -120,18 +150,37 @@ paths:
 
 
 def render(
-    *, game: str, model: str, iterations: int, stride: int, purpose: str, axis: str
+    *,
+    game: str,
+    model: str,
+    iterations: int,
+    stride: int,
+    purpose: str,
+    axis: str,
+    rollout_k: int = 1,
+    batch: int = 4,
+    start_rank: int = DEFAULT_START_RANK,
+    agent_binary: str | None = None,
+    background_pool: bool = True,
 ) -> str:
     track = CHALLENGER_TRACKS.get(game)
     return TEMPLATE.format(
+        agent_binary="null" if agent_binary is None else agent_binary,
+        background_pool="true" if background_pool else "false",
         game=game,
         model=model,
         iterations=iterations,
         stride=stride,
-        start_rank=DEFAULT_START_RANK,
+        start_rank=start_rank,
         track="null" if track is None else track,
         purpose=purpose,
         axis=axis,
+        rollout_k=rollout_k,
+        batch=batch,
+        # 一轮 k×b×2 局。并发给到"一轮能一次打完"，但不超过 16 ——
+        # 32 核上再高就会和 agent 思考、慢评测互相抢机时（实测铺满时
+        # load 冲到 75，所有东西一起变慢）。
+        parallelism=min(16, max(4, rollout_k * batch * 2)),
     )
 
 
@@ -146,10 +195,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--stride",
         type=int,
-        default=1,
-        help="慢评测每几轮取一版。验收跑只有 2 轮，必须用 1 才能拿到数据点",
+        default=4,
+        help=(
+            "慢评测每几轮取一版（只在 --background-pool 打开时有意义）。"
+            "4 是需要曲线时的默认口径：32 轮 → 8 个点，够看趋势，"
+            "而每个点要 458 局，再密就追不上迭代了"
+        ),
     )
     parser.add_argument("--prefix", default="verify")
+    parser.add_argument(
+        "--rollout-k",
+        type=int,
+        default=1,
+        help="一轮提交几个候选（k）。k>1 才有并行假设检验，见模板里的详注",
+    )
+    parser.add_argument("--batch", type=int, default=4, help="一轮打几个对手（b）")
+    parser.add_argument(
+        "--start-rank",
+        type=int,
+        default=DEFAULT_START_RANK,
+        help=(
+            "progress 课程的起点名次（榜单里第几名，数字越小越强）。"
+            "注意它是**对手**的名次，不是 agent 自己的池内名次 —— "
+            "后者由慢评测测出来，两者同名不同义"
+        ),
+    )
+    parser.add_argument(
+        "--agent-binary",
+        default=None,
+        help="harness 可执行文件（cc harness 用 claude）。不给则回落 codex_binary",
+    )
+    parser.add_argument(
+        "--background-pool",
+        action="store_true",
+        help=(
+            "开启**中间版本**的后台慢评测（每 --stride 轮取一版）。"
+            "默认关闭：绝大多数实验只需要终局名次，那个用 pool_elo_worker "
+            "的 --last-n-best 1 在迭代跑完之后单独测，又快又不抢机时。"
+            "只有需要**学习曲线**的实验（多模型对比 / 多游戏对比）才开它"
+        ),
+    )
     arguments = parser.parse_args(argv)
 
     if not arguments.models and not arguments.games:
@@ -157,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments.out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    shape = f"k={arguments.rollout_k}/b={arguments.batch}"
 
     for model in arguments.models:
         path = arguments.out_dir / f"{arguments.prefix}-{model}-{arguments.game}.yaml"
@@ -166,8 +252,13 @@ def main(argv: list[str] | None = None) -> int:
                 model=model,
                 iterations=arguments.iterations,
                 stride=arguments.stride,
-                purpose=f"验证 {model} 这个模型/中转在新框架下跑得通",
+                purpose=f"验证 {model} 这个模型/中转跑得通（{shape}）",
                 axis="provider.model_profile",
+                rollout_k=arguments.rollout_k,
+                batch=arguments.batch,
+                start_rank=arguments.start_rank,
+                agent_binary=arguments.agent_binary,
+                background_pool=arguments.background_pool,
             ),
             encoding="utf-8",
         )
@@ -181,8 +272,13 @@ def main(argv: list[str] | None = None) -> int:
                 model=arguments.model,
                 iterations=arguments.iterations,
                 stride=arguments.stride,
-                purpose=f"验证 {game} 在新框架（k=1/b=4/progress/用历史）下跑得通",
+                purpose=f"验证 {game} 在 {shape}/progress/用历史 下跑得通",
                 axis="game（以及随之而来的 challenger_track）",
+                rollout_k=arguments.rollout_k,
+                batch=arguments.batch,
+                start_rank=arguments.start_rank,
+                agent_binary=arguments.agent_binary,
+                background_pool=arguments.background_pool,
             ),
             encoding="utf-8",
         )

@@ -223,6 +223,17 @@ class GoalLedService:
             window_iterations=progress_window_iterations,
             window_wins=progress_window_wins,
         )
+        # ★ b 的口径统一到**策略实际会打几个**，而不是配置里写了几个。
+        #
+        # 单目标策略（ladder_up / ladder_down / fixed_rank）无论 batch 写多少都
+        # 只返回 1 个对手。exp2 主线就是 ladder_up 配着默认 batch: 4 在跑，
+        # 于是事件账本、run-manifest.json、提示词里全写着 4，实际只打 1 个。
+        #
+        # 这不只是数字难看：提示词会跟 agent 说"这一版会被拿去打 4 个对手，
+        # 你能从 4 份不同的回放里拿到证据"（它只会拿到 1 份），watch_runs 的
+        # 对手数告警拿虚高的 b 当阈值因此失灵，而"一轮 = k × b × 座次"这个
+        # 公式会让读账本的人以为丢了 3/4 的对局。
+        self.batch = self.policy.effective_batch(self.batch)
 
     # -------------------------------------------------------- opponent history
 
@@ -349,6 +360,21 @@ class GoalLedService:
             f"量化下限：任意两个候选之间的代码差异不少于 "
             f"{DIVERSITY_THRESHOLD_LINES} 行且落在不同的判断路径上；"
             "框架会逐轮度量 pairwise 差异并把结果写进反馈。"
+            # ↓ 这段是 k>1 真正的用法，来自实测最好的那个 run（55 轮打进池内 #10）。
+            # 缺了它，agent 会把 k 个候选当成"k 个独立的小改动"各自演进，
+            # 于是每轮虽然有 k 份证据、却没人去合并它们——k 的复利效应完全丢失。
+            "\n【怎么用好这 k 个候选：先分叉找到能赢的底盘，再在它上面分叉测增量】"
+            "读上一轮反馈时，先分辨出**哪个候选赢了、它和输的那些在机制上差在哪**。"
+            "那条差异就是已被对局证实的「底盘」。"
+            "下一轮的 k 个候选应当**全部保留这条底盘**，然后各自测试一个独立增量；"
+            "而不是让上一轮 4 个候选各自继续往下演进 4 条互不相干的线。"
+            "换句话说：**分叉是为了合并**——一轮探 k 个方向，"
+            "下一轮把胜出方向变成所有候选的共同前提，再从那里继续分叉。"
+            "这样每一轮的 k 份证据都累积进同一条主线；"
+            "各自演进则会让证据散开，k 轮之后你有 k 条半成品而不是一条强策略。"
+            "如果上一轮**全部落败**，那说明当前底盘本身有问题："
+            "这时该让 k 个候选走**更远**的方向（换取胜路径，而不是在同一路径上调参），"
+            "先找到任何一个能赢的点。"
             "候选目录规则："
             ".agentbench/rollouts/<candidate_id>/ 会**叠加**到工作区当前版本之上，"
             "所以每个候选目录里必须放它自己的 main.py（以及被改动的模块）；"
@@ -1342,8 +1368,28 @@ class GoalLedService:
                 )
             if isinstance(row.get("rounds"), int):
                 per_candidate_rounds.setdefault(candidate, []).append(int(row["rounds"]))
+        # 逐候选战绩。**必须带胜率**，不能只有分差。
+        #
+        # k>1 的全部价值在于"分叉找到能赢的底盘 → 下一轮所有候选都保留它、
+        # 再从那里分叉测增量"。要做这件事，agent 首先得知道**哪个候选赢了**。
+        # 这个字段以前只有 margin，胜率得它自己按 candidate_id 分组数 matches
+        # 才能算出来 —— 那一步很容易被跳过，于是 k 个候选各自独立往下演进，
+        # k 轮之后是 k 条半成品而不是一条强策略。
+        #
+        # 实测最好的那个 run（55 轮进池内 #10）第 5 轮的 rationale 就是
+        # "v003-cluster-storm 是首个 2/2 候选……本轮四个候选都保留这条底盘"——
+        # 那正是这个字段该支撑的动作。
+        #
+        # 按 (胜率, 平均分差) 降序排：第一项就是本轮的底盘，不用再比对。
         margin_by_candidate = {
             candidate: {
+                "win_rate": round(
+                    per_candidate[candidate]["points"]
+                    / (per_candidate[candidate]["played"] or 1.0),
+                    4,
+                ),
+                "played": int(per_candidate[candidate]["played"]),
+                "is_best": candidate == best_candidate,
                 "mean": round(sum(values) / len(values), 2),
                 "best": round(max(values), 2),
                 "worst": round(min(values), 2),
@@ -1357,7 +1403,16 @@ class GoalLedService:
                     else None
                 ),
             }
-            for candidate, values in per_candidate_margin.items()
+            for candidate, values in sorted(
+                per_candidate_margin.items(),
+                key=lambda item: (
+                    -(
+                        per_candidate[item[0]]["points"]
+                        / (per_candidate[item[0]]["played"] or 1.0)
+                    ),
+                    -(sum(item[1]) / len(item[1])),
+                ),
+            )
         }
 
         # 失败原因汇总：0 回合判负这种情况没有回放可看，诊断是唯一的可执行线索。
@@ -2408,8 +2463,13 @@ class GoalLedService:
                 "gamepack_digests": gamepack_digests,
                 "experiment_variables": {
                     "seeds": list(self.seeds),
+                    # 候选**实际坐的**座次。分轨游戏只有一个（换座次就是同轨互殴），
+                    # 所以这里不等于 game.yaml 里的角色列表。
                     "roles": list(self.roles),
                     "rollout_k": self.rollout_k,
+                    # b 以前**没记进可复现清单**，而"一轮 = k × b × 座次"要靠它。
+                    # 这里是策略实际会打的个数（单目标策略恒为 1），不是配置里的值。
+                    "batch": self.batch,
                     "opponent_policy": self.policy_name,
                     "match_parallelism": self.match_parallelism,
                     "code_constraint": self.code_constraint,
