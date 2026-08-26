@@ -267,13 +267,20 @@ def run_ladder(
 ) -> dict[str, object]:
     """跑（或续跑）一次全池实测评分，返回汇总文档。"""
 
-    from agentbench_hl.adapters.contract.factory import _supports_compiled_players, game_roles
+    from agentbench_hl.adapters.contract.factory import (
+        _supported_player_build_systems,
+        game_roles,
+    )
 
     root = Path(agentbench_root).resolve()
     work = Path(work_root).resolve()
     work.mkdir(parents=True, exist_ok=True)
     roles = game_roles(root, game)
-    pool = load_pool(root, game, supports_compiled=_supports_compiled_players(root, game))
+    pool = load_pool(
+        root,
+        game,
+        supported_build_systems=_supported_player_build_systems(root, game),
+    )
     by_id = {item.player_id: item for item in pool}
     player_ids, scope_note = _select_players(root, game, pool, scope)
     # 非对称游戏（rollman）：比较关系是二分图，只能跨角色配对。

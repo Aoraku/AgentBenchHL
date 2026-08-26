@@ -160,7 +160,10 @@ def evaluate_challenger(
     可以在里面等到 CPU 空闲再返回，从而不与主迭代抢核。
     """
 
-    from agentbench_hl.adapters.contract.factory import _supports_compiled_players, game_roles
+    from agentbench_hl.adapters.contract.factory import (
+        _supported_player_build_systems,
+        game_roles,
+    )
 
     root = Path(agentbench_root).resolve()
     work = Path(work_root).resolve()
@@ -171,7 +174,11 @@ def evaluate_challenger(
 
     frozen = pool if pool is not None else load_frozen_pool(root, game)
     roles = tuple(game_roles(root, game))
-    players = load_pool(root, game, supports_compiled=_supports_compiled_players(root, game))
+    players = load_pool(
+        root,
+        game,
+        supported_build_systems=_supported_player_build_systems(root, game),
+    )
     by_id = {item.player_id: item for item in players}
     tracks = {item.track for item in players if item.track}
     if len(tracks) == 2:
@@ -403,14 +410,21 @@ def evaluate_many(
     所以断点续跑、指纹校验这些语义都不变。
     """
 
-    from agentbench_hl.adapters.contract.factory import _supports_compiled_players, game_roles
+    from agentbench_hl.adapters.contract.factory import (
+        _supported_player_build_systems,
+        game_roles,
+    )
 
     root = Path(agentbench_root).resolve()
     queue = Path(queue_root).resolve()
     queue.mkdir(parents=True, exist_ok=True)
     frozen = pool if pool is not None else load_frozen_pool(root, game)
     roles = tuple(game_roles(root, game))
-    players = load_pool(root, game, supports_compiled=_supports_compiled_players(root, game))
+    players = load_pool(
+        root,
+        game,
+        supported_build_systems=_supported_player_build_systems(root, game),
+    )
     by_id = {item.player_id: item for item in players}
     tracks = {item.track for item in players if item.track}
     if len(tracks) == 2:

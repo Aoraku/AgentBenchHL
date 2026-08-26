@@ -187,7 +187,9 @@ def _unit_data(data: Mapping[str, object], type_name: str, level: int) -> dict[s
     }
 
 
-def _apply(state: ProbeState, event: int, payload: Sequence[int], data: Mapping[str, object]) -> None:
+def _apply(
+    state: ProbeState, event: int, payload: Sequence[int], data: Mapping[str, object]
+) -> None:
     """把一条事件应用到局面上（就地修改）。
 
     只处理会改变公开局面的事件。Attack/Attacking/Attacked/Leave/Arrive 是

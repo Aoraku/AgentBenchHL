@@ -13,7 +13,9 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -71,14 +73,36 @@ def game_roles(agentbench_root: Path, game: str) -> tuple[str, ...]:
     return tuple(str(item) for item in roles)
 
 
-def _supports_compiled_players(agentbench_root: Path, game: str) -> bool:
-    """该游戏的对战器是否能准备需编译的选手包（有 ``prepare_player`` 即可）。"""
+def _supported_player_build_systems(agentbench_root: Path, game: str) -> frozenset[str]:
+    """读取 A 评测机声明的精确构建系统集合。"""
 
     module = agentbench_root / "games" / game / "evaluator" / "runtime.py"
     if not module.is_file():
-        return False
+        return frozenset()
     text = module.read_text(encoding="utf-8", errors="ignore")
-    return "def prepare_player" in text or "def build_player" in text
+    declaration = re.search(r"^SUPPORTED_PLAYER_BUILD_SYSTEMS\s*=\s*(.+)$", text, re.MULTILINE)
+    if declaration is not None:
+        try:
+            value = ast.literal_eval(declaration.group(1))
+        except (SyntaxError, ValueError):
+            return frozenset()
+        if isinstance(value, (tuple, list, set, frozenset)):
+            return frozenset(str(item) for item in value if str(item) in {"make", "cmake"})
+        return frozenset()
+    # 旧版 A 只有函数名信号。它至多证明传统 Make 可用，绝不能据此放行 CMake。
+    if "SUPPORTS_COMPILED_PLAYERS = False" in text:
+        return frozenset()
+    if "SUPPORTS_COMPILED_PLAYERS = True" in text:
+        return frozenset({"make"})
+    if "def prepare_player" in text or "def build_player" in text:
+        return frozenset({"make"})
+    return frozenset()
+
+
+def _supports_compiled_players(agentbench_root: Path, game: str) -> bool:
+    """Backward-compatible boolean view for callers that only need yes/no."""
+
+    return bool(_supported_player_build_systems(agentbench_root, game))
 
 
 def _isolation_provider(
@@ -236,7 +260,9 @@ def build_goal_run(
     pool = load_pool(
         agentbench_root,
         config.game,
-        supports_compiled=_supports_compiled_players(agentbench_root, config.game),
+        supported_build_systems=_supported_player_build_systems(
+            agentbench_root, config.game
+        ),
         # 榜单口径决定对手选择策略能挑到谁（official 只有 11–32 人，
         # reference/measured 可达数百人）。见 contract/pool.py 的模块文档。
         ladder_scope=config.curriculum.ladder_scope,
