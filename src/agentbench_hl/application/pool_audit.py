@@ -17,7 +17,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -28,7 +30,9 @@ from pathlib import Path
 from agentbench_hl.adapters.contract.arena import ContractArena
 from agentbench_hl.adapters.contract.pool import (
     PoolPlayer,
+    evaluator_content_sha256,
     load_pool,
+    load_valid_audit_document,
     opposing_track,
     players_in_track,
     ranked_ladder,
@@ -39,7 +43,54 @@ from agentbench_hl.ports.arena import MatchCase
 from agentbench_hl.ports.isolation import IsolationRequest
 
 RUNNABLE_FILENAME = "runnable.json"
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
+
+
+def _evaluator_revision(agentbench_root: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(agentbench_root), "rev-parse", "HEAD"),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and revision else "unknown"
+
+
+def _audit_fingerprint(config: dict[str, object]) -> str:
+    payload = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _merge_audit_rows(
+    existing: dict[str, object],
+    current_rows: Sequence[dict[str, object]],
+    *,
+    audit_fingerprint: str,
+) -> dict[str, dict[str, object]]:
+    """Resume only results produced by the same evaluator and audit contract."""
+
+    merged: dict[str, dict[str, object]] = {}
+    if existing.get("audit_fingerprint") == audit_fingerprint:
+        merged.update(
+            {
+                str(row["player_id"]): row
+                for row in (existing.get("rows") or [])
+                if isinstance(row, dict) and row.get("player_id")
+            }
+        )
+    merged.update(
+        {
+            str(row["player_id"]): row
+            for row in current_rows
+            if isinstance(row, dict) and row.get("player_id")
+        }
+    )
+    return merged
 
 
 @dataclass(frozen=True)
@@ -141,11 +192,15 @@ def audit_pool(
     一次（供服务端实时进度）；``should_stop`` 允许外部取消，已完成部分照常写盘。
     """
 
-    from agentbench_hl.adapters.contract.factory import _supports_compiled_players, game_roles
+    from agentbench_hl.adapters.contract.factory import (
+        _supported_player_build_systems,
+        game_roles,
+    )
 
     root = Path(agentbench_root).resolve()
     work = Path(work_root).resolve()
     work.mkdir(parents=True, exist_ok=True)
+    initial_evaluator_content = evaluator_content_sha256(root, game)
     roles = game_roles(root, game)
     # ★ 审计**不能**读自己上一次的结论：``load_pool`` 默认会用 runnable.json 把
     # "审过且失败"的选手降级为不可运行，如果审计再拿这个结果当输入，重审就只会
@@ -154,7 +209,7 @@ def audit_pool(
     players = load_pool(
         root,
         game,
-        supports_compiled=_supports_compiled_players(root, game),
+        supported_build_systems=_supported_player_build_systems(root, game),
         apply_audit=False,
     )
     candidates = list(ranked_ladder(players)) if ranked_only else [p for p in players if p.runnable]
@@ -311,6 +366,20 @@ def audit_pool(
 
     verified = [row for row in rows if row.verified]
     stopped = bool(should_stop is not None and should_stop())
+    evaluator_revision = _evaluator_revision(root)
+    audit_config: dict[str, object] = {
+        "game": game,
+        "evaluator_revision": evaluator_revision,
+        "evaluator_content_sha256": initial_evaluator_content,
+        "method": "self_play_smoke",
+        "seed": seed,
+        "attempts": attempts,
+        "cpus_per_match": cpus_per_match,
+        "timeout_s": timeout_s,
+        "isolation_backend": isolation_backend,
+        "scope": "ranked" if ranked_only else "all_runnable",
+    }
+    fingerprint = _audit_fingerprint(audit_config)
     document: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "game": game,
@@ -320,6 +389,9 @@ def audit_pool(
         "attempts": attempts,
         "cpus_per_match": cpus_per_match,
         "scope": "ranked" if ranked_only else "all_runnable",
+        "evaluator_revision": evaluator_revision,
+        "evaluator_content_sha256": initial_evaluator_content,
+        "audit_fingerprint": fingerprint,
         # 被取消/中断时如实标记：下游（实测评分口径）需要知道这份结论不完整。
         "partial": stopped or len(rows) < total,
         "candidates": total,
@@ -329,6 +401,11 @@ def audit_pool(
         "rows": [row.as_dict() for row in rows],
     }
     if write:
+        final_evaluator_content = evaluator_content_sha256(root, game)
+        if final_evaluator_content != initial_evaluator_content:
+            raise RuntimeError(
+                "evaluator/core source changed during pool audit; refusing to write mixed verdicts"
+            )
         target = Path(root) / "games" / game / "players" / RUNNABLE_FILENAME
         existing: dict[str, object] = {}
         if target.is_file():
@@ -336,13 +413,13 @@ def audit_pool(
                 existing = json.loads(target.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing = {}
-        # 增量合并：不同 scope 的审计结果互不覆盖对方已验证的条目。
-        merged_rows = {
-            str(row["player_id"]): row
-            for row in (existing.get("rows") or [])
-            if isinstance(row, dict) and row.get("player_id")
-        }
-        merged_rows.update({row.player_id: row.as_dict() for row in rows})
+        # 只续接**相同评测机版本 + 相同审计配置**的结果。评测机或配置一变，旧失败
+        # 结论就不再有证明力；继续静默合并正是本次 768 条陈旧失败的来源。
+        merged_rows = _merge_audit_rows(
+            existing,
+            [row.as_dict() for row in rows],
+            audit_fingerprint=fingerprint,
+        )
         document["rows"] = [merged_rows[key] for key in sorted(merged_rows)]
         document["verified_ids"] = sorted(
             key for key, row in merged_rows.items() if row.get("verified")
@@ -360,12 +437,9 @@ def audit_pool(
 def load_verified_ids(agentbench_root: str | Path, game: str) -> frozenset[str] | None:
     """读取审计结果；没有审计文件时返回 None（表示"未审计"，不是"全不可用"）。"""
 
-    target = Path(agentbench_root) / "games" / game / "players" / RUNNABLE_FILENAME
-    if not target.is_file():
-        return None
-    try:
-        document = json.loads(target.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    game_dir = Path(agentbench_root).resolve() / "games" / game
+    document = load_valid_audit_document(game_dir)
+    if document is None:
         return None
     ids = document.get("verified_ids")
     if not isinstance(ids, list):

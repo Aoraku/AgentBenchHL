@@ -171,8 +171,8 @@ def test_explicit_iteration_count_wins(tmp_path: Path) -> None:
     assert config.runtime.max_iterations == 8
 
 
-def test_defaults_are_k1_batch4_and_no_information_gain(tmp_path: Path) -> None:
-    """默认配置的四件事：k=1、b=4、progress 课程、IG 全关。"""
+def test_defaults_are_k4_batch4_and_no_information_gain(tmp_path: Path) -> None:
+    """默认配置的四件事：k=4、b=4、progress 课程、IG 全关。"""
 
     path = tmp_path / "experiment.yaml"
     path.write_text(VALID_CONFIG, encoding="utf-8")
@@ -183,7 +183,7 @@ def test_defaults_are_k1_batch4_and_no_information_gain(tmp_path: Path) -> None:
         gamepacks_root=_gamepacks_with(tmp_path, "antwar2"),
     )
 
-    assert config.runtime.rollout_k == 1
+    assert config.runtime.rollout_k == 4
     assert config.curriculum.batch == 4
     assert config.curriculum.opponent_policy == "progress"
     assert config.measurement.information_gain is False

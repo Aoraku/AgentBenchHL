@@ -37,6 +37,7 @@ AgentBench/games/<game>/players/
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -81,6 +82,8 @@ class PoolPlayer:
     # 排名来源：official（manifest）/ reference（外部交付）/ measured（我们实测）。
     # 上层必须能回答"这个 Elo 是谁测的"，否则跨口径混用会得出错误结论。
     rank_source: str = "crawled"
+    # 结构探测只做分类，不把评测机尚未支持的提交形状冒充成坏策略。
+    availability_status: str = "runnable"
 
     @property
     def public_row(self) -> dict[str, object]:
@@ -123,7 +126,7 @@ def _to_float(value: str | None) -> float | None:
 
 
 def _nested_entry(package_root: Path) -> Path | None:
-    """找嵌套一层的 Python 入口（``<pkg>/<sdk-dir>/main.py``），取最浅+字典序最小。
+    """递归找 Python 入口，取最浅、再按路径字典序最小。
 
     很多游戏的提交是"把整个 SDK 目录一起打包上传"，入口在下一层：
     rollman 309 个包里 **188 个**是这种结构，只有 93 个把 main.py 放在包根。
@@ -134,26 +137,101 @@ def _nested_entry(package_root: Path) -> Path | None:
         return None
     candidates = [
         item
-        for item in package_root.glob("*/main.py")
-        if "__pycache__" not in item.parts
+        for item in package_root.rglob("main.py")
+        if "__pycache__" not in item.relative_to(package_root).parts
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda path: path.as_posix()).parent
+    return min(
+        candidates,
+        key=lambda path: (len(path.relative_to(package_root).parts), path.as_posix()),
+    ).parent
 
 
-def _runnable(package_root: Path, *, supports_compiled: bool) -> tuple[bool, str | None]:
-    if (package_root / "main.py").is_file():
-        return True, None
-    if supports_compiled and any(
-        (package_root / name).is_file() for name in ("Makefile", "makefile", "CMakeLists.txt")
-    ):
-        return True, None
+def _native_build_systems(package_root: Path) -> frozenset[str]:
+    systems: set[str] = set()
+    for name in ("Makefile", "makefile", "GNUmakefile", "CMakeLists.txt"):
+        for path in package_root.rglob(name):
+            if "__pycache__" in path.relative_to(package_root).parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            lowered = text.lower()
+            if name == "CMakeLists.txt":
+                recognized = "add_executable" in lowered
+            else:
+                recognized = "sphinx-build" not in lowered and any(
+                    marker in text
+                    for marker in (
+                        "g++",
+                        "clang++",
+                        "CXX",
+                        "CXXFLAGS",
+                        ".cpp",
+                        ".cc",
+                        ".cxx",
+                    )
+                )
+            if recognized:
+                systems.add("cmake" if name == "CMakeLists.txt" else "make")
+    return frozenset(systems)
+
+
+def _has_native_source(package_root: Path) -> bool:
+    return any(
+        path.is_file() and path.suffix.lower() in {".c", ".cc", ".cpp", ".cxx"}
+        for path in package_root.rglob("*")
+    )
+
+
+def classify_availability(
+    package_root: Path,
+    *,
+    supports_compiled: bool,
+    supported_build_systems: frozenset[str] | None = None,
+) -> tuple[str, str | None]:
+    """Classify package structure without treating evaluator gaps as player failures."""
+
     if not package_root.is_dir():
-        return False, "package directory is missing"
-    if _nested_entry(package_root) is not None:
-        return True, None
-    return False, "no runnable entry point (main.py) in package"
+        return "missing_package", "package directory is missing"
+    if (package_root / "main.py").is_file() or _nested_entry(package_root) is not None:
+        return "runnable", None
+    build_systems = _native_build_systems(package_root)
+    supported = (
+        supported_build_systems
+        if supported_build_systems is not None
+        else frozenset({"make", "cmake"})
+        if supports_compiled
+        else frozenset()
+    )
+    if build_systems:
+        if build_systems & supported:
+            return "runnable", None
+        found = ", ".join(sorted(build_systems))
+        accepted = ", ".join(sorted(supported)) or "none"
+        return (
+            "evaluator_unsupported",
+            f"native build system unsupported by evaluator: found={found}; accepted={accepted}",
+        )
+    if _has_native_source(package_root):
+        return "build_metadata_required", "native source found but no supported build entry"
+    return "unsupported_submission_shape", "no recognized Python or native build entry"
+
+
+def _runnable(
+    package_root: Path,
+    *,
+    supports_compiled: bool,
+    supported_build_systems: frozenset[str] | None = None,
+) -> tuple[bool, str | None]:
+    status, diagnostic = classify_availability(
+        package_root,
+        supports_compiled=supports_compiled,
+        supported_build_systems=supported_build_systems,
+    )
+    return status == "runnable", diagnostic
 
 
 def _tracks(game_dir: Path) -> dict[str, str]:
@@ -180,6 +258,53 @@ def _tracks(game_dir: Path) -> dict[str, str]:
     return tracks
 
 
+def evaluator_content_sha256(agentbench_root: str | Path, game: str) -> str:
+    """Hash the exact evaluator/core source content that determines audit verdicts."""
+
+    root = Path(agentbench_root).resolve()
+    sources = (
+        root / "src" / "agentbench" / "core",
+        root / "games" / game / "evaluator",
+    )
+    digest = hashlib.sha256()
+    for source in sources:
+        label = source.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(label).to_bytes(8, "big"))
+        digest.update(label)
+        if not source.is_dir():
+            digest.update(b"<missing>")
+            continue
+        for path in sorted(source.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+                continue
+            relative = path.relative_to(root).as_posix().encode("utf-8")
+            content = path.read_bytes()
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+    return digest.hexdigest()
+
+
+def load_valid_audit_document(game_dir: Path) -> dict[str, object] | None:
+    """Load an audit only when its content provenance matches the current evaluator."""
+
+    target = game_dir / "players" / "runnable.json"
+    if not target.is_file():
+        return None
+    try:
+        document = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("audit_fingerprint"), str):
+        return None
+    expected = document.get("evaluator_content_sha256")
+    if not isinstance(expected, str) or not expected:
+        return None
+    current = evaluator_content_sha256(game_dir.parents[1], game_dir.name)
+    return document if expected == current else None
+
+
 def _audit_verdicts(game_dir: Path) -> dict[str, tuple[bool, str | None]]:
     """读取 self-play smoke 审计结论（见 ``application/pool_audit.py``）。
 
@@ -187,12 +312,8 @@ def _audit_verdicts(game_dir: Path) -> dict[str, tuple[bool, str | None]]:
     （"未审计"不等于"不可用"）。
     """
 
-    target = game_dir / "players" / "runnable.json"
-    if not target.is_file():
-        return {}
-    try:
-        document = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    document = load_valid_audit_document(game_dir)
+    if document is None:
         return {}
     verdicts: dict[str, tuple[bool, str | None]] = {}
     for row in document.get("rows") or []:
@@ -287,6 +408,7 @@ def load_pool(
     game: str,
     *,
     supports_compiled: bool = False,
+    supported_build_systems: frozenset[str] | None = None,
     apply_audit: bool = True,
     ladder_scope: str = "auto",
 ) -> tuple[PoolPlayer, ...]:
@@ -314,12 +436,18 @@ def load_pool(
                 continue
             relative = (row.get("dir") or "").strip()
             package_root = (game_dir / "players" / relative).resolve() if relative else game_dir
-            runnable, diagnostic = _runnable(package_root, supports_compiled=supports_compiled)
+            availability, diagnostic = classify_availability(
+                package_root,
+                supports_compiled=supports_compiled,
+                supported_build_systems=supported_build_systems,
+            )
+            runnable = availability == "runnable"
             verdict = verdicts.get(player_id)
             if verdict is not None:
                 verified, audit_diagnostic = verdict
                 if not verified:
                     runnable = False
+                    availability = "runtime_failed"
                     diagnostic = audit_diagnostic or "failed self-play smoke audit"
                 elif runnable:
                     diagnostic = None
@@ -336,6 +464,7 @@ def load_pool(
                     runnable=runnable,
                     exclusion_diagnostic=diagnostic,
                     track=tracks.get(player_id),
+                    availability_status=availability,
                 )
             )
     if not players:

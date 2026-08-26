@@ -203,7 +203,11 @@ def write_codex_config(
             raise ValueError(f"unknown model_catalog: {model_catalog!r}")
         catalog_path = root / "models.json"
         catalog_path.write_text(
-            json.dumps({"models": list(MODEL_CATALOGS[model_catalog])}, ensure_ascii=False, indent=2)
+            json.dumps(
+                {"models": list(MODEL_CATALOGS[model_catalog])},
+                ensure_ascii=False,
+                indent=2,
+            )
             + "\n",
             encoding="utf-8",
         )

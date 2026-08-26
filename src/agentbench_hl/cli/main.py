@@ -395,7 +395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     close()
         elif arguments.group == "pool" and arguments.command == "audit":
             from agentbench_hl.adapters.contract.factory import (
-                _supports_compiled_players,
+                _supported_player_build_systems,
                 game_roles,
             )
             from agentbench_hl.adapters.contract.pool import (
@@ -412,10 +412,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             players = load_pool(
                 root,
                 arguments.game,
-                supports_compiled=_supports_compiled_players(root, arguments.game),
+                supported_build_systems=_supported_player_build_systems(
+                    root, arguments.game
+                ),
             )
             runnable = runnable_players(players)
             ladder = ranked_ladder(players)
+            availability_counts: dict[str, int] = {}
+            for player in players:
+                status = player.availability_status
+                availability_counts[status] = availability_counts.get(status, 0) + 1
             payload = {
                 "status": "ok",
                 "game": arguments.game,
@@ -423,12 +429,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "players_total": len(players),
                 "players_runnable": len(runnable),
                 "players_ranked_runnable": len(ladder),
+                "availability_counts": dict(sorted(availability_counts.items())),
                 "top_runnable": [
                     {"player_id": item.player_id, "rank": item.rank, "elo": item.elo}
                     for item in ladder[:10]
                 ],
                 "unrunnable_examples": [
-                    {"player_id": item.player_id, "reason": item.exclusion_diagnostic}
+                    {
+                        "player_id": item.player_id,
+                        "availability_status": item.availability_status,
+                        "reason": item.exclusion_diagnostic,
+                    }
                     for item in players
                     if not item.runnable
                 ][:5],
@@ -457,14 +468,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "verified": report["verified"],
                     "written_to": report.get("written_to"),
                     "rejected": [
-                        {"player_id": row["player_id"], "reason": row["diagnostic"]}
+                        {
+                            "player_id": row["player_id"],
+                            "availability_status": "runtime_failed",
+                            "reason": row["diagnostic"],
+                        }
                         for row in report["rows"]  # type: ignore[union-attr]
                         if isinstance(row, dict) and not row.get("verified")
                     ],
                 }
         elif arguments.group == "ladder" and arguments.command == "eval":
             from agentbench_hl.adapters.contract.factory import (
-                _supports_compiled_players,
+                _supported_player_build_systems,
                 game_roles,
             )
             from agentbench_hl.adapters.contract.pool import load_pool
@@ -491,7 +506,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pool_players = load_pool(
                     root,
                     arguments.game,
-                    supports_compiled=_supports_compiled_players(root, arguments.game),
+                    supported_build_systems=_supported_player_build_systems(
+                        root, arguments.game
+                    ),
                 )
                 ids, note = _select_players(root, arguments.game, pool_players, arguments.scope)
                 plan = build_plan(
